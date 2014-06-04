@@ -1,0 +1,46 @@
+---
+common_config: -des -Dman1dir=none -Dman3dir=none -Uversiononly
+perls:
+    -
+        name: 5.21.0
+        url: http://www.cpan.org/src/5.0/perl-5.21.0.tar.gz
+        config: -Dusedevel
+    -
+        name: 5.21.0t
+        url: http://www.cpan.org/src/5.0/perl-5.21.0.tar.gz
+        config: -Dusedevel -Dusethreads
+    -
+        name: 5.20.0
+        url: http://www.cpan.org/src/5.0/perl-5.20.0.tar.gz
+        config: -Dusethreads
+    -
+        name: 5.20.0t
+        url: http://www.cpan.org/src/5.0/perl-5.20.0.tar.gz
+    -
+        name: 5.18.2
+        url: http://www.cpan.org/src/5.0/perl-5.18.2.tar.gz
+    -
+        name: 5.16.3
+        url: http://www.cpan.org/src/5.0/perl-5.16.3.tar.gz
+    -
+        name: 5.14.4
+        url: http://www.cpan.org/src/5.0/perl-5.14.4.tar.gz
+    -
+        name: 5.12.5
+        url: http://www.cpan.org/src/5.0/perl-5.12.5.tar.gz
+    -
+        name: 5.10.1
+        url: http://www.cpan.org/src/5.0/perl-5.10.1.tar.gz
+    -
+        name: 5.10.0
+        url: http://www.cpan.org/src/5.0/perl-5.10.0.tar.gz
+    -
+        name: 5.10.0t
+        url: http://www.cpan.org/src/5.0/perl-5.10.0.tar.gz
+        config: -Dusethreads
+    -
+        name: 5.8.9
+        url: http://www.cpan.org/src/5.0/perl-5.8.9.tar.gz
+    -
+        name: 5.8.9t
+        url: http://www.cpan.org/src/5.0/perl-5.8.9.tar.gz
