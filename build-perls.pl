@@ -12,8 +12,8 @@ use Cwd;
 
 my $lang_path = shift or die "Usage: $0 <path-to-install-perls>\n";
 
-my $patchperl = File::Spec->catfile( dirname($0), 'patchperl.pl' );
-my $yaml_file = File::Spec->catfile( dirname($0), 'perls.yml' );
+my $patchperl = Cwd::abs_path( File::Spec->catfile( dirname($0), 'patchperl.pl' ) );
+my $yaml_file = Cwd::abs_path( File::Spec->catfile( dirname($0), 'perls.yml' ) );
 
 my $build_dir     = Cwd::getcwd;
 my $data          = Parse::CPAN::Meta->load_file($yaml_file);
