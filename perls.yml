@@ -12,10 +12,10 @@ perls:
     -
         name: 5.20.0
         url: http://www.cpan.org/src/5.0/perl-5.20.0.tar.gz
-        config: -Dusethreads
     -
         name: 5.20.0t
         url: http://www.cpan.org/src/5.0/perl-5.20.0.tar.gz
+        config: -Dusethreads
     -
         name: 5.18.2
         url: http://www.cpan.org/src/5.0/perl-5.18.2.tar.gz
@@ -44,3 +44,4 @@ perls:
     -
         name: 5.8.9t
         url: http://www.cpan.org/src/5.0/perl-5.8.9.tar.gz
+        config: -Dusethreads
