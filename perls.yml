@@ -2,14 +2,6 @@
 common_config: -des -Dman1dir=none -Dman3dir=none -Uversiononly
 perls:
     -
-        name: 5.21.0
-        url: http://www.cpan.org/src/5.0/perl-5.21.0.tar.gz
-        config: -Dusedevel
-    -
-        name: 5.21.0t
-        url: http://www.cpan.org/src/5.0/perl-5.21.0.tar.gz
-        config: -Dusedevel -Dusethreads
-    -
         name: 5.20.0
         url: http://www.cpan.org/src/5.0/perl-5.20.0.tar.gz
     -
@@ -45,3 +37,39 @@ perls:
         name: 5.8.9t
         url: http://www.cpan.org/src/5.0/perl-5.8.9.tar.gz
         config: -Dusethreads
+post_install:
+    - App::cpanminus
+    - CPAN::Meta::Requirements
+    - Config::AutoConf
+    - Data::Dump
+    - Data::Types
+    - DateTime
+    - DateTime::Tiny
+    - Devel::Peek
+    - File::Slurp
+    - IPC::Cmd
+    - JSON
+    - Log::Any::Adapter
+    - Moo
+    - Moose
+    - MooseX::Role::Logger
+    - Net::EmptyPort
+    - Path::Tiny
+    - Proc::Guard
+    - Safe::Isa
+    - Syntax::Keyword::Junction
+    - Sys::Hostname
+    - Test::Deep
+    - Test::Exception
+    - Test::Fatal
+    - Test::More
+    - Test::Warn
+    - Throwable
+    - Tie::IxHash
+    - Try::Tiny
+    - Types::Path::Tiny
+    - Types::Standard
+    - Version::Next
+    - YAML::XS
+    - boolean
+    - namespace::clean
