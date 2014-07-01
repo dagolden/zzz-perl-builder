@@ -22,24 +22,24 @@ my @common_config = split " ", $data->{common_config};
 for my $perl ( @{ $data->{perls} } ) {
     say "Building $perl->{name}";
     my $prefix = File::Spec->catfile( $lang_path, $perl->{name} );
-    next if -x File::Spec->catfile( $prefix, qw/bin perl/ );
+    unless ( -x File::Spec->catfile( $prefix, qw/bin perl/ ) ) {
+        chdir $build_dir;
+        my @local_config = $perl->{config} ? ( split " ", $perl->{config} ) : ();
+        my @config = ( @common_config, "-Dprefix=$prefix", @local_config );
+        my ($tarball) = $perl->{url} =~ m{.*/(.*)};
+        ( my $src_dir = $tarball ) =~ s{\.tar\.gz}{};
 
-    chdir $build_dir;
-    my @local_config = $perl->{config} ? ( split " ", $perl->{config} ) : ();
-    my @config = ( @common_config, "-Dprefix=$prefix", @local_config );
-    my ($tarball) = $perl->{url} =~ m{.*/(.*)};
-    ( my $src_dir = $tarball ) =~ s{\.tar\.gz}{};
+        try_run( "wget", $perl->{url} ) unless -f $tarball;
+        remove_tree($src_dir) if -d $src_dir;
+        try_run( "tar", "-xzf", $tarball );
 
-    try_run( "wget", $perl->{url} ) unless -f $tarball;
-    remove_tree($src_dir) if -d $src_dir;
-    try_run( "tar", "-xzf", $tarball );
+        chdir $src_dir;
 
-    chdir $src_dir;
-
-    try_run( $^X,           $patchperl );
-    try_run( "./Configure", @config );
-    try_run( "make",        "-j9" );
-    try_run( "make",        "install" );
+        try_run( $^X,           $patchperl );
+        try_run( "./Configure", @config );
+        try_run( "make",        "-j9" );
+        try_run( "make",        "install" );
+    }
 
     # switch to new perl for post install
     $ENV{PATH}                      = "$prefix/bin:$ENV{PATH}";
