@@ -53,9 +53,11 @@ for my $perl ( @{ $data->{perls} } ) {
     local $ENV{PATH} = "$prefix/bin:$ENV{PATH}";
 
     # let's avoid any pod tests and prompts when we try to install stuff
-    try_run( './cpanm', 'TAP::Harness::Restricted' );
+    try_run( './cpanm', '-q', 'TAP::Harness::Restricted' );
     local $ENV{HARNESS_SUBCLASS} = "TAP::Harness::Restricted";
-    try_run( './cpanm', @{ $data->{post_install} } ) if $data->{post_install};
+    try_run( './cpanm', '-q', @{ $data->{post_install} } ) if $data->{post_install};
+
+    say "";
 }
 
 sub try_run {
