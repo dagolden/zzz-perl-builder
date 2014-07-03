@@ -49,13 +49,22 @@ for my $perl ( @{ $data->{perls} } ) {
         chdir $build_dir;
     }
 
-    # switch to new perl for post install
-    local $ENV{PATH} = "$prefix/bin:$ENV{PATH}";
+    # Module install failure must not disrupt perl installation
+    eval {
+        # switch to new perl for post install
+        local $ENV{PATH} = "$prefix/bin:$ENV{PATH}";
 
-    # let's avoid any pod tests and prompts when we try to install stuff
-    try_run( './cpanm', '-q', 'TAP::Harness::Restricted' );
-    local $ENV{HARNESS_SUBCLASS} = "TAP::Harness::Restricted";
-    try_run( './cpanm', '-q', @{ $data->{post_install} } ) if $data->{post_install};
+        # bootstrap latest toolchain
+        try_run( './cpanm', '-q', 'ExtUtils::MakeMaker', 'CPAN::Meta::Requirements', 'CPAN::Meta' );
+
+        # let's avoid any pod tests and prompts when we try to install stuff
+        try_run( './cpanm', '-q', 'TAP::Harness::Restricted' );
+        local $ENV{HARNESS_SUBCLASS} = "TAP::Harness::Restricted";
+
+        # now it should be safe to install the rest
+        try_run( './cpanm', '-q', @{ $data->{post_install} } ) if $data->{post_install};
+    };
+    warn $@ if $@;
 
     say "";
 }

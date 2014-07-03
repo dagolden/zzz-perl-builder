@@ -39,7 +39,6 @@ perls:
         config: -Dusethreads
 post_install:
     - App::cpanminus
-    - CPAN::Meta::Requirements
     - Config::AutoConf
     - Data::Dump
     - Data::Types
