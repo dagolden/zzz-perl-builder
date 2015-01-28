@@ -5,6 +5,1110 @@
 BEGIN {
 my %fatpacked;
 
+$fatpacked{"CPAN/Meta/Requirements.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'CPAN_META_REQUIREMENTS';
+  use strict;
+  use warnings;
+  package CPAN::Meta::Requirements;
+  # ABSTRACT: a set of version requirements for a CPAN dist
+  
+  our $VERSION = '2.132';
+  
+  #pod =head1 SYNOPSIS
+  #pod
+  #pod   use CPAN::Meta::Requirements;
+  #pod
+  #pod   my $build_requires = CPAN::Meta::Requirements->new;
+  #pod
+  #pod   $build_requires->add_minimum('Library::Foo' => 1.208);
+  #pod
+  #pod   $build_requires->add_minimum('Library::Foo' => 2.602);
+  #pod
+  #pod   $build_requires->add_minimum('Module::Bar'  => 'v1.2.3');
+  #pod
+  #pod   $METAyml->{build_requires} = $build_requires->as_string_hash;
+  #pod
+  #pod =head1 DESCRIPTION
+  #pod
+  #pod A CPAN::Meta::Requirements object models a set of version constraints like
+  #pod those specified in the F<META.yml> or F<META.json> files in CPAN distributions,
+  #pod and as defined by L<CPAN::Meta::Spec>;
+  #pod It can be built up by adding more and more constraints, and it will reduce them
+  #pod to the simplest representation.
+  #pod
+  #pod Logically impossible constraints will be identified immediately by thrown
+  #pod exceptions.
+  #pod
+  #pod =cut
+  
+  use Carp ();
+  
+  # To help ExtUtils::MakeMaker bootstrap CPAN::Meta::Requirements on perls
+  # before 5.10, we fall back to the EUMM bundled compatibility version module if
+  # that's the only thing available.  This shouldn't ever happen in a normal CPAN
+  # install of CPAN::Meta::Requirements, as version.pm will be picked up from
+  # prereqs and be available at runtime.
+  
+  BEGIN {
+    eval "use version ()"; ## no critic
+    if ( my $err = $@ ) {
+      eval "use ExtUtils::MakeMaker::version" or die $err; ## no critic
+    }
+  }
+  
+  # Perl 5.10.0 didn't have "is_qv" in version.pm
+  *_is_qv = version->can('is_qv') ? sub { $_[0]->is_qv } : sub { exists $_[0]->{qv} };
+  
+  # construct once, reuse many times
+  my $V0 = version->new(0);
+  
+  #pod =method new
+  #pod
+  #pod   my $req = CPAN::Meta::Requirements->new;
+  #pod
+  #pod This returns a new CPAN::Meta::Requirements object.  It takes an optional
+  #pod hash reference argument.  Currently, only one key is supported:
+  #pod
+  #pod =for :list
+  #pod * C<bad_version_hook> -- if provided, when a version cannot be parsed into
+  #pod   a version object, this code reference will be called with the invalid
+  #pod   version string as first argument, and the module name as second
+  #pod   argument.  It must return a valid version object.
+  #pod
+  #pod All other keys are ignored.
+  #pod
+  #pod =cut
+  
+  my @valid_options = qw( bad_version_hook );
+  
+  sub new {
+    my ($class, $options) = @_;
+    $options ||= {};
+    Carp::croak "Argument to $class\->new() must be a hash reference"
+      unless ref $options eq 'HASH';
+    my %self = map {; $_ => $options->{$_}} @valid_options;
+  
+    return bless \%self => $class;
+  }
+  
+  # from version::vpp
+  sub _find_magic_vstring {
+    my $value = shift;
+    my $tvalue = '';
+    require B;
+    my $sv = B::svref_2object(\$value);
+    my $magic = ref($sv) eq 'B::PVMG' ? $sv->MAGIC : undef;
+    while ( $magic ) {
+      if ( $magic->TYPE eq 'V' ) {
+        $tvalue = $magic->PTR;
+        $tvalue =~ s/^v?(.+)$/v$1/;
+        last;
+      }
+      else {
+        $magic = $magic->MOREMAGIC;
+      }
+    }
+    return $tvalue;
+  }
+  
+  # safe if given an unblessed reference
+  sub _isa_version {
+    UNIVERSAL::isa( $_[0], 'UNIVERSAL' ) && $_[0]->isa('version')
+  }
+  
+  sub _version_object {
+    my ($self, $module, $version) = @_;
+  
+    my $vobj;
+  
+    # hack around version::vpp not handling <3 character vstring literals
+    if ( $INC{'version/vpp.pm'} || $INC{'ExtUtils/MakeMaker/version/vpp.pm'} ) {
+      my $magic = _find_magic_vstring( $version );
+      $version = $magic if length $magic;
+    }
+  
+    eval {
+      if (not defined $version or (!ref($version) && $version eq '0')) {
+        $vobj = $V0;
+      }
+      elsif ( ref($version) eq 'version' || _isa_version($version) ) {
+        $vobj = $version;
+      }
+      else {
+        local $SIG{__WARN__} = sub { die "Invalid version: $_[0]" };
+        $vobj = version->new($version);
+      }
+    };
+  
+    if ( my $err = $@ ) {
+      my $hook = $self->{bad_version_hook};
+      $vobj = eval { $hook->($version, $module) }
+        if ref $hook eq 'CODE';
+      unless (eval { $vobj->isa("version") }) {
+        $err =~ s{ at .* line \d+.*$}{};
+        die "Can't convert '$version': $err";
+      }
+    }
+  
+    # ensure no leading '.'
+    if ( $vobj =~ m{\A\.} ) {
+      $vobj = version->new("0$vobj");
+    }
+  
+    # ensure normal v-string form
+    if ( _is_qv($vobj) ) {
+      $vobj = version->new($vobj->normal);
+    }
+  
+    return $vobj;
+  }
+  
+  #pod =method add_minimum
+  #pod
+  #pod   $req->add_minimum( $module => $version );
+  #pod
+  #pod This adds a new minimum version requirement.  If the new requirement is
+  #pod redundant to the existing specification, this has no effect.
+  #pod
+  #pod Minimum requirements are inclusive.  C<$version> is required, along with any
+  #pod greater version number.
+  #pod
+  #pod This method returns the requirements object.
+  #pod
+  #pod =method add_maximum
+  #pod
+  #pod   $req->add_maximum( $module => $version );
+  #pod
+  #pod This adds a new maximum version requirement.  If the new requirement is
+  #pod redundant to the existing specification, this has no effect.
+  #pod
+  #pod Maximum requirements are inclusive.  No version strictly greater than the given
+  #pod version is allowed.
+  #pod
+  #pod This method returns the requirements object.
+  #pod
+  #pod =method add_exclusion
+  #pod
+  #pod   $req->add_exclusion( $module => $version );
+  #pod
+  #pod This adds a new excluded version.  For example, you might use these three
+  #pod method calls:
+  #pod
+  #pod   $req->add_minimum( $module => '1.00' );
+  #pod   $req->add_maximum( $module => '1.82' );
+  #pod
+  #pod   $req->add_exclusion( $module => '1.75' );
+  #pod
+  #pod Any version between 1.00 and 1.82 inclusive would be acceptable, except for
+  #pod 1.75.
+  #pod
+  #pod This method returns the requirements object.
+  #pod
+  #pod =method exact_version
+  #pod
+  #pod   $req->exact_version( $module => $version );
+  #pod
+  #pod This sets the version required for the given module to I<exactly> the given
+  #pod version.  No other version would be considered acceptable.
+  #pod
+  #pod This method returns the requirements object.
+  #pod
+  #pod =cut
+  
+  BEGIN {
+    for my $type (qw(maximum exclusion exact_version)) {
+      my $method = "with_$type";
+      my $to_add = $type eq 'exact_version' ? $type : "add_$type";
+  
+      my $code = sub {
+        my ($self, $name, $version) = @_;
+  
+        $version = $self->_version_object( $name, $version );
+  
+        $self->__modify_entry_for($name, $method, $version);
+  
+        return $self;
+      };
+      
+      no strict 'refs';
+      *$to_add = $code;
+    }
+  }
+  
+  sub add_minimum {
+    my ($self, $name, $version) = @_;
+  
+    if (not defined $version or (!ref($version) && $version eq '0')) {
+      return $self if $self->__entry_for($name);
+      Carp::confess("can't add new requirements to finalized requirements")
+        if $self->is_finalized;
+  
+      $self->{requirements}{ $name } =
+        CPAN::Meta::Requirements::_Range::Range->with_minimum($V0);
+    }
+    else {
+      $version = $self->_version_object( $name, $version );
+  
+      $self->__modify_entry_for($name, 'with_minimum', $version);
+    }
+    return $self;
+  }
+  
+  #pod =method add_requirements
+  #pod
+  #pod   $req->add_requirements( $another_req_object );
+  #pod
+  #pod This method adds all the requirements in the given CPAN::Meta::Requirements object
+  #pod to the requirements object on which it was called.  If there are any conflicts,
+  #pod an exception is thrown.
+  #pod
+  #pod This method returns the requirements object.
+  #pod
+  #pod =cut
+  
+  sub add_requirements {
+    my ($self, $req) = @_;
+  
+    for my $module ($req->required_modules) {
+      my $modifiers = $req->__entry_for($module)->as_modifiers;
+      for my $modifier (@$modifiers) {
+        my ($method, @args) = @$modifier;
+        $self->$method($module => @args);
+      };
+    }
+  
+    return $self;
+  }
+  
+  #pod =method accepts_module
+  #pod
+  #pod   my $bool = $req->accepts_module($module => $version);
+  #pod
+  #pod Given an module and version, this method returns true if the version
+  #pod specification for the module accepts the provided version.  In other words,
+  #pod given:
+  #pod
+  #pod   Module => '>= 1.00, < 2.00'
+  #pod
+  #pod We will accept 1.00 and 1.75 but not 0.50 or 2.00.
+  #pod
+  #pod For modules that do not appear in the requirements, this method will return
+  #pod true.
+  #pod
+  #pod =cut
+  
+  sub accepts_module {
+    my ($self, $module, $version) = @_;
+  
+    $version = $self->_version_object( $module, $version );
+  
+    return 1 unless my $range = $self->__entry_for($module);
+    return $range->_accepts($version);
+  }
+  
+  #pod =method clear_requirement
+  #pod
+  #pod   $req->clear_requirement( $module );
+  #pod
+  #pod This removes the requirement for a given module from the object.
+  #pod
+  #pod This method returns the requirements object.
+  #pod
+  #pod =cut
+  
+  sub clear_requirement {
+    my ($self, $module) = @_;
+  
+    return $self unless $self->__entry_for($module);
+  
+    Carp::confess("can't clear requirements on finalized requirements")
+      if $self->is_finalized;
+  
+    delete $self->{requirements}{ $module };
+  
+    return $self;
+  }
+  
+  #pod =method requirements_for_module
+  #pod
+  #pod   $req->requirements_for_module( $module );
+  #pod
+  #pod This returns a string containing the version requirements for a given module in
+  #pod the format described in L<CPAN::Meta::Spec> or undef if the given module has no
+  #pod requirements. This should only be used for informational purposes such as error
+  #pod messages and should not be interpreted or used for comparison (see
+  #pod L</accepts_module> instead.)
+  #pod
+  #pod =cut
+  
+  sub requirements_for_module {
+    my ($self, $module) = @_;
+    my $entry = $self->__entry_for($module);
+    return unless $entry;
+    return $entry->as_string;
+  }
+  
+  #pod =method required_modules
+  #pod
+  #pod This method returns a list of all the modules for which requirements have been
+  #pod specified.
+  #pod
+  #pod =cut
+  
+  sub required_modules { keys %{ $_[0]{requirements} } }
+  
+  #pod =method clone
+  #pod
+  #pod   $req->clone;
+  #pod
+  #pod This method returns a clone of the invocant.  The clone and the original object
+  #pod can then be changed independent of one another.
+  #pod
+  #pod =cut
+  
+  sub clone {
+    my ($self) = @_;
+    my $new = (ref $self)->new;
+  
+    return $new->add_requirements($self);
+  }
+  
+  sub __entry_for     { $_[0]{requirements}{ $_[1] } }
+  
+  sub __modify_entry_for {
+    my ($self, $name, $method, $version) = @_;
+  
+    my $fin = $self->is_finalized;
+    my $old = $self->__entry_for($name);
+  
+    Carp::confess("can't add new requirements to finalized requirements")
+      if $fin and not $old;
+  
+    my $new = ($old || 'CPAN::Meta::Requirements::_Range::Range')
+            ->$method($version);
+  
+    Carp::confess("can't modify finalized requirements")
+      if $fin and $old->as_string ne $new->as_string;
+  
+    $self->{requirements}{ $name } = $new;
+  }
+  
+  #pod =method is_simple
+  #pod
+  #pod This method returns true if and only if all requirements are inclusive minimums
+  #pod -- that is, if their string expression is just the version number.
+  #pod
+  #pod =cut
+  
+  sub is_simple {
+    my ($self) = @_;
+    for my $module ($self->required_modules) {
+      # XXX: This is a complete hack, but also entirely correct.
+      return if $self->__entry_for($module)->as_string =~ /\s/;
+    }
+  
+    return 1;
+  }
+  
+  #pod =method is_finalized
+  #pod
+  #pod This method returns true if the requirements have been finalized by having the
+  #pod C<finalize> method called on them.
+  #pod
+  #pod =cut
+  
+  sub is_finalized { $_[0]{finalized} }
+  
+  #pod =method finalize
+  #pod
+  #pod This method marks the requirements finalized.  Subsequent attempts to change
+  #pod the requirements will be fatal, I<if> they would result in a change.  If they
+  #pod would not alter the requirements, they have no effect.
+  #pod
+  #pod If a finalized set of requirements is cloned, the cloned requirements are not
+  #pod also finalized.
+  #pod
+  #pod =cut
+  
+  sub finalize { $_[0]{finalized} = 1 }
+  
+  #pod =method as_string_hash
+  #pod
+  #pod This returns a reference to a hash describing the requirements using the
+  #pod strings in the L<CPAN::Meta::Spec> specification.
+  #pod
+  #pod For example after the following program:
+  #pod
+  #pod   my $req = CPAN::Meta::Requirements->new;
+  #pod
+  #pod   $req->add_minimum('CPAN::Meta::Requirements' => 0.102);
+  #pod
+  #pod   $req->add_minimum('Library::Foo' => 1.208);
+  #pod
+  #pod   $req->add_maximum('Library::Foo' => 2.602);
+  #pod
+  #pod   $req->add_minimum('Module::Bar'  => 'v1.2.3');
+  #pod
+  #pod   $req->add_exclusion('Module::Bar'  => 'v1.2.8');
+  #pod
+  #pod   $req->exact_version('Xyzzy'  => '6.01');
+  #pod
+  #pod   my $hashref = $req->as_string_hash;
+  #pod
+  #pod C<$hashref> would contain:
+  #pod
+  #pod   {
+  #pod     'CPAN::Meta::Requirements' => '0.102',
+  #pod     'Library::Foo' => '>= 1.208, <= 2.206',
+  #pod     'Module::Bar'  => '>= v1.2.3, != v1.2.8',
+  #pod     'Xyzzy'        => '== 6.01',
+  #pod   }
+  #pod
+  #pod =cut
+  
+  sub as_string_hash {
+    my ($self) = @_;
+  
+    my %hash = map {; $_ => $self->{requirements}{$_}->as_string }
+               $self->required_modules;
+  
+    return \%hash;
+  }
+  
+  #pod =method add_string_requirement
+  #pod
+  #pod   $req->add_string_requirement('Library::Foo' => '>= 1.208, <= 2.206');
+  #pod   $req->add_string_requirement('Library::Foo' => v1.208);
+  #pod
+  #pod This method parses the passed in string and adds the appropriate requirement
+  #pod for the given module.  A version can be a Perl "v-string".  It understands
+  #pod version ranges as described in the L<CPAN::Meta::Spec/Version Ranges>. For
+  #pod example:
+  #pod
+  #pod =over 4
+  #pod
+  #pod =item 1.3
+  #pod
+  #pod =item >= 1.3
+  #pod
+  #pod =item <= 1.3
+  #pod
+  #pod =item == 1.3
+  #pod
+  #pod =item != 1.3
+  #pod
+  #pod =item > 1.3
+  #pod
+  #pod =item < 1.3
+  #pod
+  #pod =item >= 1.3, != 1.5, <= 2.0
+  #pod
+  #pod A version number without an operator is equivalent to specifying a minimum
+  #pod (C<E<gt>=>).  Extra whitespace is allowed.
+  #pod
+  #pod =back
+  #pod
+  #pod =cut
+  
+  my %methods_for_op = (
+    '==' => [ qw(exact_version) ],
+    '!=' => [ qw(add_exclusion) ],
+    '>=' => [ qw(add_minimum)   ],
+    '<=' => [ qw(add_maximum)   ],
+    '>'  => [ qw(add_minimum add_exclusion) ],
+    '<'  => [ qw(add_maximum add_exclusion) ],
+  );
+  
+  sub add_string_requirement {
+    my ($self, $module, $req) = @_;
+  
+    unless ( defined $req && length $req ) {
+      $req = 0;
+      $self->_blank_carp($module);
+    }
+  
+    my $magic = _find_magic_vstring( $req );
+    if (length $magic) {
+      $self->add_minimum($module => $magic);
+      return;
+    }
+  
+    my @parts = split qr{\s*,\s*}, $req;
+  
+    for my $part (@parts) {
+      my ($op, $ver) = $part =~ m{\A\s*(==|>=|>|<=|<|!=)\s*(.*)\z};
+  
+      if (! defined $op) {
+        $self->add_minimum($module => $part);
+      } else {
+        Carp::confess("illegal requirement string: $req")
+          unless my $methods = $methods_for_op{ $op };
+  
+        $self->$_($module => $ver) for @$methods;
+      }
+    }
+  }
+  
+  #pod =method from_string_hash
+  #pod
+  #pod   my $req = CPAN::Meta::Requirements->from_string_hash( \%hash );
+  #pod   my $req = CPAN::Meta::Requirements->from_string_hash( \%hash, \%opts );
+  #pod
+  #pod This is an alternate constructor for a CPAN::Meta::Requirements
+  #pod object. It takes a hash of module names and version requirement
+  #pod strings and returns a new CPAN::Meta::Requirements object. As with
+  #pod add_string_requirement, a version can be a Perl "v-string". Optionally,
+  #pod you can supply a hash-reference of options, exactly as with the L</new>
+  #pod method.
+  #pod
+  #pod =cut
+  
+  sub _blank_carp {
+    my ($self, $module) = @_;
+    Carp::carp("Undefined requirement for $module treated as '0'");
+  }
+  
+  sub from_string_hash {
+    my ($class, $hash, $options) = @_;
+  
+    my $self = $class->new($options);
+  
+    for my $module (keys %$hash) {
+      my $req = $hash->{$module};
+      unless ( defined $req && length $req ) {
+        $req = 0;
+        $class->_blank_carp($module);
+      }
+      $self->add_string_requirement($module, $req);
+    }
+  
+    return $self;
+  }
+  
+  ##############################################################
+  
+  {
+    package
+      CPAN::Meta::Requirements::_Range::Exact;
+    sub _new     { bless { version => $_[1] } => $_[0] }
+  
+    sub _accepts { return $_[0]{version} == $_[1] }
+  
+    sub as_string { return "== $_[0]{version}" }
+  
+    sub as_modifiers { return [ [ exact_version => $_[0]{version} ] ] }
+  
+    sub _clone {
+      (ref $_[0])->_new( version->new( $_[0]{version} ) )
+    }
+  
+    sub with_exact_version {
+      my ($self, $version) = @_;
+  
+      return $self->_clone if $self->_accepts($version);
+  
+      Carp::confess("illegal requirements: unequal exact version specified");
+    }
+  
+    sub with_minimum {
+      my ($self, $minimum) = @_;
+      return $self->_clone if $self->{version} >= $minimum;
+      Carp::confess("illegal requirements: minimum above exact specification");
+    }
+  
+    sub with_maximum {
+      my ($self, $maximum) = @_;
+      return $self->_clone if $self->{version} <= $maximum;
+      Carp::confess("illegal requirements: maximum below exact specification");
+    }
+  
+    sub with_exclusion {
+      my ($self, $exclusion) = @_;
+      return $self->_clone unless $exclusion == $self->{version};
+      Carp::confess("illegal requirements: excluded exact specification");
+    }
+  }
+  
+  ##############################################################
+  
+  {
+    package
+      CPAN::Meta::Requirements::_Range::Range;
+  
+    sub _self { ref($_[0]) ? $_[0] : (bless { } => $_[0]) }
+  
+    sub _clone {
+      return (bless { } => $_[0]) unless ref $_[0];
+  
+      my ($s) = @_;
+      my %guts = (
+        (exists $s->{minimum} ? (minimum => version->new($s->{minimum})) : ()),
+        (exists $s->{maximum} ? (maximum => version->new($s->{maximum})) : ()),
+  
+        (exists $s->{exclusions}
+          ? (exclusions => [ map { version->new($_) } @{ $s->{exclusions} } ])
+          : ()),
+      );
+  
+      bless \%guts => ref($s);
+    }
+  
+    sub as_modifiers {
+      my ($self) = @_;
+      my @mods;
+      push @mods, [ add_minimum => $self->{minimum} ] if exists $self->{minimum};
+      push @mods, [ add_maximum => $self->{maximum} ] if exists $self->{maximum};
+      push @mods, map {; [ add_exclusion => $_ ] } @{$self->{exclusions} || []};
+      return \@mods;
+    }
+  
+    sub as_string {
+      my ($self) = @_;
+  
+      return 0 if ! keys %$self;
+  
+      return "$self->{minimum}" if (keys %$self) == 1 and exists $self->{minimum};
+  
+      my @exclusions = @{ $self->{exclusions} || [] };
+  
+      my @parts;
+  
+      for my $pair (
+        [ qw( >= > minimum ) ],
+        [ qw( <= < maximum ) ],
+      ) {
+        my ($op, $e_op, $k) = @$pair;
+        if (exists $self->{$k}) {
+          my @new_exclusions = grep { $_ != $self->{ $k } } @exclusions;
+          if (@new_exclusions == @exclusions) {
+            push @parts, "$op $self->{ $k }";
+          } else {
+            push @parts, "$e_op $self->{ $k }";
+            @exclusions = @new_exclusions;
+          }
+        }
+      }
+  
+      push @parts, map {; "!= $_" } @exclusions;
+  
+      return join q{, }, @parts;
+    }
+  
+    sub with_exact_version {
+      my ($self, $version) = @_;
+      $self = $self->_clone;
+  
+      Carp::confess("illegal requirements: exact specification outside of range")
+        unless $self->_accepts($version);
+  
+      return CPAN::Meta::Requirements::_Range::Exact->_new($version);
+    }
+  
+    sub _simplify {
+      my ($self) = @_;
+  
+      if (defined $self->{minimum} and defined $self->{maximum}) {
+        if ($self->{minimum} == $self->{maximum}) {
+          Carp::confess("illegal requirements: excluded all values")
+            if grep { $_ == $self->{minimum} } @{ $self->{exclusions} || [] };
+  
+          return CPAN::Meta::Requirements::_Range::Exact->_new($self->{minimum})
+        }
+  
+        Carp::confess("illegal requirements: minimum exceeds maximum")
+          if $self->{minimum} > $self->{maximum};
+      }
+  
+      # eliminate irrelevant exclusions
+      if ($self->{exclusions}) {
+        my %seen;
+        @{ $self->{exclusions} } = grep {
+          (! defined $self->{minimum} or $_ >= $self->{minimum})
+          and
+          (! defined $self->{maximum} or $_ <= $self->{maximum})
+          and
+          ! $seen{$_}++
+        } @{ $self->{exclusions} };
+      }
+  
+      return $self;
+    }
+  
+    sub with_minimum {
+      my ($self, $minimum) = @_;
+      $self = $self->_clone;
+  
+      if (defined (my $old_min = $self->{minimum})) {
+        $self->{minimum} = (sort { $b cmp $a } ($minimum, $old_min))[0];
+      } else {
+        $self->{minimum} = $minimum;
+      }
+  
+      return $self->_simplify;
+    }
+  
+    sub with_maximum {
+      my ($self, $maximum) = @_;
+      $self = $self->_clone;
+  
+      if (defined (my $old_max = $self->{maximum})) {
+        $self->{maximum} = (sort { $a cmp $b } ($maximum, $old_max))[0];
+      } else {
+        $self->{maximum} = $maximum;
+      }
+  
+      return $self->_simplify;
+    }
+  
+    sub with_exclusion {
+      my ($self, $exclusion) = @_;
+      $self = $self->_clone;
+  
+      push @{ $self->{exclusions} ||= [] }, $exclusion;
+  
+      return $self->_simplify;
+    }
+  
+    sub _accepts {
+      my ($self, $version) = @_;
+  
+      return if defined $self->{minimum} and $version < $self->{minimum};
+      return if defined $self->{maximum} and $version > $self->{maximum};
+      return if defined $self->{exclusions}
+            and grep { $version == $_ } @{ $self->{exclusions} };
+  
+      return 1;
+    }
+  }
+  
+  1;
+  # vim: ts=2 sts=2 sw=2 et:
+  
+  __END__
+  
+  =pod
+  
+  =encoding UTF-8
+  
+  =head1 NAME
+  
+  CPAN::Meta::Requirements - a set of version requirements for a CPAN dist
+  
+  =head1 VERSION
+  
+  version 2.132
+  
+  =head1 SYNOPSIS
+  
+    use CPAN::Meta::Requirements;
+  
+    my $build_requires = CPAN::Meta::Requirements->new;
+  
+    $build_requires->add_minimum('Library::Foo' => 1.208);
+  
+    $build_requires->add_minimum('Library::Foo' => 2.602);
+  
+    $build_requires->add_minimum('Module::Bar'  => 'v1.2.3');
+  
+    $METAyml->{build_requires} = $build_requires->as_string_hash;
+  
+  =head1 DESCRIPTION
+  
+  A CPAN::Meta::Requirements object models a set of version constraints like
+  those specified in the F<META.yml> or F<META.json> files in CPAN distributions,
+  and as defined by L<CPAN::Meta::Spec>;
+  It can be built up by adding more and more constraints, and it will reduce them
+  to the simplest representation.
+  
+  Logically impossible constraints will be identified immediately by thrown
+  exceptions.
+  
+  =head1 METHODS
+  
+  =head2 new
+  
+    my $req = CPAN::Meta::Requirements->new;
+  
+  This returns a new CPAN::Meta::Requirements object.  It takes an optional
+  hash reference argument.  Currently, only one key is supported:
+  
+  =over 4
+  
+  =item *
+  
+  C<bad_version_hook> -- if provided, when a version cannot be parsed into a version object, this code reference will be called with the invalid version string as first argument, and the module name as second argument.  It must return a valid version object.
+  
+  =back
+  
+  All other keys are ignored.
+  
+  =head2 add_minimum
+  
+    $req->add_minimum( $module => $version );
+  
+  This adds a new minimum version requirement.  If the new requirement is
+  redundant to the existing specification, this has no effect.
+  
+  Minimum requirements are inclusive.  C<$version> is required, along with any
+  greater version number.
+  
+  This method returns the requirements object.
+  
+  =head2 add_maximum
+  
+    $req->add_maximum( $module => $version );
+  
+  This adds a new maximum version requirement.  If the new requirement is
+  redundant to the existing specification, this has no effect.
+  
+  Maximum requirements are inclusive.  No version strictly greater than the given
+  version is allowed.
+  
+  This method returns the requirements object.
+  
+  =head2 add_exclusion
+  
+    $req->add_exclusion( $module => $version );
+  
+  This adds a new excluded version.  For example, you might use these three
+  method calls:
+  
+    $req->add_minimum( $module => '1.00' );
+    $req->add_maximum( $module => '1.82' );
+  
+    $req->add_exclusion( $module => '1.75' );
+  
+  Any version between 1.00 and 1.82 inclusive would be acceptable, except for
+  1.75.
+  
+  This method returns the requirements object.
+  
+  =head2 exact_version
+  
+    $req->exact_version( $module => $version );
+  
+  This sets the version required for the given module to I<exactly> the given
+  version.  No other version would be considered acceptable.
+  
+  This method returns the requirements object.
+  
+  =head2 add_requirements
+  
+    $req->add_requirements( $another_req_object );
+  
+  This method adds all the requirements in the given CPAN::Meta::Requirements object
+  to the requirements object on which it was called.  If there are any conflicts,
+  an exception is thrown.
+  
+  This method returns the requirements object.
+  
+  =head2 accepts_module
+  
+    my $bool = $req->accepts_module($module => $version);
+  
+  Given an module and version, this method returns true if the version
+  specification for the module accepts the provided version.  In other words,
+  given:
+  
+    Module => '>= 1.00, < 2.00'
+  
+  We will accept 1.00 and 1.75 but not 0.50 or 2.00.
+  
+  For modules that do not appear in the requirements, this method will return
+  true.
+  
+  =head2 clear_requirement
+  
+    $req->clear_requirement( $module );
+  
+  This removes the requirement for a given module from the object.
+  
+  This method returns the requirements object.
+  
+  =head2 requirements_for_module
+  
+    $req->requirements_for_module( $module );
+  
+  This returns a string containing the version requirements for a given module in
+  the format described in L<CPAN::Meta::Spec> or undef if the given module has no
+  requirements. This should only be used for informational purposes such as error
+  messages and should not be interpreted or used for comparison (see
+  L</accepts_module> instead.)
+  
+  =head2 required_modules
+  
+  This method returns a list of all the modules for which requirements have been
+  specified.
+  
+  =head2 clone
+  
+    $req->clone;
+  
+  This method returns a clone of the invocant.  The clone and the original object
+  can then be changed independent of one another.
+  
+  =head2 is_simple
+  
+  This method returns true if and only if all requirements are inclusive minimums
+  -- that is, if their string expression is just the version number.
+  
+  =head2 is_finalized
+  
+  This method returns true if the requirements have been finalized by having the
+  C<finalize> method called on them.
+  
+  =head2 finalize
+  
+  This method marks the requirements finalized.  Subsequent attempts to change
+  the requirements will be fatal, I<if> they would result in a change.  If they
+  would not alter the requirements, they have no effect.
+  
+  If a finalized set of requirements is cloned, the cloned requirements are not
+  also finalized.
+  
+  =head2 as_string_hash
+  
+  This returns a reference to a hash describing the requirements using the
+  strings in the L<CPAN::Meta::Spec> specification.
+  
+  For example after the following program:
+  
+    my $req = CPAN::Meta::Requirements->new;
+  
+    $req->add_minimum('CPAN::Meta::Requirements' => 0.102);
+  
+    $req->add_minimum('Library::Foo' => 1.208);
+  
+    $req->add_maximum('Library::Foo' => 2.602);
+  
+    $req->add_minimum('Module::Bar'  => 'v1.2.3');
+  
+    $req->add_exclusion('Module::Bar'  => 'v1.2.8');
+  
+    $req->exact_version('Xyzzy'  => '6.01');
+  
+    my $hashref = $req->as_string_hash;
+  
+  C<$hashref> would contain:
+  
+    {
+      'CPAN::Meta::Requirements' => '0.102',
+      'Library::Foo' => '>= 1.208, <= 2.206',
+      'Module::Bar'  => '>= v1.2.3, != v1.2.8',
+      'Xyzzy'        => '== 6.01',
+    }
+  
+  =head2 add_string_requirement
+  
+    $req->add_string_requirement('Library::Foo' => '>= 1.208, <= 2.206');
+    $req->add_string_requirement('Library::Foo' => v1.208);
+  
+  This method parses the passed in string and adds the appropriate requirement
+  for the given module.  A version can be a Perl "v-string".  It understands
+  version ranges as described in the L<CPAN::Meta::Spec/Version Ranges>. For
+  example:
+  
+  =over 4
+  
+  =item 1.3
+  
+  =item >= 1.3
+  
+  =item <= 1.3
+  
+  =item == 1.3
+  
+  =item != 1.3
+  
+  =item > 1.3
+  
+  =item < 1.3
+  
+  =item >= 1.3, != 1.5, <= 2.0
+  
+  A version number without an operator is equivalent to specifying a minimum
+  (C<E<gt>=>).  Extra whitespace is allowed.
+  
+  =back
+  
+  =head2 from_string_hash
+  
+    my $req = CPAN::Meta::Requirements->from_string_hash( \%hash );
+    my $req = CPAN::Meta::Requirements->from_string_hash( \%hash, \%opts );
+  
+  This is an alternate constructor for a CPAN::Meta::Requirements
+  object. It takes a hash of module names and version requirement
+  strings and returns a new CPAN::Meta::Requirements object. As with
+  add_string_requirement, a version can be a Perl "v-string". Optionally,
+  you can supply a hash-reference of options, exactly as with the L</new>
+  method.
+  
+  =for :stopwords cpan testmatrix url annocpan anno bugtracker rt cpants kwalitee diff irc mailto metadata placeholders metacpan
+  
+  =head1 SUPPORT
+  
+  =head2 Bugs / Feature Requests
+  
+  Please report any bugs or feature requests through the issue tracker
+  at L<https://github.com/dagolden/CPAN-Meta-Requirements/issues>.
+  You will be notified automatically of any progress on your issue.
+  
+  =head2 Source Code
+  
+  This is open source software.  The code repository is available for
+  public review and contribution under the terms of the license.
+  
+  L<https://github.com/dagolden/CPAN-Meta-Requirements>
+  
+    git clone https://github.com/dagolden/CPAN-Meta-Requirements.git
+  
+  =head1 AUTHORS
+  
+  =over 4
+  
+  =item *
+  
+  David Golden <dagolden@cpan.org>
+  
+  =item *
+  
+  Ricardo Signes <rjbs@cpan.org>
+  
+  =back
+  
+  =head1 CONTRIBUTORS
+  
+  =for stopwords Ed J Karen Etheridge Leon Timmermans robario
+  
+  =over 4
+  
+  =item *
+  
+  Ed J <mohawk2@users.noreply.github.com>
+  
+  =item *
+  
+  Karen Etheridge <ether@cpan.org>
+  
+  =item *
+  
+  Leon Timmermans <fawaka@gmail.com>
+  
+  =item *
+  
+  robario <webmaster@robario.com>
+  
+  =back
+  
+  =head1 COPYRIGHT AND LICENSE
+  
+  This software is copyright (c) 2010 by David Golden and Ricardo Signes.
+  
+  This is free software; you can redistribute it and/or modify it under
+  the same terms as the Perl 5 programming language system itself.
+  
+  =cut
+CPAN_META_REQUIREMENTS
+
 $fatpacked{"Devel/InnerPackage.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'DEVEL_INNERPACKAGE';
   package Devel::InnerPackage;
   
@@ -139,7 +1243,7 @@ DEVEL_INNERPACKAGE
 
 $fatpacked{"Devel/PatchPerl.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'DEVEL_PATCHPERL';
   package Devel::PatchPerl;
-  $Devel::PatchPerl::VERSION = '1.24';
+  $Devel::PatchPerl::VERSION = '1.30';
   # ABSTRACT: Patch perl source a la Devel::PPPort's buildperl.pl
   
   use strict;
@@ -267,6 +1371,7 @@ $fatpacked{"Devel/PatchPerl.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<
                 [ \&_patch_conf_solaris ],
                 [ \&_patch_bitrig ],
                 [ \&_patch_hints ],
+                [ \&_patch_patchlevel ],
               ],
     },
     {
@@ -322,6 +1427,20 @@ $fatpacked{"Devel/PatchPerl.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<
                 qr/^5\.20\.0$/,
               ],
       subs => [ [ \&_patch_cow_speed ] ],
+    },
+    {
+      perl => [
+                qr/^5\.6\.[012]$/,
+                qr/^5\.8\.[89]$/,
+                qr/^5\.10\.[01]$/,
+              ],
+      subs => [ [ \&_patch_preprocess_options ] ],
+    },
+    {
+      perl => [
+                qr/^5\.18\.3$/,
+              ],
+      subs => [ [ \&_patch_5183_metajson ] ],
     },
   );
   
@@ -493,6 +1612,29 @@ $fatpacked{"Devel/PatchPerl.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<
       }
     }
     return $version;
+  }
+  
+  # adapted from patchlevel.h for use with perls that predate it
+  sub _patch_patchlevel {
+    my $dpv = $Devel::PatchPerl::VERSION || "(unreleased)";
+    open my $plin, "patchlevel.h" or die "Couldn't open patchlevel.h : $!";
+    open my $plout, ">patchlevel.new" or die "Couldn't write on patchlevel.new : $!";
+    my $seen=0;
+    while (<$plin>) {
+        if (/\t,NULL/ and $seen) {
+          print {$plout} qq{\t,"Devel::PatchPerl $dpv"\n};
+        }
+        $seen++ if /local_patches\[\]/;
+        print {$plout} $_;
+    }
+    close $plout or die "Couldn't close filehandle writing to patchlevel.new : $!";
+    close $plin or die "Couldn't close filehandle reading from patchlevel.h : $!";
+    unlink "patchlevel.bak" or warn "Couldn't unlink patchlevel.bak : $!"
+      if -e "patchlevel.bak";
+    rename "patchlevel.h", "patchlevel.bak" or
+      die "Couldn't rename patchlevel.h to patchlevel.bak : $!";
+    rename "patchlevel.new", "patchlevel.h" or
+      die "Couldn't rename patchlevel.new to patchlevel.h : $!";
   }
   
   sub _patch_hints {
@@ -2677,6 +3819,62 @@ $fatpacked{"Devel/PatchPerl.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<
   COWSAY
   }
   
+  sub _patch_preprocess_options {
+    my $perl = shift;
+  
+    if ($perl =~ /^5\.(?:8|10)\./) {
+      _patch(<<'END');
+  diff --git a/perl.c b/perl.c
+  index 82e5538..b9e02fe 100644
+  --- perl.c
+  +++ perl.c
+  @@ -3758,7 +3758,7 @@ S_open_script(pTHX_ const char *scriptname, bool dosearch, SV *sv,
+   #       ifdef VMS
+               cpp_discard_flag = "";
+   #       else
+  -            cpp_discard_flag = "-C";
+  +            cpp_discard_flag = "-C -ffreestanding";
+   #       endif
+   
+   #       ifdef OS2
+  END
+    } elsif ($perl =~ /^5\.6\./) {
+      _patch(<<'END');
+  diff --git a/perl.c b/perl.c
+  index 623f9be..014d318 100644
+  --- perl.c
+  +++ perl.c
+  @@ -2631,7 +2631,7 @@ sed %s -e \"/^[^#]/b\" \
+    -e '/^#[ 	]*undef[ 	]/b' \
+    -e '/^#[ 	]*endif/b' \
+    -e 's/^[ 	]*#.*//' \
+  - %s | %"SVf" -C %"SVf" %s",
+  + %s | %"SVf" -C -ffreestanding %"SVf" %s",
+   #  endif
+   #ifdef LOC_SED
+   	  LOC_SED,
+  END
+    }
+  }
+  
+  sub _patch_5183_metajson {
+  _patch(<<'DOGSAY');
+  diff --git a/META.json b/META.json
+  index 64caea7..200e324 100644
+  --- META.json
+  +++ META.json
+  @@ -118,7 +118,7 @@
+            "TestInit.pm"
+         ]
+      },
+  -   "release_status" : "testing",
+  +   "release_status" : "stable",
+      "resources" : {
+         "bugtracker" : {
+            "web" : "http://rt.perl.org/perlbug/"
+  DOGSAY
+  }
+  
   sub _norm_ver {
     my $ver = shift;
     my @v = split(qr/[._]0*/, $ver);
@@ -2698,7 +3896,7 @@ $fatpacked{"Devel/PatchPerl.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<
   
   =head1 VERSION
   
-  version 1.24
+  version 1.30
   
   =head1 SYNOPSIS
   
@@ -2774,7 +3972,7 @@ DEVEL_PATCHPERL
 
 $fatpacked{"Devel/PatchPerl/Hints.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'DEVEL_PATCHPERL_HINTS';
   package Devel::PatchPerl::Hints;
-  $Devel::PatchPerl::Hints::VERSION = '1.24';
+  $Devel::PatchPerl::Hints::VERSION = '1.30';
   #ABSTRACT: replacement 'hints' files
   
   use strict;
@@ -2893,7 +4091,9 @@ $fatpacked{"Devel/PatchPerl/Hints.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"
   biBUaWdlcgojICgxMC40L2RhcndpbiA4KSBhbmQgZWFybGllciBbcGVybCAjMjQxMjJdCmNhc2Ug
   IiRvc3ZlcnMiIGluClsxLThdLiopCiAgICBkX3NldHJlZ2lkPSd1bmRlZicKICAgIGRfc2V0cmV1
   aWQ9J3VuZGVmJwogICAgZF9zZXRyZ2lkPSd1bmRlZicKICAgIGRfc2V0cnVpZD0ndW5kZWYnCiAg
-  ICA7Owplc2FjCgojIFRoaXMgd2FzIHByZXZpb3VzbHkgdXNlZCBpbiBhbGwgYnV0IGNhdXNlcyB0
+  ICA7Owplc2FjCgojIGZpbml0ZSgpIGRlcHJlY2F0ZWQgaW4gMTAuOSwgdXNlIGlzZmluaXRlKCkg
+  aW5zdGVhZC4KY2FzZSAiJG9zdmVycyIgaW4KWzEtOF0uKikgOzsKKikgZF9maW5pdGU9J3VuZGVm
+  JyA7Owplc2FjCgojIFRoaXMgd2FzIHByZXZpb3VzbHkgdXNlZCBpbiBhbGwgYnV0IGNhdXNlcyB0
   aHJlZSBjYXNlcwojIChubyAtRGRwcmVmaXg9LCAtRHByZWZpeD0vdXNyLCAtRHByZWZpeD0vc29t
   ZS90aGluZy9lbHNlKQojIGJ1dCB0aGF0IGNhdXNlZCB0b28gbXVjaCBncmllZi4KIyB2ZW5kb3Js
   aWI9Ii9TeXN0ZW0vTGlicmFyeS9QZXJsLyR7dmVyc2lvbn0iOyAjIEFwcGxlLXN1cHBsaWVkIG1v
@@ -2967,75 +4167,82 @@ $fatpacked{"Devel/PatchPerl/Hints.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"
   cyBiZXN0CicnKQogICBjY2NkbGZsYWdzPScgJzsgIyBzcGFjZSwgbm90IGVtcHR5LCBiZWNhdXNl
   IG90aGVyd2lzZSB3ZSBnZXQgLWZwaWMKOzsKZXNhYwoKIyBBbGxvdyB0aGUgdXNlciB0byBvdmVy
   cmlkZSBsZCwgYnV0IG1vZGlmeSBpdCBhcyBuZWNlc3NhcnkgYmVsb3cKY2FzZSAiJGxkIiBpbgog
-  ICAgJycpIGxkPSdjYyc7Owplc2FjCgojIFBlcmwgYnVuZGxlcyBkbyBub3QgZXhwZWN0IHR3by1s
-  ZXZlbCBuYW1lc3BhY2UsIGFkZGVkIGluIERhcndpbiAxLjQuCiMgQnV0IHN0YXJ0aW5nIGZyb20g
-  cGVybCA1LjguMS9EYXJ3aW4gNyB0aGUgZGVmYXVsdCBpcyB0aGUgdHdvLWxldmVsLgpjYXNlICIk
-  b3N2ZXJzIiBpbgoxLlswLTNdLiopCiAgIGxkZGxmbGFncz0iJHtsZGZsYWdzfSAtYnVuZGxlIC11
-  bmRlZmluZWQgc3VwcHJlc3MiCiAgIDs7CjEuKikKICAgbGRmbGFncz0iJHtsZGZsYWdzfSAtZmxh
-  dF9uYW1lc3BhY2UiCiAgIGxkZGxmbGFncz0iJHtsZGZsYWdzfSAtYnVuZGxlIC11bmRlZmluZWQg
-  c3VwcHJlc3MiCiAgIDs7ClsyLTZdLiopCiAgIGxkZmxhZ3M9IiR7bGRmbGFnc30gLWZsYXRfbmFt
+  ICAgJycpIGNhc2UgIiRjYyIgaW4KICAgICAgICAjIElmIHRoZSBjYyBpcyBleHBsaWNpdGx5IHNv
+  bWV0aGluZyBlbHNlIHRoYW4gY2MgKG9yIGVtcHR5KSwKICAgICAgICAjIHNldCB0aGUgbGQgdG8g
+  YmUgdGhhdCBleHBsaWNpdGx5IHNvbWV0aGluZyBlbHNlLiAgQ29udmVyc2VseSwKICAgICAgICAj
+  IGlmIHRoZSBjYyBpcyAnY2MnIChvciBlbXB0eSksIHNldCB0aGUgbGQgdG8gYmUgJ2NjJy4KICAg
+  ICAgICBjY3wnJykgbGQ9J2NjJzs7CiAgICAgICAgKikgbGQ9IiRjYyIgOzsKICAgICAgICBlc2Fj
+  CiAgICAgICAgOzsKZXNhYwoKIyBQZXJsIGJ1bmRsZXMgZG8gbm90IGV4cGVjdCB0d28tbGV2ZWwg
+  bmFtZXNwYWNlLCBhZGRlZCBpbiBEYXJ3aW4gMS40LgojIEJ1dCBzdGFydGluZyBmcm9tIHBlcmwg
+  NS44LjEvRGFyd2luIDcgdGhlIGRlZmF1bHQgaXMgdGhlIHR3by1sZXZlbC4KY2FzZSAiJG9zdmVy
+  cyIgaW4KMS5bMC0zXS4qKQogICBsZGRsZmxhZ3M9IiR7bGRmbGFnc30gLWJ1bmRsZSAtdW5kZWZp
+  bmVkIHN1cHByZXNzIgogICA7OwoxLiopCiAgIGxkZmxhZ3M9IiR7bGRmbGFnc30gLWZsYXRfbmFt
   ZXNwYWNlIgogICBsZGRsZmxhZ3M9IiR7bGRmbGFnc30gLWJ1bmRsZSAtdW5kZWZpbmVkIHN1cHBy
-  ZXNzIgogICA7OwoqKSAKICAgbGRkbGZsYWdzPSIke2xkZmxhZ3N9IC1idW5kbGUgLXVuZGVmaW5l
-  ZCBkeW5hbWljX2xvb2t1cCIKICAgY2FzZSAiJGxkIiBpbgogICAgICAgKk1BQ09TWF9ERVZFTE9Q
-  TUVOVF9UQVJHRVQqKSA7OwogICAgICAgKikgbGQ9ImVudiBNQUNPU1hfREVQTE9ZTUVOVF9UQVJH
-  RVQ9MTAuMyAke2xkfSIgOzsKICAgZXNhYwogICA7Owplc2FjCmxkbGlicHRobmFtZT0nRFlMRF9M
-  SUJSQVJZX1BBVEgnOwoKIyB1c2VzaHJwbGliPXRydWUgcmVzdWx0cyBpbiBtdWNoIHNsb3dlciBz
-  dGFydHVwIHRpbWVzLgojICdmYWxzZScgaXMgdGhlIGRlZmF1bHQgdmFsdWUuICBVc2UgQ29uZmln
-  dXJlIC1EdXNlc2hycGxpYiB0byBvdmVycmlkZS4KCmNhdCA+IFVVL2FyY2huYW1lLmNidSA8PCdF
-  T0NCVScKIyBUaGlzIHNjcmlwdCBVVS9hcmNobmFtZS5jYnUgd2lsbCBnZXQgJ2NhbGxlZC1iYWNr
-  JyBieSBDb25maWd1cmUgCiMgYWZ0ZXIgaXQgaGFzIG90aGVyd2lzZSBkZXRlcm1pbmVkIHRoZSBh
-  cmNoaXRlY3R1cmUgbmFtZS4KY2FzZSAiJGxkZmxhZ3MiIGluCioiLWZsYXRfbmFtZXNwYWNlIiop
-  IDs7ICMgQmFja3dhcmQgY29tcGF0LCBiZSBmbGF0LgojIElmIHdlIGFyZSB1c2luZyB0d28tbGV2
-  ZWwgbmFtZXNwYWNlLCB3ZSB3aWxsIG11bmdlIHRoZSBhcmNobmFtZSB0byBzaG93IGl0LgoqKSBh
-  cmNobmFtZT0iJHthcmNobmFtZX0tMmxldmVsIiA7Owplc2FjCkVPQ0JVCgojIDY0LWJpdCBhZGRy
-  ZXNzaW5nIHN1cHBvcnQuIEN1cnJlbnRseSBzdHJpY3RseSBleHBlcmltZW50YWwuIERGRCAyMDA1
-  LTA2LTA2CmNhc2UgIiR1c2U2NGJpdGFsbCIgaW4KJGRlZmluZXx0cnVlfFt5WV0qKQpjYXNlICIk
-  b3N2ZXJzIiBpbgpbMS03XS4qKQogICAgIGNhdCA8PEVPTSA+JjQKCgoKKioqIDY0LWJpdCBhZGRy
-  ZXNzaW5nIGlzIG5vdCBzdXBwb3J0ZWQgZm9yIE1hYyBPUyBYIHZlcnNpb25zCioqKiBiZWxvdyAx
-  MC40ICgiVGlnZXIiKSBvciBEYXJ3aW4gdmVyc2lvbnMgYmVsb3cgOC4gUGxlYXNlIHRyeQoqKiog
-  YWdhaW4gd2l0aG91dCAtRHVzZTY0Yml0YWxsLiAoLUR1c2U2NGJpdGludCB3aWxsIHdvcmssIGhv
-  d2V2ZXIuKQoKRU9NCiAgICAgZXhpdCAxCiAgOzsKKikKICAgIGNhc2UgIiRvc3ZlcnMiIGluCiAg
-  ICA4LiopCiAgICAgICAgY2F0IDw8RU9NID4mNAoKCgoqKiogUGVybCA2NC1iaXQgYWRkcmVzc2lu
-  ZyBzdXBwb3J0IGlzIGV4cGVyaW1lbnRhbCBmb3IgTWFjIE9TIFgKKioqIDEwLjQgKCJUaWdlciIp
-  IGFuZCBEYXJ3aW4gdmVyc2lvbiA4LiBTeXN0ZW0gViBJUEMgaXMgZGlzYWJsZWQKKioqIGR1ZSB0
-  byBwcm9ibGVtcyB3aXRoIHRoZSA2NC1iaXQgdmVyc2lvbnMgb2YgbXNnY3RsLCBzZW1jdGwsCioq
-  KiBhbmQgc2htY3RsLiBZb3Ugc2hvdWxkIGFsc28gZXhwZWN0IHRoZSBmb2xsb3dpbmcgdGVzdCBm
-  YWlsdXJlczoKKioqCioqKiAgICBleHQvdGhyZWFkcy1zaGFyZWQvdC93YWl0ICh0aHJlYWRlZCBi
-  dWlsZHMgb25seSkKCkVPTQoKICAgICAgICBbICIkZF9tc2djdGwiIF0gfHwgZF9tc2djdGw9J3Vu
-  ZGVmJwogICAgICAgIFsgIiRkX3NlbWN0bCIgXSB8fCBkX3NlbWN0bD0ndW5kZWYnCiAgICAgICAg
-  WyAiJGRfc2htY3RsIiBdIHx8IGRfc2htY3RsPSd1bmRlZicKICAgIDs7CiAgICBlc2FjCgogICAg
-  Y2FzZSBgdW5hbWUgLXBgIGluIAogICAgcG93ZXJwYykgYXJjaD1wcGM2NCA7OwogICAgaTM4Nikg
-  YXJjaD14ODZfNjQgOzsKICAgICopIGNhdCA8PEVPTSA+JjQKCioqKiBEb24ndCByZWNvZ25pemUg
-  cHJvY2Vzc29yLCBjYW4ndCBzcGVjaWZ5IDY0IGJpdCBjb21waWxhdGlvbi4KCkVPTQogICAgOzsK
-  ICAgIGVzYWMKICAgIGZvciB2YXIgaW4gY2NmbGFncyBjcHBmbGFncyBsZCBsZGZsYWdzCiAgICBk
-  bwogICAgICAgZXZhbCAkdmFyPSJcJCR7dmFyfVwgLWFyY2hcICRhcmNoIgogICAgZG9uZQoKICAg
-  IDs7CmVzYWMKOzsKZXNhYwoKIyMKIyBTeXN0ZW0gbGlicmFyaWVzCiMjCgojIHZmb3JrIHdvcmtz
-  CnVzZXZmb3JrPSd0cnVlJzsKCiMgbWFsbG9jIHdyYXAgd29ya3MKY2FzZSAiJHVzZW1hbGxvY3dy
-  YXAiIGluCicnKSB1c2VtYWxsb2N3cmFwPSdkZWZpbmUnIDs7CmVzYWMKCiMgb3VyIG1hbGxvYyB3
-  b3JrcyAoYnV0IGFsbG93IHVzZXJzIHRvIG92ZXJyaWRlKQpjYXNlICIkdXNlbXltYWxsb2MiIGlu
-  CicnKSB1c2VteW1hbGxvYz0nbicgOzsKZXNhYwojIEhvd2V2ZXIgc2JyaygpIHJldHVybnMgLTEg
-  KGZhaWx1cmUpIHNvbWV3aGVyZSBpbiBsaWIvdW5pY29yZS9ta3RhYmxlcyBhdAojIGFyb3VuZCAx
-  NE0sIHNvIHdlIG5lZWQgdG8gdXNlIHN5c3RlbSBtYWxsb2MoKSBhcyBvdXIgc2JyaygpCm1hbGxv
-  Y19jZmxhZ3M9J2NjZmxhZ3M9Ii1EVVNFX1BFUkxfU0JSSyAtRFBFUkxfU0JSS19WSUFfTUFMTE9D
-  ICRjY2ZsYWdzIicKCiMgTG9jYWxlcyBhcmVuJ3QgZmVlbGluZyB3ZWxsLgpMQ19BTEw9QzsgZXhw
-  b3J0IExDX0FMTDsKTEFORz1DOyBleHBvcnQgTEFORzsKCiMKIyBUaGUgbGlicmFyaWVzIGFyZSBu
-  b3QgdGhyZWFkc2FmZSBhcyBvZiBPUyBYIDEwLjEuCiMKIyBGaXggd2hlbiBBcHBsZSBmaXhlcyBs
-  aWJjLgojCmNhc2UgIiR1c2V0aHJlYWRzJHVzZWl0aHJlYWRzIiBpbgogICpkZWZpbmUqKQogIGNh
-  c2UgIiRvc3ZlcnMiIGluCiAgICBbMTIzNDVdLiopICAgICBjYXQgPDxFT00gPiY0CgoKCioqKiBX
-  YXJuaW5nLCB0aGVyZSBtaWdodCBiZSBwcm9ibGVtcyB3aXRoIHlvdXIgbGlicmFyaWVzIHdpdGgK
-  KioqIHJlZ2FyZHMgdG8gdGhyZWFkaW5nLiAgVGhlIHRlc3QgZXh0L3RocmVhZHMvdC9saWJjLnQg
-  aXMgbGlrZWx5CioqKiB0byBmYWlsLgoKRU9NCiAgICA7OwogICAgKikgdXNlcmVlbnRyYW50PSdk
-  ZWZpbmUnOzsKICBlc2FjCgplc2FjCgojIEZpbmsgY2FuIGluc3RhbGwgYSBHREJNIGxpYnJhcnkg
-  dGhhdCBjbGFpbXMgdG8gaGF2ZSB0aGUgT0RCTSBpbnRlcmZhY2VzCiMgYnV0IFBlcmwgZHluYWxv
-  YWRlciBjYW5ub3QgZm9yIHNvbWUgcmVhc29uIHVzZSB0aGF0IGxpYnJhcnkuICBXZSBkb24ndAoj
-  IHJlYWxseSBuZWVkIE9EQk1fRklsZSwgdGhvdWdoLCBzbyBsZXQncyBqdXN0IGhpbnQgT0RCTSBh
-  d2F5LgppX2RibT11bmRlZjsKCiMgQ29uZmlndXJlIGRvZXNuJ3QgZGV0ZWN0IHJhbmxpYiBvbiBU
-  aWdlciBwcm9wZXJseS4KIyBOZWlsVyBzYXlzIHRoaXMgc2hvdWxkIGJlIGFjY2VwdGFibGUgb24g
-  YWxsIGRhcndpbiB2ZXJzaW9ucy4KcmFubGliPSdyYW5saWInCgojIwojIEJ1aWxkIHByb2Nlc3MK
-  IyMKCiMgQ2FzZS1pbnNlbnNpdGl2ZSBmaWxlc3lzdGVtcyBkb24ndCBnZXQgYWxvbmcgd2l0aCBN
-  YWtlZmlsZSBhbmQKIyBtYWtlZmlsZSBpbiB0aGUgc2FtZSBwbGFjZS4gIFNpbmNlIERhcndpbiB1
-  c2VzIEdOVSBtYWtlLCB0aGlzIGRvZGdlcwojIHRoZSBwcm9ibGVtLgpmaXJzdG1ha2VmaWxlPUdO
-  VW1ha2VmaWxlOwo=',
+  ZXNzIgogICA7OwpbMi02XS4qKQogICBsZGZsYWdzPSIke2xkZmxhZ3N9IC1mbGF0X25hbWVzcGFj
+  ZSIKICAgbGRkbGZsYWdzPSIke2xkZmxhZ3N9IC1idW5kbGUgLXVuZGVmaW5lZCBzdXBwcmVzcyIK
+  ICAgOzsKKikgCiAgIGxkZGxmbGFncz0iJHtsZGZsYWdzfSAtYnVuZGxlIC11bmRlZmluZWQgZHlu
+  YW1pY19sb29rdXAiCiAgIGNhc2UgIiRsZCIgaW4KICAgICAgICpNQUNPU1hfREVWRUxPUE1FTlRf
+  VEFSR0VUKikgOzsKICAgICAgICopIGxkPSJlbnYgTUFDT1NYX0RFUExPWU1FTlRfVEFSR0VUPTEw
+  LjMgJHtsZH0iIDs7CiAgIGVzYWMKICAgOzsKZXNhYwpsZGxpYnB0aG5hbWU9J0RZTERfTElCUkFS
+  WV9QQVRIJzsKCiMgdXNlc2hycGxpYj10cnVlIHJlc3VsdHMgaW4gbXVjaCBzbG93ZXIgc3RhcnR1
+  cCB0aW1lcy4KIyAnZmFsc2UnIGlzIHRoZSBkZWZhdWx0IHZhbHVlLiAgVXNlIENvbmZpZ3VyZSAt
+  RHVzZXNocnBsaWIgdG8gb3ZlcnJpZGUuCgpjYXQgPiBVVS9hcmNobmFtZS5jYnUgPDwnRU9DQlUn
+  CiMgVGhpcyBzY3JpcHQgVVUvYXJjaG5hbWUuY2J1IHdpbGwgZ2V0ICdjYWxsZWQtYmFjaycgYnkg
+  Q29uZmlndXJlIAojIGFmdGVyIGl0IGhhcyBvdGhlcndpc2UgZGV0ZXJtaW5lZCB0aGUgYXJjaGl0
+  ZWN0dXJlIG5hbWUuCmNhc2UgIiRsZGZsYWdzIiBpbgoqIi1mbGF0X25hbWVzcGFjZSIqKSA7OyAj
+  IEJhY2t3YXJkIGNvbXBhdCwgYmUgZmxhdC4KIyBJZiB3ZSBhcmUgdXNpbmcgdHdvLWxldmVsIG5h
+  bWVzcGFjZSwgd2Ugd2lsbCBtdW5nZSB0aGUgYXJjaG5hbWUgdG8gc2hvdyBpdC4KKikgYXJjaG5h
+  bWU9IiR7YXJjaG5hbWV9LTJsZXZlbCIgOzsKZXNhYwpFT0NCVQoKIyA2NC1iaXQgYWRkcmVzc2lu
+  ZyBzdXBwb3J0LiBDdXJyZW50bHkgc3RyaWN0bHkgZXhwZXJpbWVudGFsLiBERkQgMjAwNS0wNi0w
+  NgpjYXNlICIkdXNlNjRiaXRhbGwiIGluCiRkZWZpbmV8dHJ1ZXxbeVldKikKY2FzZSAiJG9zdmVy
+  cyIgaW4KWzEtN10uKikKICAgICBjYXQgPDxFT00gPiY0CgoKCioqKiA2NC1iaXQgYWRkcmVzc2lu
+  ZyBpcyBub3Qgc3VwcG9ydGVkIGZvciBNYWMgT1MgWCB2ZXJzaW9ucwoqKiogYmVsb3cgMTAuNCAo
+  IlRpZ2VyIikgb3IgRGFyd2luIHZlcnNpb25zIGJlbG93IDguIFBsZWFzZSB0cnkKKioqIGFnYWlu
+  IHdpdGhvdXQgLUR1c2U2NGJpdGFsbC4gKC1EdXNlNjRiaXRpbnQgd2lsbCB3b3JrLCBob3dldmVy
+  LikKCkVPTQogICAgIGV4aXQgMQogIDs7CiopCiAgICBjYXNlICIkb3N2ZXJzIiBpbgogICAgOC4q
+  KQogICAgICAgIGNhdCA8PEVPTSA+JjQKCgoKKioqIFBlcmwgNjQtYml0IGFkZHJlc3Npbmcgc3Vw
+  cG9ydCBpcyBleHBlcmltZW50YWwgZm9yIE1hYyBPUyBYCioqKiAxMC40ICgiVGlnZXIiKSBhbmQg
+  RGFyd2luIHZlcnNpb24gOC4gU3lzdGVtIFYgSVBDIGlzIGRpc2FibGVkCioqKiBkdWUgdG8gcHJv
+  YmxlbXMgd2l0aCB0aGUgNjQtYml0IHZlcnNpb25zIG9mIG1zZ2N0bCwgc2VtY3RsLAoqKiogYW5k
+  IHNobWN0bC4gWW91IHNob3VsZCBhbHNvIGV4cGVjdCB0aGUgZm9sbG93aW5nIHRlc3QgZmFpbHVy
+  ZXM6CioqKgoqKiogICAgZXh0L3RocmVhZHMtc2hhcmVkL3Qvd2FpdCAodGhyZWFkZWQgYnVpbGRz
+  IG9ubHkpCgpFT00KCiAgICAgICAgWyAiJGRfbXNnY3RsIiBdIHx8IGRfbXNnY3RsPSd1bmRlZicK
+  ICAgICAgICBbICIkZF9zZW1jdGwiIF0gfHwgZF9zZW1jdGw9J3VuZGVmJwogICAgICAgIFsgIiRk
+  X3NobWN0bCIgXSB8fCBkX3NobWN0bD0ndW5kZWYnCiAgICA7OwogICAgZXNhYwoKICAgIGNhc2Ug
+  YHVuYW1lIC1wYCBpbiAKICAgIHBvd2VycGMpIGFyY2g9cHBjNjQgOzsKICAgIGkzODYpIGFyY2g9
+  eDg2XzY0IDs7CiAgICAqKSBjYXQgPDxFT00gPiY0CgoqKiogRG9uJ3QgcmVjb2duaXplIHByb2Nl
+  c3NvciwgY2FuJ3Qgc3BlY2lmeSA2NCBiaXQgY29tcGlsYXRpb24uCgpFT00KICAgIDs7CiAgICBl
+  c2FjCiAgICBmb3IgdmFyIGluIGNjZmxhZ3MgY3BwZmxhZ3MgbGQgbGRmbGFncwogICAgZG8KICAg
+  ICAgIGV2YWwgJHZhcj0iXCQke3Zhcn1cIC1hcmNoXCAkYXJjaCIKICAgIGRvbmUKCiAgICA7Owpl
+  c2FjCjs7CmVzYWMKCiMjCiMgU3lzdGVtIGxpYnJhcmllcwojIwoKIyB2Zm9yayB3b3Jrcwp1c2V2
+  Zm9yaz0ndHJ1ZSc7CgojIG1hbGxvYyB3cmFwIHdvcmtzCmNhc2UgIiR1c2VtYWxsb2N3cmFwIiBp
+  bgonJykgdXNlbWFsbG9jd3JhcD0nZGVmaW5lJyA7Owplc2FjCgojIG91ciBtYWxsb2Mgd29ya3Mg
+  KGJ1dCBhbGxvdyB1c2VycyB0byBvdmVycmlkZSkKY2FzZSAiJHVzZW15bWFsbG9jIiBpbgonJykg
+  dXNlbXltYWxsb2M9J24nIDs7CmVzYWMKIyBIb3dldmVyIHNicmsoKSByZXR1cm5zIC0xIChmYWls
+  dXJlKSBzb21ld2hlcmUgaW4gbGliL3VuaWNvcmUvbWt0YWJsZXMgYXQKIyBhcm91bmQgMTRNLCBz
+  byB3ZSBuZWVkIHRvIHVzZSBzeXN0ZW0gbWFsbG9jKCkgYXMgb3VyIHNicmsoKQptYWxsb2NfY2Zs
+  YWdzPSdjY2ZsYWdzPSItRFVTRV9QRVJMX1NCUksgLURQRVJMX1NCUktfVklBX01BTExPQyAkY2Nm
+  bGFncyInCgojIExvY2FsZXMgYXJlbid0IGZlZWxpbmcgd2VsbC4KTENfQUxMPUM7IGV4cG9ydCBM
+  Q19BTEw7CkxBTkc9QzsgZXhwb3J0IExBTkc7CgojCiMgVGhlIGxpYnJhcmllcyBhcmUgbm90IHRo
+  cmVhZHNhZmUgYXMgb2YgT1MgWCAxMC4xLgojCiMgRml4IHdoZW4gQXBwbGUgZml4ZXMgbGliYy4K
+  IwpjYXNlICIkdXNldGhyZWFkcyR1c2VpdGhyZWFkcyIgaW4KICAqZGVmaW5lKikKICBjYXNlICIk
+  b3N2ZXJzIiBpbgogICAgWzEyMzQ1XS4qKSAgICAgY2F0IDw8RU9NID4mNAoKCgoqKiogV2Fybmlu
+  ZywgdGhlcmUgbWlnaHQgYmUgcHJvYmxlbXMgd2l0aCB5b3VyIGxpYnJhcmllcyB3aXRoCioqKiBy
+  ZWdhcmRzIHRvIHRocmVhZGluZy4gIFRoZSB0ZXN0IGV4dC90aHJlYWRzL3QvbGliYy50IGlzIGxp
+  a2VseQoqKiogdG8gZmFpbC4KCkVPTQogICAgOzsKICAgICopIHVzZXJlZW50cmFudD0nZGVmaW5l
+  Jzs7CiAgZXNhYwoKZXNhYwoKIyBGaW5rIGNhbiBpbnN0YWxsIGEgR0RCTSBsaWJyYXJ5IHRoYXQg
+  Y2xhaW1zIHRvIGhhdmUgdGhlIE9EQk0gaW50ZXJmYWNlcwojIGJ1dCBQZXJsIGR5bmFsb2FkZXIg
+  Y2Fubm90IGZvciBzb21lIHJlYXNvbiB1c2UgdGhhdCBsaWJyYXJ5LiAgV2UgZG9uJ3QKIyByZWFs
+  bHkgbmVlZCBPREJNX0ZJbGUsIHRob3VnaCwgc28gbGV0J3MganVzdCBoaW50IE9EQk0gYXdheS4K
+  aV9kYm09dW5kZWY7CgojIENvbmZpZ3VyZSBkb2Vzbid0IGRldGVjdCByYW5saWIgb24gVGlnZXIg
+  cHJvcGVybHkuCiMgTmVpbFcgc2F5cyB0aGlzIHNob3VsZCBiZSBhY2NlcHRhYmxlIG9uIGFsbCBk
+  YXJ3aW4gdmVyc2lvbnMuCnJhbmxpYj0ncmFubGliJwoKIyBDYXRjaCBNYWNQb3J0cyBnY2MvZysr
+  IGV4dHJhIGxpYmRpcgpjYXNlICIkKCRjYyAtdiAyPiYxKSIgaW4KKiJNYWNQb3J0cyBnY2MiKikg
+  bG9jbGlicHRoPSIkbG9jbGlicHRoIC9vcHQvbG9jYWwvbGliL2xpYmdjYyIgOzsKZXNhYwoKIyMK
+  IyBCdWlsZCBwcm9jZXNzCiMjCgojIENhc2UtaW5zZW5zaXRpdmUgZmlsZXN5c3RlbXMgZG9uJ3Qg
+  Z2V0IGFsb25nIHdpdGggTWFrZWZpbGUgYW5kCiMgbWFrZWZpbGUgaW4gdGhlIHNhbWUgcGxhY2Uu
+  ICBTaW5jZSBEYXJ3aW4gdXNlcyBHTlUgbWFrZSwgdGhpcyBkb2RnZXMKIyB0aGUgcHJvYmxlbS4K
+  Zmlyc3RtYWtlZmlsZT1HTlVtYWtlZmlsZTsK',
   'dragonfly' =>
   'IyBoaW50cy9kcmFnb25mbHkuc2gKIwojIFRoaXMgZmlsZSBpcyBtb3N0bHkgY29waWVkIGZyb20g
   aGludHMvZnJlZWJzZC5zaCB3aXRoIHRoZSBPUyB2ZXJzaW9uCiMgaW5mb3JtYXRpb24gdGFrZW4g
@@ -3455,193 +4662,212 @@ $fatpacked{"Devel/PatchPerl/Hints.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"
   IHN5c2FkbWluLCBhbmQgeW91ICpkbyogd2FudCBmdWxsCm9wdGltaXphdGlvbiwgcmFpc2UgdGhl
   ICdtYXhkc2l6JyBrZXJuZWwgY29uZmlndXJhdGlvbiBwYXJhbWV0ZXIKdG8gYXQgbGVhc3QgMHgw
   ODAwMDAwMCAoMTI4IE1iKSBhbmQgcmVidWlsZCB5b3VyIGtlcm5lbC4KRU9NCnJlZ2V4ZWNfY2Zs
-  YWdzPScnCmRvb3BfY2ZsYWdzPScnCm9wX2NmbGFncz0nJwogICAgZmkKCmNhc2UgIiRjY2lzZ2Nj
-  IiBpbgogICAgJGRlZmluZXx0cnVlfFtZeV0pCgoJY2FzZSAiJG9wdGltaXplIiBpbgoJICAgICIi
-  KSAgICAgICAgICAgb3B0aW1pemU9Ii1nIC1PIiA7OwoJICAgICpPWzM0NTY3ODldKikgb3B0aW1p
-  emU9YGVjaG8gIiRvcHRpbWl6ZSIgfCBzZWQgLWUgJ3MvT1szLTldL08yLydgIDs7CgkgICAgZXNh
-  YwoJI2xkPSIkY2MiCglsZD0vdXNyL2Jpbi9sZAoJY2NjZGxmbGFncz0nLWZQSUMnCgkjbGRkbGZs
-  YWdzPSctc2hhcmVkJwoJbGRkbGZsYWdzPSctYicKCWNhc2UgIiRvcHRpbWl6ZSIgaW4KCSAgICAq
-  LWcqLU8qfCotTyotZyopCgkJIyBnY2Mgd2l0aG91dCBnYXMgd2lsbCBub3QgYWNjZXB0IC1nCgkJ
-  ZWNobyAibWFpbigpe30iPnRyeS5jCgkJY2FzZSAiYCRjYyAkb3B0aW1pemUgLWMgdHJ5LmMgMj4m
-  MWAiIGluCgkJICAgICoiLWcgb3B0aW9uIGRpc2FibGVkIiopCgkJCXNldCBgZWNobyAiWCAkb3B0
-  aW1pemUgIiB8IHNlZCAtZSAncy8gLWcgLyAvJ2AKCQkJc2hpZnQKCQkJb3B0aW1pemU9IiQqIgoJ
-  CQk7OwoJCSAgICBlc2FjCgkJOzsKCSAgICBlc2FjCglpZiBbICRtYXhkc2l6IC1sZSA2NCBdOyB0
-  aGVuCgkgICAgY2FzZSAiJG9wdGltaXplIiBpbgoJCSpPMiopCW9wdD1gZWNobyAiJG9wdGltaXpl
-  IiB8IHNlZCAtZSAncy9PMi9PMS8nYAoJCQl0b2tlX2NmbGFncz0iJHRva2VfY2ZsYWdzO29wdGlt
-  aXplPVwiJG9wdFwiIgoJCQlyZWdleGVjX2NmbGFncz0ib3B0aW1pemU9XCIkb3B0XCIiCgkJCTs7
-  CgkJZXNhYwoJICAgIGZpCgk7OwoKICAgICopCgljYXNlICIkb3B0aW1pemUiIGluCgkgICAgIiIp
-  ICAgICAgICAgICBvcHRpbWl6ZT0iK08yICtPbm9saW1pdCIgOzsKCSAgICAqT1szNDU2Nzg5XSop
-  IG9wdGltaXplPWBlY2hvICIkb3B0aW1pemUiIHwgc2VkIC1lICdzL09bMy05XS9PMi8nYCA7OwoJ
-  ICAgIGVzYWMKCWNhc2UgIiRvcHRpbWl6ZSIgaW4KCSAgICAqLU8qfFwKCSAgICAqTzIqKSAgIG9w
-  dD1gZWNobyAiJG9wdGltaXplIiB8IHNlZCAtZSAncy8tTy8rTzIvJyAtZSAncy9PMi9PMS8nIC1l
-  ICdzLyAqK09ub2xpbWl0Ly8nYAoJCSAgICA7OwoJICAgICopICAgICAgb3B0PSIkb3B0aW1pemUi
-  CgkJICAgIDs7CgkgICAgZXNhYwoJY2FzZSAiJGFyY2huYW1lIiBpbgoJICAgIElBNjQqKQoJCWNh
-  c2UgIiRjY3ZlcnNpb24iIGluCgkJICAgIEIzOTEwQipBLjA2LjBbMTIzNDVdKQoJCQkjID4gY2Mg
-  LS12ZXJzaW9uCgkJCSMgY2M6IEhQIGFDKysvQU5TSSBDIEIzOTEwQiBBLjA2LjA1IFtKdWwgMjUg
-  MjAwNV0KCQkJIyBIYXMgb3B0aW1pemluZyBwcm9ibGVtcyB3aXRoIC1PMiBhbmQgdXAgZm9yIGJv
-  dGgKCQkJIyBtYWludCAoNS44LjgrKSBhbmQgYmxlYWQgKDUuOS4zKykKCQkJIyAtTzEvK08xIHBh
-  c3NlZCBhbGwgdGVzdHMgKG0pJzA1IFsgMTAgSmFuIDIwMDUgXQoJCQlvcHRpbWl6ZT0iJG9wdCIJ
-  CQk7OwoJCQlCMzkxMEIqQS4wNi4xNSkKCQkJIyA+IGNjIC0tdmVyc2lvbgoJCQkjIGNjOiBIUCBD
-  L2FDKysgQjM5MTBCIEEuMDYuMTUgW01heSAxNiAyMDA3XQoJCQkjIEhhcyBvcHRpbWl6aW5nIHBy
-  b2JsZW1zIHdpdGggK08yIGZvciBibGVhZCAoNS4xNy40KSwKCQkJIyBzZWUgaHR0cHM6Ly9ydC5w
-  ZXJsLm9yZzo0NDMvcnQzL1RpY2tldC9EaXNwbGF5Lmh0bWw/aWQ9MTAzNjY4LgoJCQkjCgkJCSMg
-  K08yICtPbm9saW1pdCArT25vcHJvY2VsaW0gICtPc3RvcmVfb3JkZXJpbmcgXAoJCQkjICtPbm9s
-  aWJjYWxscz1zdHJjbXAKCQkJIyBwYXNzZXMgYWxsIHRlc3RzICh3aXRoL3dpdGhvdXQgLURERUJV
-  R0dJTkcpIFtOb3YgMTcgMjAxMV0KCQkJY2FzZSAiJG9wdGltaXplIiBpbgoJCQkJKk8yKikgb3B0
-  aW1pemU9IiRvcHRpbWl6ZSArT25vcHJvY2VsaW0gK09zdG9yZV9vcmRlcmluZyArT25vbGliY2Fs
-  bHM9c3RyY21wIiA7OwoJCQkJZXNhYwoJCQk7OwoJCSAgICAqKSAgZG9vcF9jZmxhZ3M9Im9wdGlt
-  aXplPVwiJG9wdFwiIgoJCQlvcF9jZmxhZ3M9Im9wdGltaXplPVwiJG9wdFwiIgk7OwoJCSAgICBl
-  c2FjCgkJOzsKCSAgICBlc2FjCglpZiBbICRtYXhkc2l6IC1sZSA2NCBdOyB0aGVuCgkgICAgdG9r
-  ZV9jZmxhZ3M9IiR0b2tlX2NmbGFncztvcHRpbWl6ZT1cIiRvcHRcIiIKCSAgICByZWdleGVjX2Nm
-  bGFncz0ib3B0aW1pemU9XCIkb3B0XCIiCgkgICAgZmkKCWxkPS91c3IvYmluL2xkCgljY2NkbGZs
-  YWdzPScrWicKCWxkZGxmbGFncz0nLWIgK3Zub2NvbXBhdHdhcm5pbmdzJwoJOzsKICAgIGVzYWMK
-  CiMjIExBUkdFRklMRVMKaWYgWyAkeHhPc1JldiAtbHQgMTAyMCBdOyB0aGVuCiAgICB1c2VsYXJn
-  ZWZpbGVzPSIkdW5kZWYiCiAgICBmaQoKI2Nhc2UgIiR1c2VsYXJnZWZpbGVzLSRjY2lzZ2NjIiBp
-  bgojICAgICIkZGVmaW5lLSRkZWZpbmUifCctZGVmaW5lJykKIwljYXQgPDxFT00gPiY0CiMKIyoq
-  KiBJJ20gaWdub3JpbmcgbGFyZ2UgZmlsZXMgZm9yIHRoaXMgYnVpbGQgYmVjYXVzZQojKioqIEkg
-  ZG9uJ3Qga25vdyBob3cgdG8gZG8gdXNlIGxhcmdlIGZpbGVzIGluIEhQLVVYIHVzaW5nIGdjYy4K
-  IwojRU9NCiMJdXNlbGFyZ2VmaWxlcz0iJHVuZGVmIgojCTs7CiMgICAgZXNhYwoKIyBPbmNlIHdl
-  IGhhdmUgdGhlIGNvbXBpbGVyIGZsYWdzIGRlZmluZWQsIENvbmZpZ3VyZSB3aWxsCiMgZXhlY3V0
-  ZSB0aGUgZm9sbG93aW5nIGNhbGwtYmFjayBzY3JpcHQuIFNlZSBoaW50cy9SRUFETUUuaGludHMK
-  IyBmb3IgZGV0YWlscy4KY2F0ID4gVVUvY2MuY2J1IDw8J0VPQ0JVJwojIFRoaXMgc2NyaXB0IFVV
-  L2NjLmNidSB3aWxsIGdldCAnY2FsbGVkLWJhY2snIGJ5IENvbmZpZ3VyZSBhZnRlciBpdAojIGhh
-  cyBwcm9tcHRlZCB0aGUgdXNlciBmb3IgdGhlIEMgY29tcGlsZXIgdG8gdXNlLgoKIyBDb21waWxl
-  IGFuZCBydW4gdGhlIGEgdGVzdCBjYXNlIHRvIHNlZSBpZiBhIGNlcnRhaW4gZ2NjIGJ1ZyBpcwoj
-  IHByZXNlbnQuIElmIHNvLCBsb3dlciB0aGUgb3B0aW1pemF0aW9uIGxldmVsIHdoZW4gY29tcGls
-  aW5nCiMgcHBfcGFjay5jLiAgVGhpcyB3b3JrcyBhcm91bmQgYSBidWcgaW4gdW5wYWNrLgoKaWYg
-  dGVzdCAteiAiJGNjaXNnY2MiIC1hIC16ICIkZ2NjdmVyc2lvbiI7IHRoZW4KICAgIDogbm8gdGVz
-  dHMgbmVlZGVkIGZvciBIUGMKZWxzZQogICAgZWNobyAiICIKICAgIGVjaG8gIlRlc3RpbmcgZm9y
-  IGEgY2VydGFpbiBnY2MgYnVnIGlzIGZpeGVkIGluIHlvdXIgY29tcGlsZXIuLi4iCgogICAgIyBU
-  cnkgY29tcGlsaW5nIHRoZSB0ZXN0IGNhc2UuCiAgICBpZiAkY2MgLW8gdDAwMSAtTyAkY2NmbGFn
-  cyAkbGRmbGFncyAtbG0gLi4vaGludHMvdDAwMS5jOyB0aGVuCiAgICAgICBnY2NidWc9YCRydW4g
-  Li90MDAxYAogICAgICAgY2FzZSAiJGdjY2J1ZyIgaW4KICAgICAgICAgICAqZmFpbHMqKQogICAg
-  ICAgICAgICAgICBjYXQgPiY0IDw8RU9GClRoaXMgQyBjb21waWxlciAoJGdjY3ZlcnNpb24pIGlz
-  IGtub3duIHRvIGhhdmUgb3B0aW1pemVyCnByb2JsZW1zIHdoZW4gY29tcGlsaW5nIHBwX3BhY2su
-  Yy4KCkRpc2FibGluZyBvcHRpbWl6YXRpb24gZm9yIHBwX3BhY2suYy4KRU9GCiAgICAgICAgICAg
-  ICAgIGNhc2UgIiRwcF9wYWNrX2NmbGFncyIgaW4KICAgICAgICAgICAgICAgICAgICcnKSBwcF9w
-  YWNrX2NmbGFncz0nb3B0aW1pemU9JwogICAgICAgICAgICAgICAgICAgICAgIGVjaG8gInBwX3Bh
-  Y2tfY2ZsYWdzPSdvcHRpbWl6ZT1cIlwiJyIgPj4gY29uZmlnLnNoIDs7CiAgICAgICAgICAgICAg
-  ICAgICAqKSAgZWNobyAiWW91IHNwZWNpZmllZCBwcF9wYWNrX2NmbGFncyB5b3Vyc2VsZiwgc28g
-  d2UnbGwgZ28gd2l0aCB5b3VyIHZhbHVlLiIgPiY0IDs7CiAgICAgICAgICAgICAgICAgICBlc2Fj
-  CiAgICAgICAgICAgICAgIDs7CiAgICAgICAgICAgKikgIGVjaG8gIllvdXIgY29tcGlsZXIgaXMg
-  b2suIiA+JjQKICAgICAgICAgICAgICAgOzsKICAgICAgICAgICBlc2FjCiAgICBlbHNlCiAgICAg
-  ICBlY2hvICIgIgogICAgICAgZWNobyAiKioqIFdIT0EgVEhFUkUhISEgKioqIiA+JjQKICAgICAg
-  IGVjaG8gIiAgICBZb3VyIEMgY29tcGlsZXIgXCIkY2NcIiBkb2Vzbid0IHNlZW0gdG8gYmUgd29y
-  a2luZyEiID4mNAogICAgICAgY2FzZSAiJGtub3dpdGFsbCIgaW4KICAgICAgICAgICAnJykgZWNo
-  byAiICAgIFlvdSdkIGJldHRlciBzdGFydCBodW50aW5nIGZvciBvbmUgYW5kIGxldCBtZSBrbm93
-  IGFib3V0IGl0LiIgPiY0CiAgICAgICAgICAgICAgIGV4aXQgMQogICAgICAgICAgICAgICA7Owog
-  ICAgICAgICAgIGVzYWMKICAgICAgIGZpCgogICAgcm0gLWYgdDAwMSRfbyB0MDAxJF9leGUKICAg
-  IGZpCkVPQ0JVCgpjYXQgPmNvbmZpZy5hcmNoIDw8J0VPQ0JVJwojIFRoaXMgc2NyaXB0IFVVL2Nv
-  bmZpZy5hcmNoIHdpbGwgZ2V0ICdjYWxsZWQtYmFjaycgYnkgQ29uZmlndXJlIGFmdGVyCiMgYWxs
-  IG90aGVyIGNvbmZpZ3VyYXRpb25zIGFyZSBkb25lIGp1c3QgYmVmb3JlIGNvbmZpZy5oIGlzIGdl
-  bmVyYXRlZApjYXNlICIkYXJjaG5hbWU6JG9wdGltaXplIiBpbgogIFBBKjoqLWcqWy0rXU8qfFBB
-  KjoqWy0rXU8qLWcqKQogICAgY2FzZSAiJGNjZmxhZ3MiIGluCiAgICAgICpERDY0KikgOzsKICAg
-  ICAgKikgY2FzZSAiJGNjdmVyc2lvbiIgaW4KCSAgIyBPbmx5IG9uIFBBLVJJU0MuIEIzOTEwQiAo
-  YUNDKSBpcyBub3QgZmF1bHR5CgkgICMgQi4xMS4qIGFuZCBBLjEwLiogYXJlCgkgIFtBQl0uMSop
-  CgkgICAgICAjIGNjOiBlcnJvciAxNDE0OiBDYW4ndCBoYW5kbGUgcHJlcHJvY2Vzc2VkIGZpbGUg
-  Zm9vLmkgaWYgLWcgYW5kIC1PIHNwZWNpZmllZC4KCSAgICAgIGVjaG8gIkhQLVVYIEMtQU5TSS1D
-  IG9uIFBBLVJJU0MgZG9lcyBub3QgYWNjZXB0IGJvdGggLWcgYW5kIC1PIG9uIHByZXByb2Nlc3Nl
-  ZCBmaWxlcyIgPiY0CgkgICAgICBlY2hvICJ3aGVuIGNvbXBpbGluZyBpbiAzMmJpdCBtb2RlLiBU
-  aGUgb3B0aW1pemVyIHdpbGwgYmUgZGlzYWJsZWQuIiA+JjQKCSAgICAgIG9wdGltaXplPWBlY2hv
-  ICIkb3B0aW1pemUiIHwgc2VkIC1lICdzL1stK11PWzAtOV0qLy8nIC1lICdzLytPbm9saW1pdC8v
-  JyAtZSAncy9eICovLydgCgkgICAgICA7OwoJICBlc2FjCiAgICAgIGVzYWMKICBlc2FjCkVPQ0JV
-  CgpjYXQgPlVVL3VzZWxhcmdlZmlsZXMuY2J1IDw8J0VPQ0JVJwojIFRoaXMgc2NyaXB0IFVVL3Vz
-  ZWxhcmdlZmlsZXMuY2J1IHdpbGwgZ2V0ICdjYWxsZWQtYmFjaycgYnkgQ29uZmlndXJlCiMgYWZ0
-  ZXIgaXQgaGFzIHByb21wdGVkIHRoZSB1c2VyIGZvciB3aGV0aGVyIHRvIHVzZSBsYXJnZSBmaWxl
-  cy4KY2FzZSAiJHVzZWxhcmdlZmlsZXMiIGluCiAgICAiInwkZGVmaW5lfHRydWV8W3lZXSopCgkj
-  IHRoZXJlIGFyZSBsYXJnZWZpbGUgZmxhZ3MgYXZhaWxhYmxlIHZpYSBnZXRjb25mKDEpCgkjIGJ1
-  dCB3ZSBjaGVhdCBmb3Igbm93LiAgKEtlZXAgdGhhdCBpbiB0aGUgbGVmdCBtYXJnaW4uKQpjY2Zs
-  YWdzX3VzZWxhcmdlZmlsZXM9Ii1EX0xBUkdFRklMRV9TT1VSQ0UgLURfRklMRV9PRkZTRVRfQklU
-  Uz02NCIKCgljYXNlICIgJGNjZmxhZ3MgIiBpbgoJKiIgJGNjZmxhZ3NfdXNlbGFyZ2VmaWxlcyAi
-  KikgOzsKCSopIGNjZmxhZ3M9IiRjY2ZsYWdzICRjY2ZsYWdzX3VzZWxhcmdlZmlsZXMiIDs7Cgll
-  c2FjCgoJaWYgdGVzdCAteiAiJGNjaXNnY2MiIC1hIC16ICIkZ2NjdmVyc2lvbiI7IHRoZW4KCSAg
-  ICAjIFRoZSBzdHJpY3QgQU5TSSBtb2RlICgtQWEpIGRvZXNuJ3QgbGlrZSBsYXJnZSBmaWxlcy4K
-  CSAgICBjY2ZsYWdzPWBlY2hvICIgJGNjZmxhZ3MgInxzZWQgJ3NAIC1BYSBAIEBnJ2AKCSAgICBj
-  YXNlICIkY2NmbGFncyIgaW4KCQkqLUFlKikgOzsKCQkqKSAgICAgY2NmbGFncz0iJGNjZmxhZ3Mg
-  LUFlIiA7OwoJCWVzYWMKCSAgICBmaQoJOzsKICAgIGVzYWMKRU9DQlUKCiMgVEhSRUFESU5HCgoj
-  IFRoaXMgc2NyaXB0IFVVL3VzZXRocmVhZHMuY2J1IHdpbGwgZ2V0ICdjYWxsZWQtYmFjaycgYnkg
-  Q29uZmlndXJlCiMgYWZ0ZXIgaXQgaGFzIHByb21wdGVkIHRoZSB1c2VyIGZvciB3aGV0aGVyIHRv
-  IHVzZSB0aHJlYWRzLgpjYXQgPlVVL3VzZXRocmVhZHMuY2J1IDw8J0VPQ0JVJwpjYXNlICIkdXNl
-  dGhyZWFkcyIgaW4KICAgICRkZWZpbmV8dHJ1ZXxbeVldKikKCWlmIFsgIiR4eE9zUmV2TWFqb3Ii
-  IC1sdCAxMCBdOyB0aGVuCgkgICAgY2F0IDw8RU9NID4mNAoKSFAtVVggJHh4T3NSZXZNYWpvciBj
-  YW5ub3Qgc3VwcG9ydCBQT1NJWCB0aHJlYWRzLgpDb25zaWRlciB1cGdyYWRpbmcgdG8gYXQgbGVh
-  c3QgSFAtVVggMTEuCkNhbm5vdCBjb250aW51ZSwgYWJvcnRpbmcuCkVPTQoJICAgIGV4aXQgMQoJ
-  ICAgIGZpCgoJaWYgWyAiJHh4T3NSZXZNYWpvciIgLWVxIDEwIF07IHRoZW4KCSAgICAjIFVuZGVy
-  IDEwLlgsIGEgdGhyZWFkZWQgcGVybCBjYW4gYmUgYnVpbHQKCSAgICBpZiBbIC1mIC91c3IvaW5j
-  bHVkZS9wdGhyZWFkLmggXTsgdGhlbgoJCWlmIFsgLWYgL3Vzci9saWIvbGliY21hLnNsIF07IHRo
-  ZW4KCQkgICAgIyBEQ0UgKGZyb20gQ29yZSBPUyBDRCkgaXMgaW5zdGFsbGVkCgoJCSAgICMgQ2hl
-  Y2sgaWYgaXQgaXMgcHJpc3RpbmUsIG9yIHBhdGNoZWQKCQkgICBjbWF2c249YHdoYXQgL3Vzci9s
-  aWIvbGliY21hLnNsIDI+JjEgfCBncmVwIDE5OTZgCgkJICAgaWYgWyAhIC16ICIkY21hdnNuIiBd
-  OyB0aGVuCgkJICAgICAgIGNhdCA8PEVPTSA+JjQKBwoqKioqKioqKioqKioqKioqKioqKioqKioq
-  KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioKClBlcmwg
-  d2lsbCBzdXBwb3J0IHRocmVhZGluZyB0aHJvdWdoIC91c3IvbGliL2xpYmNtYS5zbCBmcm9tCnRo
-  ZSBIUCBEQ0UgcGFja2FnZSwgYnV0IHRoZSB2ZXJzaW9uIGZvdW5kIGlzIHRvbyBvbGQgdG8gYmUK
-  cmVsaWFibGUuCgpJZiB5b3UgYXJlIG5vdCBkZXBlbmRpbmcgb24gdGhpcyBzcGVjaWZpYyB2ZXJz
-  aW9uIG9mIHRoZSBsaWJyYXJ5LApjb25zaWRlciB0byB1cGdyYWRlIHVzaW5nIHBhdGNoIFBIU1Nf
-  MjM2NzIgKHJlYWQgUkVBRE1FLmhwdXgpCgoqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioq
-  KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioKCihzbGVlcGluZyBm
-  b3IgMTAgc2Vjb25kcy4uLikKRU9NCgkJICAgICAgIHNsZWVwIDEwCgkJICAgICAgIGZpCgoJCSAg
-  ICAjIEl0IG5lZWRzICMgbGliY21hIGFuZCBPTERfUFRIUkVBRFNfQVBJLiBBbHNvCgkJICAgICMg
-  PHB0aHJlYWQuaD4gbmVlZHMgdG8gYmUgI2luY2x1ZGVkIGJlZm9yZSBhbnkKCQkgICAgIyBvdGhl
-  ciBpbmNsdWRlcyAoaW4gcGVybC5oKQoKCQkgICAgIyBIUC1VWCAxMC5YIHVzZXMgdGhlIG9sZCBw
-  dGhyZWFkcyBBUEkKCQkgICAgZF9vbGRwdGhyZWFkcz0iJGRlZmluZSIKCgkJICAgICMgaW5jbHVk
-  ZSBsaWJjbWEgYmVmb3JlIGFsbCB0aGUgb3RoZXJzCgkJICAgIGxpYnN3YW50ZWQ9ImNtYSAkbGli
-  c3dhbnRlZCIKCgkJICAgICMgdGVsbCBwZXJsLmggdG8gaW5jbHVkZSA8cHRocmVhZC5oPiBiZWZv
-  cmUgb3RoZXIKCQkgICAgIyBpbmNsdWRlIGZpbGVzCgkJICAgIGNjZmxhZ3M9IiRjY2ZsYWdzIC1E
-  UFRIUkVBRF9IX0ZJUlNUIgojIEZpcnN0IGNvbHVtbiBvbiBwdXJwb3NlOgojIHRoaXMgaXMgbm90
-  IGEgc3RhbmRhcmQgQ29uZmlndXJlIHZhcmlhYmxlCiMgYnV0IHdlIG5lZWQgdG8gZ2V0IHRoaXMg
-  bm90aWNlZC4KcHRocmVhZF9oX2ZpcnN0PSIkZGVmaW5lIgoKCQkgICAgIyBIUC1VWCAxMC5YIHNl
-  ZW1zIHRvIGhhdmUgbm8gZWFzeQoJCSAgICAjIHdheSBvZiBkZXRlY3RpbmcgdGhlc2UgKnRpbWVf
-  ciBwcm90b3MuCgkJICAgIGRfZ210aW1lX3JfcHJvdG89J2RlZmluZScKCQkgICAgZ210aW1lX3Jf
-  cHJvdG89J1JFRU5UUkFOVF9QUk9UT19JX1RTJwoJCSAgICBkX2xvY2FsdGltZV9yX3Byb3RvPSdk
-  ZWZpbmUnCgkJICAgIGxvY2FsdGltZV9yX3Byb3RvPSdSRUVOVFJBTlRfUFJPVE9fSV9UUycKCgkJ
-  ICAgICMgQXZvaWQgdGhlIHBvaXNvbm91cyBjb25mbGljdGluZyAoYW5kIGlycmVsZXZhbnQpCgkJ
-  ICAgICMgcHJvdG90eXBlcyBvZiBzZXRrZXkgKCkuCgkJICAgIGlfY3J5cHQ9IiR1bmRlZiIKCgkJ
-  ICAgICMgQ01BIHJlZGVmaW5lcyBzZWxlY3QgdG8gY21hX3NlbGVjdCwgYW5kIGNtYV9zZWxlY3QK
-  CQkgICAgIyBleHBlY3RzIGludCAqIGluc3RlYWQgb2YgZmRfc2V0ICogKGp1c3QgbGlrZSA5Llgp
-  CgkJICAgIHNlbGVjdHR5cGU9J2ludCAqJwoKCQllbGlmIFsgLWYgL3Vzci9saWIvbGlicHRocmVh
-  ZC5zbCBdOyB0aGVuCgkJICAgICMgUFRIIHBhY2thZ2UgaXMgaW5zdGFsbGVkCgkJICAgIGxpYnN3
-  YW50ZWQ9InB0aHJlYWQgJGxpYnN3YW50ZWQiCgkJZWxzZQoJCSAgICBsaWJzd2FudGVkPSJub190
-  aHJlYWRzX2F2YWlsYWJsZSIKCQkgICAgZmkKCSAgICBlbHNlCgkJbGlic3dhbnRlZD0ibm9fdGhy
-  ZWFkc19hdmFpbGFibGUiCgkJZmkKCgkgICAgaWYgWyAkbGlic3dhbnRlZCA9ICJub190aHJlYWRz
-  X2F2YWlsYWJsZSIgXTsgdGhlbgoJCWNhdCA8PEVPTSA+JjQKCkluIEhQLVVYIDEwLlggZm9yIFBP
-  U0lYIHRocmVhZHMgeW91IG5lZWQgYm90aCBvZiB0aGUgZmlsZXMKL3Vzci9pbmNsdWRlL3B0aHJl
-  YWQuaCBhbmQgZWl0aGVyIC91c3IvbGliL2xpYmNtYS5zbCBvciAvdXNyL2xpYi9saWJwdGhyZWFk
-  LnNsLgpFaXRoZXIgeW91IG11c3QgdXBncmFkZSB0byBIUC1VWCAxMSBvciBpbnN0YWxsIGEgcG9z
-  aXggdGhyZWFkIGxpYnJhcnk6CgogICAgRENFLUNvcmVUb29scyBmcm9tIEhQLVVYIDEwLjIwIEhh
-  cmR3YXJlIEV4dGVuc2lvbnMgMy4wIENEIChCMzkyMC0xMzk0MSkKCm9yCgogICAgUFRIIHBhY2th
-  Z2UgZnJvbSBlLmcuIGh0dHA6Ly9ocHV4LmNvbm5lY3Qub3JnLnVrL2hwcGQvaHB1eC9HbnUvcHRo
-  LTIuMC43LwoKQ2Fubm90IGNvbnRpbnVlLCBhYm9ydGluZy4KRU9NCgkJZXhpdCAxCgkJZmkKCWVs
-  c2UKCSAgICAjIDEyIG1heSB3YW50IHVwcGluZyB0aGUgX1BPU0lYX0NfU09VUkNFIGRhdGVzdGFt
-  cC4uLgoJICAgIGNjZmxhZ3M9IiAtRF9QT1NJWF9DX1NPVVJDRT0xOTk1MDZMIC1EX1JFRU5UUkFO
-  VCAkY2NmbGFncyIKCSAgICBzZXQgYGVjaG8gWCAiJGxpYnN3YW50ZWQgInwgc2VkIC1lICdzLyBj
-  IC8gcHRocmVhZCBjIC8nYAoJICAgIHNoaWZ0CgkgICAgbGlic3dhbnRlZD0iJCoiCgoJICAgICMg
-  SFAtVVggMTEuWCBzZWVtcyB0byBoYXZlIG5vIGVhc3kKCSAgICAjIHdheSBvZiBkZXRlY3Rpbmcg
-  dGhlc2UgKnRpbWVfciBwcm90b3MuCgkgICAgZF9nbXRpbWVfcl9wcm90bz0nZGVmaW5lJwoJICAg
-  IGdtdGltZV9yX3Byb3RvPSdSRUVOVFJBTlRfUFJPVE9fU19UUycKCSAgICBkX2xvY2FsdGltZV9y
-  X3Byb3RvPSdkZWZpbmUnCgkgICAgbG9jYWx0aW1lX3JfcHJvdG89J1JFRU5UUkFOVF9QUk9UT19T
-  X1RTJwoJICAgIGZpCgk7OwogICAgZXNhYwpFT0NCVQoKIyBUaGVyZSB1c2VkIHRvIGJlOgojICBU
-  aGUgbXlzdGVyaW91cyBpb194cyBtZW1vcnkgY29ycnVwdGlvbiBpbiAxMS4wMCAzMmJpdCBzZWVt
-  cyB0byBnZXQKIyAgZml4ZWQgYnkgbm90IHVzaW5nIFBlcmwncyBtYWxsb2MuICBGbGlwIHNpZGUg
-  aXMgcGVyZm9ybWFuY2UgbG9zcy4KIyAgU28gd2Ugd2FudCBteW1hbGxvYyBmb3IgYWxsIHNpdHVh
-  dGlvbnMgcG9zc2libGUKIyBUaGF0IHNldCB1c2VteW1hbGxvYyB0byAnbicgZm9yIHRocmVhZGVk
-  IGJ1aWxkcyBhbmQgbm9uLWdjYyAzMmJpdAojICBub24tZGVidWdnaW5nIGJ1aWxkcyBhbmQgJ3kn
-  IGZvciBhbGwgb3RoZXJzCgp1c2VteW1hbGxvYz0nbicKY2FzZSAiJHVzZXBlcmxpbyIgaW4KICAg
-  ICR1bmRlZnxmYWxzZXxbbk5dKikgdXNlbXltYWxsb2M9J3knIDs7CiAgICBlc2FjCgojIG1hbGxv
-  YyB3cmFwIHdvcmtzCmNhc2UgIiR1c2VtYWxsb2N3cmFwIiBpbgogICAgJycpIHVzZW1hbGxvY3dy
-  YXA9J2RlZmluZScgOzsKICAgIGVzYWMKCiMgY3RpbWVfciAoKSBhbmQgYXNjdGltZV9yICgpIHNl
-  ZW0gdG8gaGF2ZSBpc3N1ZXMgZm9yIHZlcnNpb25zIGJlZm9yZQojIEhQLVVYIDExCmlmIFsgJHh4
-  T3NSZXZNYWpvciAtbHQgMTEgXTsgdGhlbgogICAgZF9jdGltZV9yPSIkdW5kZWYiCiAgICBkX2Fz
-  Y3RpbWVfcj0iJHVuZGVmIgogICAgZmkKCiMgZnBjbGFzc2lmeSAoKSBpcyBhIG1hY3JvLCB0aGUg
-  bGlicmFyeSBjYWxsIGlzIEZwY2xhc3NpZnkKIyBTaW1pbGFybHkgd2l0aCB0aGUgb3RoZXJzIGJl
-  bG93LgpkX2ZwY2xhc3NpZnk9J2RlZmluZScKZF9pc25hbj0nZGVmaW5lJwpkX2lzaW5mPSdkZWZp
-  bmUnCmRfaXNmaW5pdGU9J2RlZmluZScKZF91bm9yZGVyZWQ9J2RlZmluZScKIyBOZXh0IG9uZShz
-  KSBuZWVkIHRoZSBsZWFkaW5nIHRhYi4gIFRoZXNlIGFyZSBzcGVjaWFsICdoaW50JyBzeW1ib2xz
-  IHRoYXQKIyBhcmUgbm90IHRvIGJlIHByb3BhZ2F0ZWQgdG8gY29uZmlnLnNoLCBhbGwgcmVsYXRl
-  ZCB0byBwdGhyZWFkcyBkcmFmdCA0CiMgaW50ZXJmYWNlcy4KY2FzZSAiJGRfb2xkcHRocmVhZHMi
-  IGluCiAgICAnJ3wkdW5kZWYpCglkX2NyeXB0X3JfcHJvdG89J3VuZGVmJwoJZF9nZXRncmVudF9y
-  X3Byb3RvPSd1bmRlZicKCWRfZ2V0cHdlbnRfcl9wcm90bz0ndW5kZWYnCglkX3N0cmVycm9yX3Jf
-  cHJvdG89J3VuZGVmJwoJOzsKICAgIGVzYWMK',
+  YWdzPScnCmRvb3BfY2ZsYWdzPScnCm9wX2NmbGFncz0nJwpvcG1pbmlfY2ZsYWdzPScnCnBlcmxt
+  YWluX2NmbGFncz0nJwogICAgZmkKCmNhc2UgIiRjY2lzZ2NjIiBpbgogICAgJGRlZmluZXx0cnVl
+  fFtZeV0pCgoJY2FzZSAiJG9wdGltaXplIiBpbgoJICAgICIiKSAgICAgICAgICAgb3B0aW1pemU9
+  Ii1nIC1PIiA7OwoJICAgICpPWzM0NTY3ODldKikgb3B0aW1pemU9YGVjaG8gIiRvcHRpbWl6ZSIg
+  fCBzZWQgLWUgJ3MvT1szLTldL08yLydgIDs7CgkgICAgZXNhYwoJI2xkPSIkY2MiCglsZD0vdXNy
+  L2Jpbi9sZAoJY2NjZGxmbGFncz0nLWZQSUMnCgkjbGRkbGZsYWdzPSctc2hhcmVkJwoJbGRkbGZs
+  YWdzPSctYicKCWNhc2UgIiRvcHRpbWl6ZSIgaW4KCSAgICAqLWcqLU8qfCotTyotZyopCgkJIyBn
+  Y2Mgd2l0aG91dCBnYXMgd2lsbCBub3QgYWNjZXB0IC1nCgkJZWNobyAibWFpbigpe30iPnRyeS5j
+  CgkJY2FzZSAiYCRjYyAkb3B0aW1pemUgLWMgdHJ5LmMgMj4mMWAiIGluCgkJICAgICoiLWcgb3B0
+  aW9uIGRpc2FibGVkIiopCgkJCXNldCBgZWNobyAiWCAkb3B0aW1pemUgIiB8IHNlZCAtZSAncy8g
+  LWcgLyAvJ2AKCQkJc2hpZnQKCQkJb3B0aW1pemU9IiQqIgoJCQk7OwoJCSAgICBlc2FjCgkJOzsK
+  CSAgICBlc2FjCglpZiBbICRtYXhkc2l6IC1sZSA2NCBdOyB0aGVuCgkgICAgY2FzZSAiJG9wdGlt
+  aXplIiBpbgoJCSpPMiopCW9wdD1gZWNobyAiJG9wdGltaXplIiB8IHNlZCAtZSAncy9PMi9PMS8n
+  YAoJCQl0b2tlX2NmbGFncz0iJHRva2VfY2ZsYWdzO29wdGltaXplPVwiJG9wdFwiIgoJCQlyZWdl
+  eGVjX2NmbGFncz0ib3B0aW1pemU9XCIkb3B0XCIiCgkJCTs7CgkJZXNhYwoJICAgIGZpCgk7OwoK
+  ICAgICopCgljYXNlICIkb3B0aW1pemUiIGluCgkgICAgIiIpICAgICAgICAgICBvcHRpbWl6ZT0i
+  K08yICtPbm9saW1pdCIgOzsKCSAgICAqT1szNDU2Nzg5XSopIG9wdGltaXplPWBlY2hvICIkb3B0
+  aW1pemUiIHwgc2VkIC1lICdzL09bMy05XS9PMi8nYCA7OwoJICAgIGVzYWMKCWNhc2UgIiRvcHRp
+  bWl6ZSIgaW4KCSAgICAqLU8qfFwKCSAgICAqTzIqKSAgIG9wdD1gZWNobyAiJG9wdGltaXplIiB8
+  IHNlZCAtZSAncy8tTy8rTzIvJyAtZSAncy9PMi9PMS8nIC1lICdzLyAqK09ub2xpbWl0Ly8nYAoJ
+  CSAgICA7OwoJICAgICopICAgICAgb3B0PSIkb3B0aW1pemUiCgkJICAgIDs7CgkgICAgZXNhYwoJ
+  Y2FzZSAiJGFyY2huYW1lIiBpbgoJICAgIFBBLVJJU0MyLjApCgkJY2FzZSAiJGNjdmVyc2lvbiIg
+  aW4KCQkgICAgQi4xMS4xMS4qKQoJCQkjIG9wbWluaS5jIGFuZCBvcC5jIHdpdGggK08yIG1ha2Vz
+  IHRoZSBjb21waWxlciBkaWUKCQkJIyBvZiBpbnRlcm5hbCBlcnJvciwgZm9yIHBlcmxtYWluLmMg
+  b25seSArTzAgKG5vIG9wdCkKICAgICAgICAgICAgICAgICAgICAgICAgIyB3b3Jrcy4KCQkJY2Fz
+  ZSAiJG9wdGltaXplIiBpbgoJCQkqTzIqKQlvcHQ9YGVjaG8gIiRvcHRpbWl6ZSIgfCBzZWQgLWUg
+  J3MvTzIvTzEvJ2AKCQkJCW9wbWluaV9jZmxhZ3M9Im9wdGltaXplPVwiJG9wdFwiIgoJCQkJb3Bf
+  Y2ZsYWdzPSJvcHRpbWl6ZT1cIiRvcHRcIiIKCQkJCXBlcmxtYWluX2NmbGFncz0ib3B0aW1pemU9
+  XCJcIiIKCQkJCTs7CgkJCWVzYWMKCQkgICAgZXNhYwoJCTs7CgkgICAgSUE2NCopCgkJY2FzZSAi
+  JGNjdmVyc2lvbiIgaW4KCQkgICAgQjM5MTBCKkEuMDYuMFsxMjM0NV0pCgkJCSMgPiBjYyAtLXZl
+  cnNpb24KCQkJIyBjYzogSFAgYUMrKy9BTlNJIEMgQjM5MTBCIEEuMDYuMDUgW0p1bCAyNSAyMDA1
+  XQoJCQkjIEhhcyBvcHRpbWl6aW5nIHByb2JsZW1zIHdpdGggLU8yIGFuZCB1cCBmb3IgYm90aAoJ
+  CQkjIG1haW50ICg1LjguOCspIGFuZCBibGVhZCAoNS45LjMrKQoJCQkjIC1PMS8rTzEgcGFzc2Vk
+  IGFsbCB0ZXN0cyAobSknMDUgWyAxMCBKYW4gMjAwNSBdCgkJCW9wdGltaXplPSIkb3B0IgkJCTs7
+  CgkJCUIzOTEwQipBLjA2LjE1KQoJCQkjID4gY2MgLS12ZXJzaW9uCgkJCSMgY2M6IEhQIEMvYUMr
+  KyBCMzkxMEIgQS4wNi4xNSBbTWF5IDE2IDIwMDddCgkJCSMgSGFzIG9wdGltaXppbmcgcHJvYmxl
+  bXMgd2l0aCArTzIgZm9yIGJsZWFkICg1LjE3LjQpLAoJCQkjIHNlZSBodHRwczovL3J0LnBlcmwu
+  b3JnOjQ0My9ydDMvVGlja2V0L0Rpc3BsYXkuaHRtbD9pZD0xMDM2NjguCgkJCSMKCQkJIyArTzIg
+  K09ub2xpbWl0ICtPbm9wcm9jZWxpbSAgK09zdG9yZV9vcmRlcmluZyBcCgkJCSMgK09ub2xpYmNh
+  bGxzPXN0cmNtcAoJCQkjIHBhc3NlcyBhbGwgdGVzdHMgKHdpdGgvd2l0aG91dCAtRERFQlVHR0lO
+  RykgW05vdiAxNyAyMDExXQoJCQljYXNlICIkb3B0aW1pemUiIGluCgkJCQkqTzIqKSBvcHRpbWl6
+  ZT0iJG9wdGltaXplICtPbm9wcm9jZWxpbSArT3N0b3JlX29yZGVyaW5nICtPbm9saWJjYWxscz1z
+  dHJjbXAiIDs7CgkJCQllc2FjCgkJCTs7CgkJICAgICopICBkb29wX2NmbGFncz0ib3B0aW1pemU9
+  XCIkb3B0XCIiCgkJCW9wX2NmbGFncz0ib3B0aW1pemU9XCIkb3B0XCIiCTs7CgkJICAgIGVzYWMK
+  CQk7OwoJICAgIGVzYWMKCWlmIFsgJG1heGRzaXogLWxlIDY0IF07IHRoZW4KCSAgICB0b2tlX2Nm
+  bGFncz0iJHRva2VfY2ZsYWdzO29wdGltaXplPVwiJG9wdFwiIgoJICAgIHJlZ2V4ZWNfY2ZsYWdz
+  PSJvcHRpbWl6ZT1cIiRvcHRcIiIKCSAgICBmaQoJbGQ9L3Vzci9iaW4vbGQKCWNjY2RsZmxhZ3M9
+  JytaJwoJbGRkbGZsYWdzPSctYiArdm5vY29tcGF0d2FybmluZ3MnCgk7OwogICAgZXNhYwoKIyMg
+  TEFSR0VGSUxFUwppZiBbICR4eE9zUmV2IC1sdCAxMDIwIF07IHRoZW4KICAgIHVzZWxhcmdlZmls
+  ZXM9IiR1bmRlZiIKICAgIGZpCgojY2FzZSAiJHVzZWxhcmdlZmlsZXMtJGNjaXNnY2MiIGluCiMg
+  ICAgIiRkZWZpbmUtJGRlZmluZSJ8Jy1kZWZpbmUnKQojCWNhdCA8PEVPTSA+JjQKIwojKioqIEkn
+  bSBpZ25vcmluZyBsYXJnZSBmaWxlcyBmb3IgdGhpcyBidWlsZCBiZWNhdXNlCiMqKiogSSBkb24n
+  dCBrbm93IGhvdyB0byBkbyB1c2UgbGFyZ2UgZmlsZXMgaW4gSFAtVVggdXNpbmcgZ2NjLgojCiNF
+  T00KIwl1c2VsYXJnZWZpbGVzPSIkdW5kZWYiCiMJOzsKIyAgICBlc2FjCgojIE9uY2Ugd2UgaGF2
+  ZSB0aGUgY29tcGlsZXIgZmxhZ3MgZGVmaW5lZCwgQ29uZmlndXJlIHdpbGwKIyBleGVjdXRlIHRo
+  ZSBmb2xsb3dpbmcgY2FsbC1iYWNrIHNjcmlwdC4gU2VlIGhpbnRzL1JFQURNRS5oaW50cwojIGZv
+  ciBkZXRhaWxzLgpjYXQgPiBVVS9jYy5jYnUgPDwnRU9DQlUnCiMgVGhpcyBzY3JpcHQgVVUvY2Mu
+  Y2J1IHdpbGwgZ2V0ICdjYWxsZWQtYmFjaycgYnkgQ29uZmlndXJlIGFmdGVyIGl0CiMgaGFzIHBy
+  b21wdGVkIHRoZSB1c2VyIGZvciB0aGUgQyBjb21waWxlciB0byB1c2UuCgojIENvbXBpbGUgYW5k
+  IHJ1biB0aGUgYSB0ZXN0IGNhc2UgdG8gc2VlIGlmIGEgY2VydGFpbiBnY2MgYnVnIGlzCiMgcHJl
+  c2VudC4gSWYgc28sIGxvd2VyIHRoZSBvcHRpbWl6YXRpb24gbGV2ZWwgd2hlbiBjb21waWxpbmcK
+  IyBwcF9wYWNrLmMuICBUaGlzIHdvcmtzIGFyb3VuZCBhIGJ1ZyBpbiB1bnBhY2suCgppZiB0ZXN0
+  IC16ICIkY2Npc2djYyIgLWEgLXogIiRnY2N2ZXJzaW9uIjsgdGhlbgogICAgOiBubyB0ZXN0cyBu
+  ZWVkZWQgZm9yIEhQYwplbHNlCiAgICBlY2hvICIgIgogICAgZWNobyAiVGVzdGluZyBmb3IgYSBj
+  ZXJ0YWluIGdjYyBidWcgaXMgZml4ZWQgaW4geW91ciBjb21waWxlci4uLiIKCiAgICAjIFRyeSBj
+  b21waWxpbmcgdGhlIHRlc3QgY2FzZS4KICAgIGlmICRjYyAtbyB0MDAxIC1PICRjY2ZsYWdzICRs
+  ZGZsYWdzIC1sbSAuLi9oaW50cy90MDAxLmM7IHRoZW4KICAgICAgIGdjY2J1Zz1gJHJ1biAuL3Qw
+  MDFgCiAgICAgICBjYXNlICIkZ2NjYnVnIiBpbgogICAgICAgICAgICpmYWlscyopCiAgICAgICAg
+  ICAgICAgIGNhdCA+JjQgPDxFT0YKVGhpcyBDIGNvbXBpbGVyICgkZ2NjdmVyc2lvbikgaXMga25v
+  d24gdG8gaGF2ZSBvcHRpbWl6ZXIKcHJvYmxlbXMgd2hlbiBjb21waWxpbmcgcHBfcGFjay5jLgoK
+  RGlzYWJsaW5nIG9wdGltaXphdGlvbiBmb3IgcHBfcGFjay5jLgpFT0YKICAgICAgICAgICAgICAg
+  Y2FzZSAiJHBwX3BhY2tfY2ZsYWdzIiBpbgogICAgICAgICAgICAgICAgICAgJycpIHBwX3BhY2tf
+  Y2ZsYWdzPSdvcHRpbWl6ZT0nCiAgICAgICAgICAgICAgICAgICAgICAgZWNobyAicHBfcGFja19j
+  ZmxhZ3M9J29wdGltaXplPVwiXCInIiA+PiBjb25maWcuc2ggOzsKICAgICAgICAgICAgICAgICAg
+  ICopICBlY2hvICJZb3Ugc3BlY2lmaWVkIHBwX3BhY2tfY2ZsYWdzIHlvdXJzZWxmLCBzbyB3ZSds
+  bCBnbyB3aXRoIHlvdXIgdmFsdWUuIiA+JjQgOzsKICAgICAgICAgICAgICAgICAgIGVzYWMKICAg
+  ICAgICAgICAgICAgOzsKICAgICAgICAgICAqKSAgZWNobyAiWW91ciBjb21waWxlciBpcyBvay4i
+  ID4mNAogICAgICAgICAgICAgICA7OwogICAgICAgICAgIGVzYWMKICAgIGVsc2UKICAgICAgIGVj
+  aG8gIiAiCiAgICAgICBlY2hvICIqKiogV0hPQSBUSEVSRSEhISAqKioiID4mNAogICAgICAgZWNo
+  byAiICAgIFlvdXIgQyBjb21waWxlciBcIiRjY1wiIGRvZXNuJ3Qgc2VlbSB0byBiZSB3b3JraW5n
+  ISIgPiY0CiAgICAgICBjYXNlICIka25vd2l0YWxsIiBpbgogICAgICAgICAgICcnKSBlY2hvICIg
+  ICAgWW91J2QgYmV0dGVyIHN0YXJ0IGh1bnRpbmcgZm9yIG9uZSBhbmQgbGV0IG1lIGtub3cgYWJv
+  dXQgaXQuIiA+JjQKICAgICAgICAgICAgICAgZXhpdCAxCiAgICAgICAgICAgICAgIDs7CiAgICAg
+  ICAgICAgZXNhYwogICAgICAgZmkKCiAgICBybSAtZiB0MDAxJF9vIHQwMDEkX2V4ZQogICAgZmkK
+  RU9DQlUKCmNhdCA+Y29uZmlnLmFyY2ggPDwnRU9DQlUnCiMgVGhpcyBzY3JpcHQgVVUvY29uZmln
+  LmFyY2ggd2lsbCBnZXQgJ2NhbGxlZC1iYWNrJyBieSBDb25maWd1cmUgYWZ0ZXIKIyBhbGwgb3Ro
+  ZXIgY29uZmlndXJhdGlvbnMgYXJlIGRvbmUganVzdCBiZWZvcmUgY29uZmlnLmggaXMgZ2VuZXJh
+  dGVkCmNhc2UgIiRhcmNobmFtZTokb3B0aW1pemUiIGluCiAgUEEqOiotZypbLStdTyp8UEEqOipb
+  LStdTyotZyopCiAgICBjYXNlICIkY2NmbGFncyIgaW4KICAgICAgKkRENjQqKSA7OwogICAgICAq
+  KSBjYXNlICIkY2N2ZXJzaW9uIiBpbgoJICAjIE9ubHkgb24gUEEtUklTQy4gQjM5MTBCIChhQ0Mp
+  IGlzIG5vdCBmYXVsdHkKCSAgIyBCLjExLiogYW5kIEEuMTAuKiBhcmUKCSAgW0FCXS4xKikKCSAg
+  ICAgICMgY2M6IGVycm9yIDE0MTQ6IENhbid0IGhhbmRsZSBwcmVwcm9jZXNzZWQgZmlsZSBmb28u
+  aSBpZiAtZyBhbmQgLU8gc3BlY2lmaWVkLgoJICAgICAgZWNobyAiSFAtVVggQy1BTlNJLUMgb24g
+  UEEtUklTQyBkb2VzIG5vdCBhY2NlcHQgYm90aCAtZyBhbmQgLU8gb24gcHJlcHJvY2Vzc2VkIGZp
+  bGVzIiA+JjQKCSAgICAgIGVjaG8gIndoZW4gY29tcGlsaW5nIGluIDMyYml0IG1vZGUuIFRoZSBv
+  cHRpbWl6ZXIgd2lsbCBiZSBkaXNhYmxlZC4iID4mNAoJICAgICAgb3B0aW1pemU9YGVjaG8gIiRv
+  cHRpbWl6ZSIgfCBzZWQgLWUgJ3MvWy0rXU9bMC05XSovLycgLWUgJ3MvK09ub2xpbWl0Ly8nIC1l
+  ICdzL14gKi8vJ2AKCSAgICAgIDs7CgkgIGVzYWMKICAgICAgZXNhYwogIGVzYWMKRU9DQlUKCmNh
+  dCA+VVUvdXNlbGFyZ2VmaWxlcy5jYnUgPDwnRU9DQlUnCiMgVGhpcyBzY3JpcHQgVVUvdXNlbGFy
+  Z2VmaWxlcy5jYnUgd2lsbCBnZXQgJ2NhbGxlZC1iYWNrJyBieSBDb25maWd1cmUKIyBhZnRlciBp
+  dCBoYXMgcHJvbXB0ZWQgdGhlIHVzZXIgZm9yIHdoZXRoZXIgdG8gdXNlIGxhcmdlIGZpbGVzLgpj
+  YXNlICIkdXNlbGFyZ2VmaWxlcyIgaW4KICAgICIifCRkZWZpbmV8dHJ1ZXxbeVldKikKCSMgdGhl
+  cmUgYXJlIGxhcmdlZmlsZSBmbGFncyBhdmFpbGFibGUgdmlhIGdldGNvbmYoMSkKCSMgYnV0IHdl
+  IGNoZWF0IGZvciBub3cuICAoS2VlcCB0aGF0IGluIHRoZSBsZWZ0IG1hcmdpbi4pCmNjZmxhZ3Nf
+  dXNlbGFyZ2VmaWxlcz0iLURfTEFSR0VGSUxFX1NPVVJDRSAtRF9GSUxFX09GRlNFVF9CSVRTPTY0
+  IgoKCWNhc2UgIiAkY2NmbGFncyAiIGluCgkqIiAkY2NmbGFnc191c2VsYXJnZWZpbGVzICIqKSA7
+  OwoJKikgY2NmbGFncz0iJGNjZmxhZ3MgJGNjZmxhZ3NfdXNlbGFyZ2VmaWxlcyIgOzsKCWVzYWMK
+  CglpZiB0ZXN0IC16ICIkY2Npc2djYyIgLWEgLXogIiRnY2N2ZXJzaW9uIjsgdGhlbgoJICAgICMg
+  VGhlIHN0cmljdCBBTlNJIG1vZGUgKC1BYSkgZG9lc24ndCBsaWtlIGxhcmdlIGZpbGVzLgoJICAg
+  IGNjZmxhZ3M9YGVjaG8gIiAkY2NmbGFncyAifHNlZCAnc0AgLUFhIEAgQGcnYAoJICAgIGNhc2Ug
+  IiRjY2ZsYWdzIiBpbgoJCSotQWUqKSA7OwoJCSopICAgICBjY2ZsYWdzPSIkY2NmbGFncyAtQWUi
+  IDs7CgkJZXNhYwoJICAgIGZpCgk7OwogICAgZXNhYwpFT0NCVQoKIyBUSFJFQURJTkcKCiMgVGhp
+  cyBzY3JpcHQgVVUvdXNldGhyZWFkcy5jYnUgd2lsbCBnZXQgJ2NhbGxlZC1iYWNrJyBieSBDb25m
+  aWd1cmUKIyBhZnRlciBpdCBoYXMgcHJvbXB0ZWQgdGhlIHVzZXIgZm9yIHdoZXRoZXIgdG8gdXNl
+  IHRocmVhZHMuCmNhdCA+VVUvdXNldGhyZWFkcy5jYnUgPDwnRU9DQlUnCmNhc2UgIiR1c2V0aHJl
+  YWRzIiBpbgogICAgJGRlZmluZXx0cnVlfFt5WV0qKQoJaWYgWyAiJHh4T3NSZXZNYWpvciIgLWx0
+  IDEwIF07IHRoZW4KCSAgICBjYXQgPDxFT00gPiY0CgpIUC1VWCAkeHhPc1Jldk1ham9yIGNhbm5v
+  dCBzdXBwb3J0IFBPU0lYIHRocmVhZHMuCkNvbnNpZGVyIHVwZ3JhZGluZyB0byBhdCBsZWFzdCBI
+  UC1VWCAxMS4KQ2Fubm90IGNvbnRpbnVlLCBhYm9ydGluZy4KRU9NCgkgICAgZXhpdCAxCgkgICAg
+  ZmkKCglpZiBbICIkeHhPc1Jldk1ham9yIiAtZXEgMTAgXTsgdGhlbgoJICAgICMgVW5kZXIgMTAu
+  WCwgYSB0aHJlYWRlZCBwZXJsIGNhbiBiZSBidWlsdAoJICAgIGlmIFsgLWYgL3Vzci9pbmNsdWRl
+  L3B0aHJlYWQuaCBdOyB0aGVuCgkJaWYgWyAtZiAvdXNyL2xpYi9saWJjbWEuc2wgXTsgdGhlbgoJ
+  CSAgICAjIERDRSAoZnJvbSBDb3JlIE9TIENEKSBpcyBpbnN0YWxsZWQKCgkJICAgIyBDaGVjayBp
+  ZiBpdCBpcyBwcmlzdGluZSwgb3IgcGF0Y2hlZAoJCSAgIGNtYXZzbj1gd2hhdCAvdXNyL2xpYi9s
+  aWJjbWEuc2wgMj4mMSB8IGdyZXAgMTk5NmAKCQkgICBpZiBbICEgLXogIiRjbWF2c24iIF07IHRo
+  ZW4KCQkgICAgICAgY2F0IDw8RU9NID4mNAoHCioqKioqKioqKioqKioqKioqKioqKioqKioqKioq
+  KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKgoKUGVybCB3aWxs
+  IHN1cHBvcnQgdGhyZWFkaW5nIHRocm91Z2ggL3Vzci9saWIvbGliY21hLnNsIGZyb20KdGhlIEhQ
+  IERDRSBwYWNrYWdlLCBidXQgdGhlIHZlcnNpb24gZm91bmQgaXMgdG9vIG9sZCB0byBiZQpyZWxp
+  YWJsZS4KCklmIHlvdSBhcmUgbm90IGRlcGVuZGluZyBvbiB0aGlzIHNwZWNpZmljIHZlcnNpb24g
+  b2YgdGhlIGxpYnJhcnksCmNvbnNpZGVyIHRvIHVwZ3JhZGUgdXNpbmcgcGF0Y2ggUEhTU18yMzY3
+  MiAocmVhZCBSRUFETUUuaHB1eCkKCioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioq
+  KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKgoKKHNsZWVwaW5nIGZvciAx
+  MCBzZWNvbmRzLi4uKQpFT00KCQkgICAgICAgc2xlZXAgMTAKCQkgICAgICAgZmkKCgkJICAgICMg
+  SXQgbmVlZHMgIyBsaWJjbWEgYW5kIE9MRF9QVEhSRUFEU19BUEkuIEFsc28KCQkgICAgIyA8cHRo
+  cmVhZC5oPiBuZWVkcyB0byBiZSAjaW5jbHVkZWQgYmVmb3JlIGFueQoJCSAgICAjIG90aGVyIGlu
+  Y2x1ZGVzIChpbiBwZXJsLmgpCgoJCSAgICAjIEhQLVVYIDEwLlggdXNlcyB0aGUgb2xkIHB0aHJl
+  YWRzIEFQSQoJCSAgICBkX29sZHB0aHJlYWRzPSIkZGVmaW5lIgoKCQkgICAgIyBpbmNsdWRlIGxp
+  YmNtYSBiZWZvcmUgYWxsIHRoZSBvdGhlcnMKCQkgICAgbGlic3dhbnRlZD0iY21hICRsaWJzd2Fu
+  dGVkIgoKCQkgICAgIyB0ZWxsIHBlcmwuaCB0byBpbmNsdWRlIDxwdGhyZWFkLmg+IGJlZm9yZSBv
+  dGhlcgoJCSAgICAjIGluY2x1ZGUgZmlsZXMKCQkgICAgY2NmbGFncz0iJGNjZmxhZ3MgLURQVEhS
+  RUFEX0hfRklSU1QiCiMgRmlyc3QgY29sdW1uIG9uIHB1cnBvc2U6CiMgdGhpcyBpcyBub3QgYSBz
+  dGFuZGFyZCBDb25maWd1cmUgdmFyaWFibGUKIyBidXQgd2UgbmVlZCB0byBnZXQgdGhpcyBub3Rp
+  Y2VkLgpwdGhyZWFkX2hfZmlyc3Q9IiRkZWZpbmUiCgoJCSAgICAjIEhQLVVYIDEwLlggc2VlbXMg
+  dG8gaGF2ZSBubyBlYXN5CgkJICAgICMgd2F5IG9mIGRldGVjdGluZyB0aGVzZSAqdGltZV9yIHBy
+  b3Rvcy4KCQkgICAgZF9nbXRpbWVfcl9wcm90bz0nZGVmaW5lJwoJCSAgICBnbXRpbWVfcl9wcm90
+  bz0nUkVFTlRSQU5UX1BST1RPX0lfVFMnCgkJICAgIGRfbG9jYWx0aW1lX3JfcHJvdG89J2RlZmlu
+  ZScKCQkgICAgbG9jYWx0aW1lX3JfcHJvdG89J1JFRU5UUkFOVF9QUk9UT19JX1RTJwoKCQkgICAg
+  IyBBdm9pZCB0aGUgcG9pc29ub3VzIGNvbmZsaWN0aW5nIChhbmQgaXJyZWxldmFudCkKCQkgICAg
+  IyBwcm90b3R5cGVzIG9mIHNldGtleSAoKS4KCQkgICAgaV9jcnlwdD0iJHVuZGVmIgoKCQkgICAg
+  IyBDTUEgcmVkZWZpbmVzIHNlbGVjdCB0byBjbWFfc2VsZWN0LCBhbmQgY21hX3NlbGVjdAoJCSAg
+  ICAjIGV4cGVjdHMgaW50ICogaW5zdGVhZCBvZiBmZF9zZXQgKiAoanVzdCBsaWtlIDkuWCkKCQkg
+  ICAgc2VsZWN0dHlwZT0naW50IConCgoJCWVsaWYgWyAtZiAvdXNyL2xpYi9saWJwdGhyZWFkLnNs
+  IF07IHRoZW4KCQkgICAgIyBQVEggcGFja2FnZSBpcyBpbnN0YWxsZWQKCQkgICAgbGlic3dhbnRl
+  ZD0icHRocmVhZCAkbGlic3dhbnRlZCIKCQllbHNlCgkJICAgIGxpYnN3YW50ZWQ9Im5vX3RocmVh
+  ZHNfYXZhaWxhYmxlIgoJCSAgICBmaQoJICAgIGVsc2UKCQlsaWJzd2FudGVkPSJub190aHJlYWRz
+  X2F2YWlsYWJsZSIKCQlmaQoKCSAgICBpZiBbICRsaWJzd2FudGVkID0gIm5vX3RocmVhZHNfYXZh
+  aWxhYmxlIiBdOyB0aGVuCgkJY2F0IDw8RU9NID4mNAoKSW4gSFAtVVggMTAuWCBmb3IgUE9TSVgg
+  dGhyZWFkcyB5b3UgbmVlZCBib3RoIG9mIHRoZSBmaWxlcwovdXNyL2luY2x1ZGUvcHRocmVhZC5o
+  IGFuZCBlaXRoZXIgL3Vzci9saWIvbGliY21hLnNsIG9yIC91c3IvbGliL2xpYnB0aHJlYWQuc2wu
+  CkVpdGhlciB5b3UgbXVzdCB1cGdyYWRlIHRvIEhQLVVYIDExIG9yIGluc3RhbGwgYSBwb3NpeCB0
+  aHJlYWQgbGlicmFyeToKCiAgICBEQ0UtQ29yZVRvb2xzIGZyb20gSFAtVVggMTAuMjAgSGFyZHdh
+  cmUgRXh0ZW5zaW9ucyAzLjAgQ0QgKEIzOTIwLTEzOTQxKQoKb3IKCiAgICBQVEggcGFja2FnZSBm
+  cm9tIGUuZy4gaHR0cDovL2hwdXguY29ubmVjdC5vcmcudWsvaHBwZC9ocHV4L0dudS9wdGgtMi4w
+  LjcvCgpDYW5ub3QgY29udGludWUsIGFib3J0aW5nLgpFT00KCQlleGl0IDEKCQlmaQoJZWxzZQoJ
+  ICAgICMgMTIgbWF5IHdhbnQgdXBwaW5nIHRoZSBfUE9TSVhfQ19TT1VSQ0UgZGF0ZXN0YW1wLi4u
+  CgkgICAgY2NmbGFncz0iIC1EX1BPU0lYX0NfU09VUkNFPTE5OTUwNkwgLURfUkVFTlRSQU5UICRj
+  Y2ZsYWdzIgoJICAgIHNldCBgZWNobyBYICIkbGlic3dhbnRlZCAifCBzZWQgLWUgJ3MvIGMgLyBw
+  dGhyZWFkIGMgLydgCgkgICAgc2hpZnQKCSAgICBsaWJzd2FudGVkPSIkKiIKCgkgICAgIyBIUC1V
+  WCAxMS5YIHNlZW1zIHRvIGhhdmUgbm8gZWFzeQoJICAgICMgd2F5IG9mIGRldGVjdGluZyB0aGVz
+  ZSAqdGltZV9yIHByb3Rvcy4KCSAgICBkX2dtdGltZV9yX3Byb3RvPSdkZWZpbmUnCgkgICAgZ210
+  aW1lX3JfcHJvdG89J1JFRU5UUkFOVF9QUk9UT19TX1RTJwoJICAgIGRfbG9jYWx0aW1lX3JfcHJv
+  dG89J2RlZmluZScKCSAgICBsb2NhbHRpbWVfcl9wcm90bz0nUkVFTlRSQU5UX1BST1RPX1NfVFMn
+  CgkgICAgZmkKCTs7CiAgICBlc2FjCkVPQ0JVCgojIFRoZXJlIHVzZWQgdG8gYmU6CiMgIFRoZSBt
+  eXN0ZXJpb3VzIGlvX3hzIG1lbW9yeSBjb3JydXB0aW9uIGluIDExLjAwIDMyYml0IHNlZW1zIHRv
+  IGdldAojICBmaXhlZCBieSBub3QgdXNpbmcgUGVybCdzIG1hbGxvYy4gIEZsaXAgc2lkZSBpcyBw
+  ZXJmb3JtYW5jZSBsb3NzLgojICBTbyB3ZSB3YW50IG15bWFsbG9jIGZvciBhbGwgc2l0dWF0aW9u
+  cyBwb3NzaWJsZQojIFRoYXQgc2V0IHVzZW15bWFsbG9jIHRvICduJyBmb3IgdGhyZWFkZWQgYnVp
+  bGRzIGFuZCBub24tZ2NjIDMyYml0CiMgIG5vbi1kZWJ1Z2dpbmcgYnVpbGRzIGFuZCAneScgZm9y
+  IGFsbCBvdGhlcnMKCnVzZW15bWFsbG9jPSduJwpjYXNlICIkdXNlcGVybGlvIiBpbgogICAgJHVu
+  ZGVmfGZhbHNlfFtuTl0qKSB1c2VteW1hbGxvYz0neScgOzsKICAgIGVzYWMKCiMgbWFsbG9jIHdy
+  YXAgd29ya3MKY2FzZSAiJHVzZW1hbGxvY3dyYXAiIGluCiAgICAnJykgdXNlbWFsbG9jd3JhcD0n
+  ZGVmaW5lJyA7OwogICAgZXNhYwoKIyBjdGltZV9yICgpIGFuZCBhc2N0aW1lX3IgKCkgc2VlbSB0
+  byBoYXZlIGlzc3VlcyBmb3IgdmVyc2lvbnMgYmVmb3JlCiMgSFAtVVggMTEKaWYgWyAkeHhPc1Jl
+  dk1ham9yIC1sdCAxMSBdOyB0aGVuCiAgICBkX2N0aW1lX3I9IiR1bmRlZiIKICAgIGRfYXNjdGlt
+  ZV9yPSIkdW5kZWYiCiAgICBmaQoKIyBmcGNsYXNzaWZ5ICgpIGlzIGEgbWFjcm8sIHRoZSBsaWJy
+  YXJ5IGNhbGwgaXMgRnBjbGFzc2lmeQojIFNpbWlsYXJseSB3aXRoIHRoZSBvdGhlcnMgYmVsb3cu
+  CmRfZnBjbGFzc2lmeT0nZGVmaW5lJwpkX2lzbmFuPSdkZWZpbmUnCmRfaXNpbmY9J2RlZmluZScK
+  ZF9pc2Zpbml0ZT0nZGVmaW5lJwpkX3Vub3JkZXJlZD0nZGVmaW5lJwojIE5leHQgb25lKHMpIG5l
+  ZWQgdGhlIGxlYWRpbmcgdGFiLiAgVGhlc2UgYXJlIHNwZWNpYWwgJ2hpbnQnIHN5bWJvbHMgdGhh
+  dAojIGFyZSBub3QgdG8gYmUgcHJvcGFnYXRlZCB0byBjb25maWcuc2gsIGFsbCByZWxhdGVkIHRv
+  IHB0aHJlYWRzIGRyYWZ0IDQKIyBpbnRlcmZhY2VzLgpjYXNlICIkZF9vbGRwdGhyZWFkcyIgaW4K
+  ICAgICcnfCR1bmRlZikKCWRfY3J5cHRfcl9wcm90bz0ndW5kZWYnCglkX2dldGdyZW50X3JfcHJv
+  dG89J3VuZGVmJwoJZF9nZXRwd2VudF9yX3Byb3RvPSd1bmRlZicKCWRfc3RyZXJyb3Jfcl9wcm90
+  bz0ndW5kZWYnCgk7OwogICAgZXNhYwoKIyBILk1lcmlqbiBzYXlzIGl0J3Mgbm90IDE5OTggYW55
+  bW9yZTogT0RCTSBpcyBub3QgbmVlZGVkLAojIGFuZCBpdCBzZWVtcyB0byBiZSBidWdneSBpbiBI
+  UC1VWCBhbnl3YXkuCmlfZGJtPXVuZGVmCgojIEluIEhQLVVYZXMgcHJpb3IgdG8gMTEuMjMgc3Ry
+  dG9sZCgpIHJldHVybmVkIGEgSFAtVVgKIyBzcGVjaWZpYyB1bmlvbiBjYWxsZWQgbG9uZ19kb3Vi
+  bGUsIG5vdCBhIEM5OSBsb25nIGRvdWJsZS4KY2FzZSAiYGdyZXAgJ2RvdWJsZSBzdHJ0b2xkLmNv
+  bnN0JyAvdXNyL2luY2x1ZGUvc3RkbGliLmhgIiBpbgoqImxvbmcgZG91YmxlIHN0cnRvbGQiKikg
+  OzsgIyBzdHJ0b2xkIHNob3VsZCBiZSBzYWZlLgoqKSBlY2hvICJMb29rcyBsaWtlIHlvdXIgc3Ry
+  dG9sZCgpIGlzIG5vbi1zdGFuZGFyZC4uLiIgPiY0CiAgIGRfc3RydG9sZD11bmRlZiA7Owplc2Fj
+  CgojIEluIHByZS0xMSBIUC1VWGVzIHRoZXJlIHJlYWxseSBpc24ndCBpc2Zpbml0ZSgpLCBkZXNw
+  aXRlIHdoYXQKIyBDb25maWd1cmUgbWlnaHQgdGhpbmsuIChUaGVyZSBpcyBmaW5pdGUoKSwgdGhv
+  dWdoLikKY2FzZSAiYGdyZXAgJ2lzZmluaXRlJyAvdXNyL2luY2x1ZGUvbWF0aC5oYCIgaW4KKiJp
+  c2Zpbml0ZSIqKSA7OwoqKSBkX2lzZmluaXRlPXVuZGVmIDs7CmVzYWMK',
   'linux' =>
   'IyBoaW50cy9saW51eC5zaAojIE9yaWdpbmFsIHZlcnNpb24gYnkgcnNhbmRlcnMKIyBBZGRpdGlv
   bmFsIHN1cHBvcnQgYnkgS2VubmV0aCBBbGJhbm93c2tpIDxramFoZHNAa2phaGRzLmNvbT4KIwoj
@@ -4006,79 +5232,84 @@ $fatpacked{"Devel/PatchPerl/Hints.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"
   aGUgcmVhbCB1c2VyaWQgb2YgYSBwcm9jZXNzIHVuZGVyIDQuNEJTRC4KIyBuZXRic2QgZml4ZWQg
   dGhpcyBpbiAxLjMuMi4KY2FzZSAiJG9zdmVycyIgaW4KMC45KnwxLlswMTJdKnwxLjN8MS4zLjEp
   CglkX3NldHJlZ2lkPSIkdW5kZWYiCglkX3NldHJldWlkPSIkdW5kZWYiCgk7Owplc2FjCmNhc2Ug
-  IiRvc3ZlcnMiIGluCjAuOSp8MS4qfDIuKnwzLip8NC4qfDUuKnw2LiopCglkX2dldHByb3RvZW50
-  X3I9IiR1bmRlZiIKCWRfZ2V0cHJvdG9ieW5hbWVfcj0iJHVuZGVmIgoJZF9nZXRwcm90b2J5bnVt
-  YmVyX3I9IiR1bmRlZiIKCWRfc2V0cHJvdG9lbnRfcj0iJHVuZGVmIgoJZF9lbmRwcm90b2VudF9y
-  PSIkdW5kZWYiCglkX2dldHNlcnZlbnRfcj0iJHVuZGVmIgoJZF9nZXRzZXJ2YnluYW1lX3I9IiR1
-  bmRlZiIKCWRfZ2V0c2VydmJ5cG9ydF9yPSIkdW5kZWYiCglkX3NldHNlcnZlbnRfcj0iJHVuZGVm
-  IgoJZF9lbmRzZXJ2ZW50X3I9IiR1bmRlZiIKCWRfZ2V0cHJvdG9lbnRfcl9wcm90bz0iMCIKCWRf
-  Z2V0cHJvdG9ieW5hbWVfcl9wcm90bz0iMCIKCWRfZ2V0cHJvdG9ieW51bWJlcl9yX3Byb3RvPSIw
-  IgoJZF9zZXRwcm90b2VudF9yX3Byb3RvPSIwIgoJZF9lbmRwcm90b2VudF9yX3Byb3RvPSIwIgoJ
-  ZF9nZXRzZXJ2ZW50X3JfcHJvdG89IjAiCglkX2dldHNlcnZieW5hbWVfcl9wcm90bz0iMCIKCWRf
-  Z2V0c2VydmJ5cG9ydF9yX3Byb3RvPSIwIgoJZF9zZXRzZXJ2ZW50X3JfcHJvdG89IjAiCglkX2Vu
-  ZHNlcnZlbnRfcl9wcm90bz0iMCIKCTs7CmVzYWMKCiMgVGhlc2UgYXJlIG9ic29sZXRlIGluIGFu
-  eSBuZXRic2QuCmRfc2V0cmdpZD0iJHVuZGVmIgpkX3NldHJ1aWQ9IiR1bmRlZiIKCiMgdGhlcmUn
-  cyBubyBwcm9ibGVtIHdpdGggdmZvcmsuCnVzZXZmb3JrPXRydWUKCiMgVGhpcyBpcyB0aGVyZSBi
-  dXQgaW4gbWFjaGluZS9pZWVlZnBfaC4KaWVlZWZwX2g9ImRlZmluZSIKCiMgVGhpcyBzY3JpcHQg
-  VVUvdXNldGhyZWFkcy5jYnUgd2lsbCBnZXQgJ2NhbGxlZC1iYWNrJyBieSBDb25maWd1cmUKIyBh
-  ZnRlciBpdCBoYXMgcHJvbXB0ZWQgdGhlIHVzZXIgZm9yIHdoZXRoZXIgdG8gdXNlIHRocmVhZHMu
-  CmNhdCA+IFVVL3VzZXRocmVhZHMuY2J1IDw8J0VPQ0JVJwpjYXNlICIkdXNldGhyZWFkcyIgaW4K
-  JGRlZmluZXx0cnVlfFt5WV0qKQoJbHB0aHJlYWQ9Cglmb3IgeHh4IGluIHB0aHJlYWQ7IGRvCgkJ
-  Zm9yIHl5eSBpbiAkbG9jbGlicHRoICRwbGlicHRoICRnbGlicHRoIGR1bW15OyBkbwoJCQl6eno9
-  JHl5eS9saWIkeHh4LmEKCQkJaWYgdGVzdCAtZiAiJHp6eiI7IHRoZW4KCQkJCWxwdGhyZWFkPSR4
-  eHgKCQkJCWJyZWFrOwoJCQlmaQoJCQl6eno9JHl5eS9saWIkeHh4LnNvCgkJCWlmIHRlc3QgLWYg
-  IiR6enoiOyB0aGVuCgkJCQlscHRocmVhZD0keHh4CgkJCQlicmVhazsKCQkJZmkKCQkJenp6PWBs
-  cyAkeXl5L2xpYiR4eHguc28uKiAyPi9kZXYvbnVsbGAKCQkJaWYgdGVzdCAiWCR6enoiICE9IFg7
-  IHRoZW4KCQkJCWxwdGhyZWFkPSR4eHgKCQkJCWJyZWFrOwoJCQlmaQoJCWRvbmUKCQlpZiB0ZXN0
-  ICJYJGxwdGhyZWFkIiAhPSBYOyB0aGVuCgkJCWJyZWFrOwoJCWZpCglkb25lCglpZiB0ZXN0ICJY
-  JGxwdGhyZWFkIiAhPSBYOyB0aGVuCgkJIyBBZGQgLWxwdGhyZWFkLgoJCWxpYnN3YW50ZWQ9IiRs
-  aWJzd2FudGVkICRscHRocmVhZCIKCQkjIFRoZXJlIGlzIG5vIGxpYmNfciBhcyBvZiBOZXRCU0Qg
-  MS41LjIsIHNvIG5vIGMgLT4gY19yLgoJCSMgVGhpcyB3aWxsIGJlIHJldmlzaXRlZCB3aGVuIE5l
-  dEJTRCBnYWlucyBhIG5hdGl2ZSBwdGhyZWFkcwoJCSMgaW1wbGVtZW50YXRpb24uCgllbHNlCgkJ
-  ZWNobyAiJDA6IE5vIFBPU0lYIHRocmVhZHMgbGlicmFyeSAoLWxwdGhyZWFkKSBmb3VuZC4gICIg
-  XAoJCSAgICAgIllvdSBtYXkgd2FudCB0byBpbnN0YWxsIEdOVSBwdGguICBBYm9ydGluZy4iID4m
-  NAoJCWV4aXQgMQoJZmkKCXVuc2V0IGxwdGhyZWFkCgoJIyBzZXZlcmFsIHJlZW50cmFudCBmdW5j
-  dGlvbnMgYXJlIGVtYmVkZGVkIGluIGxpYmMsIGJ1dCBoYXZlbid0CgkjIGJlZW4gYWRkZWQgdG8g
-  dGhlIGhlYWRlciBmaWxlcyB5ZXQuICBMZXQncyBob2xkIG9mZiBvbiB1c2luZwoJIyB0aGVtIHVu
-  dGlsIHRoZXkgYXJlIGEgdmFsaWQgcGFydCBvZiB0aGUgQVBJCgljYXNlICIkb3N2ZXJzIiBpbgoJ
-  WzAxMl0uKnwzLlswLTFdKQoJCWRfZ2V0cHJvdG9ieW5hbWVfcj0kdW5kZWYKCQlkX2dldHByb3Rv
-  YnludW1iZXJfcj0kdW5kZWYKCQlkX2dldHByb3RvZW50X3I9JHVuZGVmCgkJZF9nZXRzZXJ2Ynlu
-  YW1lX3I9JHVuZGVmCgkJZF9nZXRzZXJ2Ynlwb3J0X3I9JHVuZGVmCgkJZF9nZXRzZXJ2ZW50X3I9
-  JHVuZGVmCgkJZF9zZXRwcm90b2VudF9yPSR1bmRlZgoJCWRfc2V0c2VydmVudF9yPSR1bmRlZgoJ
-  CWRfZW5kcHJvdG9lbnRfcj0kdW5kZWYKCQlkX2VuZHNlcnZlbnRfcj0kdW5kZWYgOzsKCWVzYWMK
-  CTs7Cgplc2FjCkVPQ0JVCgojIFNldCBzZW5zaWJsZSBkZWZhdWx0cyBmb3IgTmV0QlNEOiBsb29r
-  IGZvciBsb2NhbCBzb2Z0d2FyZSBpbgojIC91c3IvcGtnIChOZXRCU0QgUGFja2FnZXMgQ29sbGVj
-  dGlvbikgYW5kIGluIC91c3IvbG9jYWwuCiMKbG9jbGlicHRoPSIvdXNyL3BrZy9saWIgL3Vzci9s
-  b2NhbC9saWIiCmxvY2luY3B0aD0iL3Vzci9wa2cvaW5jbHVkZSAvdXNyL2xvY2FsL2luY2x1ZGUi
-  CmNhc2UgIiRycGF0aGZsYWciIGluCicnKQoJbGRmbGFncz0KCTs7CiopCglsZGZsYWdzPQoJZm9y
-  IHl5eSBpbiAkbG9jbGlicHRoOyBkbwoJCWxkZmxhZ3M9IiRsZGZsYWdzICRycGF0aGZsYWckeXl5
-  IgoJZG9uZQoJOzsKZXNhYwoKY2FzZSBgdW5hbWUgLW1gIGluCmFscGhhKQogICAgZWNobyAnaW50
-  IG1haW4oKSB7fScgPiB0cnkuYwogICAgZ2NjPWAke2NjOi1jY30gLXYgLWMgdHJ5LmMgMj4mMXxn
-  cmVwICdnY2MgdmVyc2lvbiBlZ2NzLTInYAogICAgY2FzZSAiJGdjYyIgaW4KICAgICcnIHwgImdj
-  YyB2ZXJzaW9uIGVnY3MtMi45NS4iWzMtOV0qKSA7OyAjIDIuOTUuMyBvciBiZXR0ZXIgb2theQog
-  ICAgKikJY2F0ID4mNCA8PEVPRgoqKioKKioqIFlvdXIgZ2NjICgkZ2NjKSBpcyBrbm93biB0byBi
-  ZQoqKiogdG9vIGJ1Z2d5IG9uIG5ldGJzZC9hbHBoYSB0byBjb21waWxlIFBlcmwgd2l0aCBvcHRp
-  bWl6YXRpb24uCioqKiBJdCBpcyBzdWdnZXN0ZWQgeW91IGluc3RhbGwgdGhlIGxhbmcvZ2NjIHBh
-  Y2thZ2Ugd2hpY2ggc2hvdWxkCioqKiBoYXZlIGF0IGxlYXN0IGdjYyAyLjk1LjMgd2hpY2ggc2hv
-  dWxkIHdvcmsgb2theTogdXNlIGZvciBleGFtcGxlCioqKiBDb25maWd1cmUgLURjYz0vdXNyL3Br
-  Zy9nY2MtMi45NS4zL2Jpbi9jYy4gIFlvdSBjb3VsZCBhbHNvCioqKiBDb25maWd1cmUgLURvcHRp
-  bWl6ZT0tTzAgdG8gY29tcGlsZSBQZXJsIHdpdGhvdXQgYW55IG9wdGltaXphdGlvbgoqKiogYnV0
-  IHRoYXQgaXMgbm90IHJlY29tbWVuZGVkLgoqKioKRU9GCglleGl0IDEKCTs7CiAgICBlc2FjCiAg
-  ICBybSAtZiB0cnkuKgogICAgOzsKZXNhYwoKIyBOZXRCU0Qvc3BhcmMgMS41LjMvMS42LjEgZHVt
-  cHMgY29yZSBpbiB0aGUgc2VtaWRfZHMgdGVzdCBvZiBDb25maWd1cmUuCmNhc2UgYHVuYW1lIC1t
-  YCBpbgpzcGFyYykgZF9zZW1jdGxfc2VtaWRfZHM9dW5kZWYgOzsKZXNhYwoKIyBtYWxsb2Mgd3Jh
-  cCB3b3JrcwpjYXNlICIkdXNlbWFsbG9jd3JhcCIgaW4KJycpIHVzZW1hbGxvY3dyYXA9J2RlZmlu
-  ZScgOzsKZXNhYwoKIyBkb24ndCB1c2UgcGVybCBtYWxsb2MgYnkgZGVmYXVsdApjYXNlICIkdXNl
-  bXltYWxsb2MiIGluCicnKSB1c2VteW1hbGxvYz1uIDs7CmVzYWMK',
+  IiRvc3ZlcnMiIGluCjAuOCopCgk7OwoqKQoJZF9nZXRwcm90b2VudF9yPSIkdW5kZWYiCglkX2dl
+  dHByb3RvYnluYW1lX3I9IiR1bmRlZiIKCWRfZ2V0cHJvdG9ieW51bWJlcl9yPSIkdW5kZWYiCglk
+  X3NldHByb3RvZW50X3I9IiR1bmRlZiIKCWRfZW5kcHJvdG9lbnRfcj0iJHVuZGVmIgoJZF9nZXRz
+  ZXJ2ZW50X3I9IiR1bmRlZiIKCWRfZ2V0c2VydmJ5bmFtZV9yPSIkdW5kZWYiCglkX2dldHNlcnZi
+  eXBvcnRfcj0iJHVuZGVmIgoJZF9zZXRzZXJ2ZW50X3I9IiR1bmRlZiIKCWRfZW5kc2VydmVudF9y
+  PSIkdW5kZWYiCglkX2dldGhvc3RieW5hbWVfcj0iJHVuZGVmIgoJZF9nZXRob3N0YnlhZGRyMl9y
+  PSIkdW5kZWYiCglkX2dldGhvc3RieWFkZHJfcj0iJHVuZGVmIgoJZF9zZXRob3N0ZW50X3I9IiR1
+  bmRlZiIKCWRfZ2V0aG9zdGVudF9yPSIkdW5kZWYiCglkX2VuZGhvc3RlbnRfcj0iJHVuZGVmIgoJ
+  ZF9nZXRwcm90b2VudF9yX3Byb3RvPSIwIgoJZF9nZXRwcm90b2J5bmFtZV9yX3Byb3RvPSIwIgoJ
+  ZF9nZXRwcm90b2J5bnVtYmVyX3JfcHJvdG89IjAiCglkX3NldHByb3RvZW50X3JfcHJvdG89IjAi
+  CglkX2VuZHByb3RvZW50X3JfcHJvdG89IjAiCglkX2dldHNlcnZlbnRfcl9wcm90bz0iMCIKCWRf
+  Z2V0c2VydmJ5bmFtZV9yX3Byb3RvPSIwIgoJZF9nZXRzZXJ2Ynlwb3J0X3JfcHJvdG89IjAiCglk
+  X3NldHNlcnZlbnRfcl9wcm90bz0iMCIKCWRfZW5kc2VydmVudF9yX3Byb3RvPSIwIgoJZF9nZXRo
+  b3N0YnluYW1lX3JfcHJvdG89IjAiCglkX2dldGhvc3RieWFkZHIyX3JfcHJvdG89IjAiCglkX2dl
+  dGhvc3RieWFkZHJfcl9wcm90bz0iMCIKCWRfc2V0aG9zdGVudF9yX3Byb3RvPSIwIgoJZF9lbmRo
+  b3N0ZW50X3JfcHJvdG89IjAiCglkX2dldGhvc3RlbnRfcl9wcm90bz0iMCIKCTs7CmVzYWMKCiMg
+  VGhlc2UgYXJlIG9ic29sZXRlIGluIGFueSBuZXRic2QuCmRfc2V0cmdpZD0iJHVuZGVmIgpkX3Nl
+  dHJ1aWQ9IiR1bmRlZiIKCiMgdGhlcmUncyBubyBwcm9ibGVtIHdpdGggdmZvcmsuCnVzZXZmb3Jr
+  PXRydWUKCiMgVGhpcyBpcyB0aGVyZSBidXQgaW4gbWFjaGluZS9pZWVlZnBfaC4KaWVlZWZwX2g9
+  ImRlZmluZSIKCiMgVGhpcyBzY3JpcHQgVVUvdXNldGhyZWFkcy5jYnUgd2lsbCBnZXQgJ2NhbGxl
+  ZC1iYWNrJyBieSBDb25maWd1cmUKIyBhZnRlciBpdCBoYXMgcHJvbXB0ZWQgdGhlIHVzZXIgZm9y
+  IHdoZXRoZXIgdG8gdXNlIHRocmVhZHMuCmNhdCA+IFVVL3VzZXRocmVhZHMuY2J1IDw8J0VPQ0JV
+  JwpjYXNlICIkdXNldGhyZWFkcyIgaW4KJGRlZmluZXx0cnVlfFt5WV0qKQoJbHB0aHJlYWQ9Cglm
+  b3IgeHh4IGluIHB0aHJlYWQ7IGRvCgkJZm9yIHl5eSBpbiAkbG9jbGlicHRoICRwbGlicHRoICRn
+  bGlicHRoIGR1bW15OyBkbwoJCQl6eno9JHl5eS9saWIkeHh4LmEKCQkJaWYgdGVzdCAtZiAiJHp6
+  eiI7IHRoZW4KCQkJCWxwdGhyZWFkPSR4eHgKCQkJCWJyZWFrOwoJCQlmaQoJCQl6eno9JHl5eS9s
+  aWIkeHh4LnNvCgkJCWlmIHRlc3QgLWYgIiR6enoiOyB0aGVuCgkJCQlscHRocmVhZD0keHh4CgkJ
+  CQlicmVhazsKCQkJZmkKCQkJenp6PWBscyAkeXl5L2xpYiR4eHguc28uKiAyPi9kZXYvbnVsbGAK
+  CQkJaWYgdGVzdCAiWCR6enoiICE9IFg7IHRoZW4KCQkJCWxwdGhyZWFkPSR4eHgKCQkJCWJyZWFr
+  OwoJCQlmaQoJCWRvbmUKCQlpZiB0ZXN0ICJYJGxwdGhyZWFkIiAhPSBYOyB0aGVuCgkJCWJyZWFr
+  OwoJCWZpCglkb25lCglpZiB0ZXN0ICJYJGxwdGhyZWFkIiAhPSBYOyB0aGVuCgkJIyBBZGQgLWxw
+  dGhyZWFkLgoJCWxpYnN3YW50ZWQ9IiRsaWJzd2FudGVkICRscHRocmVhZCIKCQkjIFRoZXJlIGlz
+  IG5vIGxpYmNfciBhcyBvZiBOZXRCU0QgMS41LjIsIHNvIG5vIGMgLT4gY19yLgoJCSMgVGhpcyB3
+  aWxsIGJlIHJldmlzaXRlZCB3aGVuIE5ldEJTRCBnYWlucyBhIG5hdGl2ZSBwdGhyZWFkcwoJCSMg
+  aW1wbGVtZW50YXRpb24uCgllbHNlCgkJZWNobyAiJDA6IE5vIFBPU0lYIHRocmVhZHMgbGlicmFy
+  eSAoLWxwdGhyZWFkKSBmb3VuZC4gICIgXAoJCSAgICAgIllvdSBtYXkgd2FudCB0byBpbnN0YWxs
+  IEdOVSBwdGguICBBYm9ydGluZy4iID4mNAoJCWV4aXQgMQoJZmkKCXVuc2V0IGxwdGhyZWFkCgoJ
+  IyBzZXZlcmFsIHJlZW50cmFudCBmdW5jdGlvbnMgYXJlIGVtYmVkZGVkIGluIGxpYmMsIGJ1dCBo
+  YXZlbid0CgkjIGJlZW4gYWRkZWQgdG8gdGhlIGhlYWRlciBmaWxlcyB5ZXQuICBMZXQncyBob2xk
+  IG9mZiBvbiB1c2luZwoJIyB0aGVtIHVudGlsIHRoZXkgYXJlIGEgdmFsaWQgcGFydCBvZiB0aGUg
+  QVBJCgljYXNlICIkb3N2ZXJzIiBpbgoJWzAxMl0uKnwzLlswLTFdKQoJCWRfZ2V0cHJvdG9ieW5h
+  bWVfcj0kdW5kZWYKCQlkX2dldHByb3RvYnludW1iZXJfcj0kdW5kZWYKCQlkX2dldHByb3RvZW50
+  X3I9JHVuZGVmCgkJZF9nZXRzZXJ2YnluYW1lX3I9JHVuZGVmCgkJZF9nZXRzZXJ2Ynlwb3J0X3I9
+  JHVuZGVmCgkJZF9nZXRzZXJ2ZW50X3I9JHVuZGVmCgkJZF9zZXRwcm90b2VudF9yPSR1bmRlZgoJ
+  CWRfc2V0c2VydmVudF9yPSR1bmRlZgoJCWRfZW5kcHJvdG9lbnRfcj0kdW5kZWYKCQlkX2VuZHNl
+  cnZlbnRfcj0kdW5kZWYgOzsKCWVzYWMKCTs7Cgplc2FjCkVPQ0JVCgojIFNldCBzZW5zaWJsZSBk
+  ZWZhdWx0cyBmb3IgTmV0QlNEOiBsb29rIGZvciBsb2NhbCBzb2Z0d2FyZSBpbgojIC91c3IvcGtn
+  IChOZXRCU0QgUGFja2FnZXMgQ29sbGVjdGlvbikgYW5kIGluIC91c3IvbG9jYWwuCiMKbG9jbGli
+  cHRoPSIvdXNyL3BrZy9saWIgL3Vzci9sb2NhbC9saWIiCmxvY2luY3B0aD0iL3Vzci9wa2cvaW5j
+  bHVkZSAvdXNyL2xvY2FsL2luY2x1ZGUiCmNhc2UgIiRycGF0aGZsYWciIGluCicnKQoJbGRmbGFn
+  cz0KCTs7CiopCglsZGZsYWdzPQoJZm9yIHl5eSBpbiAkbG9jbGlicHRoOyBkbwoJCWxkZmxhZ3M9
+  IiRsZGZsYWdzICRycGF0aGZsYWckeXl5IgoJZG9uZQoJOzsKZXNhYwoKY2FzZSBgdW5hbWUgLW1g
+  IGluCmFscGhhKQogICAgZWNobyAnaW50IG1haW4oKSB7fScgPiB0cnkuYwogICAgZ2NjPWAke2Nj
+  Oi1jY30gLXYgLWMgdHJ5LmMgMj4mMXxncmVwICdnY2MgdmVyc2lvbiBlZ2NzLTInYAogICAgY2Fz
+  ZSAiJGdjYyIgaW4KICAgICcnIHwgImdjYyB2ZXJzaW9uIGVnY3MtMi45NS4iWzMtOV0qKSA7OyAj
+  IDIuOTUuMyBvciBiZXR0ZXIgb2theQogICAgKikJY2F0ID4mNCA8PEVPRgoqKioKKioqIFlvdXIg
+  Z2NjICgkZ2NjKSBpcyBrbm93biB0byBiZQoqKiogdG9vIGJ1Z2d5IG9uIG5ldGJzZC9hbHBoYSB0
+  byBjb21waWxlIFBlcmwgd2l0aCBvcHRpbWl6YXRpb24uCioqKiBJdCBpcyBzdWdnZXN0ZWQgeW91
+  IGluc3RhbGwgdGhlIGxhbmcvZ2NjIHBhY2thZ2Ugd2hpY2ggc2hvdWxkCioqKiBoYXZlIGF0IGxl
+  YXN0IGdjYyAyLjk1LjMgd2hpY2ggc2hvdWxkIHdvcmsgb2theTogdXNlIGZvciBleGFtcGxlCioq
+  KiBDb25maWd1cmUgLURjYz0vdXNyL3BrZy9nY2MtMi45NS4zL2Jpbi9jYy4gIFlvdSBjb3VsZCBh
+  bHNvCioqKiBDb25maWd1cmUgLURvcHRpbWl6ZT0tTzAgdG8gY29tcGlsZSBQZXJsIHdpdGhvdXQg
+  YW55IG9wdGltaXphdGlvbgoqKiogYnV0IHRoYXQgaXMgbm90IHJlY29tbWVuZGVkLgoqKioKRU9G
+  CglleGl0IDEKCTs7CiAgICBlc2FjCiAgICBybSAtZiB0cnkuKgogICAgOzsKZXNhYwoKIyBOZXRC
+  U0Qvc3BhcmMgMS41LjMvMS42LjEgZHVtcHMgY29yZSBpbiB0aGUgc2VtaWRfZHMgdGVzdCBvZiBD
+  b25maWd1cmUuCmNhc2UgYHVuYW1lIC1tYCBpbgpzcGFyYykgZF9zZW1jdGxfc2VtaWRfZHM9dW5k
+  ZWYgOzsKZXNhYwoKIyBtYWxsb2Mgd3JhcCB3b3JrcwpjYXNlICIkdXNlbWFsbG9jd3JhcCIgaW4K
+  JycpIHVzZW1hbGxvY3dyYXA9J2RlZmluZScgOzsKZXNhYwoKIyBkb24ndCB1c2UgcGVybCBtYWxs
+  b2MgYnkgZGVmYXVsdApjYXNlICIkdXNlbXltYWxsb2MiIGluCicnKSB1c2VteW1hbGxvYz1uIDs7
+  CmVzYWMK',
   'openbsd' =>
   'IyBoaW50cy9vcGVuYnNkLnNoCiMKIyBoaW50cyBmaWxlIGZvciBPcGVuQlNEOyBUb2RkIE1pbGxl
   ciA8bWlsbGVydEBvcGVuYnNkLm9yZz4KIyBFZGl0ZWQgdG8gYWxsb3cgQ29uZmlndXJlIGNvbW1h
   bmQtbGluZSBvdmVycmlkZXMgYnkKIyAgQW5keSBEb3VnaGVydHkgPGRvdWdoZXJhQGxhZmF5ZXR0
   ZS5lZHU+CiMKIyBUbyBidWlsZCB3aXRoIGRpc3RyaWJ1dGlvbiBwYXRocywgdXNlOgojCS4vQ29u
-  ZmlndXJlIC1kZXMgLURvcGVuYnNkX2Rpc3RyaWJ1dGlvbj1kZWZpbmVkCiMKCiMgSW4gT3BlbkJT
-  RCA+IDMuNywgdXNlIHBlcmwncyBtYWxsb2MgW3BlcmwgIzc1NzQyXQpjYXNlICIkb3N2ZXJzIiBp
-  bgozLls4OV0qfFs0LTldKikKICAgIHRlc3QgIiR1c2VteW1hbGxvYyIgfHwgdXNlbXltYWxsb2M9
-  eQogICAgOzsKZXNhYwoKIyBtYWxsb2Mgd3JhcCB3b3JrcwpjYXNlICIkdXNlbWFsbG9jd3JhcCIg
+  ZmlndXJlIC1kZXMgLURvcGVuYnNkX2Rpc3RyaWJ1dGlvbj1kZWZpbmVkCiMKCiMgT3BlbkJTRCBo
+  YXMgYSBiZXR0ZXIgbWFsbG9jIHRoYW4gcGVybC4uLgp0ZXN0ICIkdXNlbXltYWxsb2MiIHx8IHVz
+  ZW15bWFsbG9jPSduJwoKIyBtYWxsb2Mgd3JhcCB3b3JrcwpjYXNlICIkdXNlbWFsbG9jd3JhcCIg
   aW4KJycpIHVzZW1hbGxvY3dyYXA9J2RlZmluZScgOzsKZXNhYwoKIyBDdXJyZW50bHksIHZmb3Jr
   KDIpIGlzIG5vdCBhIHJlYWwgd2luIG92ZXIgZm9yaygyKS4KdXNldmZvcms9IiR1bmRlZiIKCiMg
   SW4gT3BlbkJTRCA8IDMuMywgdGhlIHNldHJlP1t1Z11pZCgpIGFyZSBlbXVsYXRlZCB1c2luZyB0
@@ -4093,54 +5324,56 @@ $fatpacked{"Devel/PatchPerl/Hints.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"
   IHRoZSBsaWJwZXJsIG5hbWUgYXBwcm9wcmlhdGVseS4KIyBBbGxvdyBjb21tYW5kIGxpbmUgb3Zl
   cnJpZGVzLgojCkFSQ0g9YGFyY2ggfCBzZWQgJ3MvXk9wZW5CU0QuLy8nYApjYXNlICIke0FSQ0h9
   LSR7b3N2ZXJzfSIgaW4KYWxwaGEtMi5bMC04XXxtaXBzLTIuWzAtOF18cG93ZXJwYy0yLlswLTdd
-  fG04OGstKnxocHBhLSp8dmF4LSopCgl0ZXN0IC16ICIkdXNlZGwiICYmIHVzZWRsPSR1bmRlZgoJ
-  OzsKKikKCXRlc3QgLXogIiR1c2VkbCIgJiYgdXNlZGw9JGRlZmluZQoJIyBXZSB1c2UgLWZQSUMg
-  aGVyZSBiZWNhdXNlIC1mcGljIGlzICpOT1QqIGVub3VnaCBmb3Igc29tZSBvZiB0aGUKCSMgZXh0
-  ZW5zaW9ucyBsaWtlIFRrIG9uIHNvbWUgT3BlbkJTRCBwbGF0Zm9ybXMgKGllOiBzcGFyYykKCWNj
-  Y2RsZmxhZ3M9Ii1EUElDIC1mUElDICRjY2NkbGZsYWdzIgoJY2FzZSAiJG9zdmVycyIgaW4KCVsw
-  MV0uKnwyLlswLTddfDIuWzAtN10uKikKCQlsZGRsZmxhZ3M9Ii1Cc2hhcmVhYmxlICRsZGRsZmxh
-  Z3MiCgkJOzsKCTIuWzgtOV18My4wKQoJCWxkPSR7Y2M6LWNjfQoJCWxkZGxmbGFncz0iLXNoYXJl
-  ZCAtZlBJQyAkbGRkbGZsYWdzIgoJCTs7CgkqKSAjIGZyb20gMy4xIG9ud2FyZHMKCQlsZD0ke2Nj
-  Oi1jY30KCQlsZGRsZmxhZ3M9Ii1zaGFyZWQgLWZQSUMgJGxkZGxmbGFncyIKCQlsaWJzd2FudGVk
-  PWBlY2hvICRsaWJzd2FudGVkIHwgc2VkICdzLyBkbCAvIC8nYAoJCTs7Cgllc2FjCgoJIyBXZSBu
-  ZWVkIHRvIGZvcmNlIGxkIHRvIGV4cG9ydCBzeW1ib2xzIG9uIEVMRiBwbGF0Zm9ybXMuCgkjIFdp
-  dGhvdXQgdGhpcywgZGxvcGVuKCkgaXMgY3JpcHBsZWQuCglFTEY9YCR7Y2M6LWNjfSAtZE0gLUUg
-  LSA8L2Rldi9udWxsIHwgZ3JlcCBfX0VMRl9fYAoJdGVzdCAtbiAiJEVMRiIgJiYgbGRmbGFncz0i
-  LVdsLC1FICRsZGZsYWdzIgoJOzsKZXNhYwoKIwojIFR3ZWFrcyBmb3IgdmFyaW91cyB2ZXJzaW9u
-  cyBvZiBPcGVuQlNECiMKY2FzZSAiJG9zdmVycyIgaW4KMi41KQoJIyBPcGVuQlNEIDIuNSBoYXMg
-  YnJva2VuIG9kYm0gc3VwcG9ydAoJaV9kYm09JHVuZGVmCgk7Owplc2FjCgojIE9wZW5CU0QgZG9l
-  c24ndCBuZWVkIGxpYmNyeXB0IGJ1dCBtYW55IGZvbGtzIGtlZXAgYSBzdHViIGxpYgojIGFyb3Vu
-  ZCBmb3Igb2xkIE5ldEJTRCBiaW5hcmllcy4KbGlic3dhbnRlZD1gZWNobyAkbGlic3dhbnRlZCB8
-  IHNlZCAncy8gY3J5cHQgLyAvJ2AKCiMgQ29uZmlndXJlIGNhbid0IGZpZ3VyZSB0aGlzIG91dCBu
-  b24taW50ZXJhY3RpdmVseQpkX3N1aWRzYWZlPSRkZWZpbmUKCiMgY2MgaXMgZ2NjIHNvIHdlIGNh
-  biBkbyBiZXR0ZXIgdGhhbiAtTwojIEFsbG93IGEgY29tbWFuZC1saW5lIG92ZXJyaWRlLCBzdWNo
-  IGFzIC1Eb3B0aW1pemU9LWcKY2FzZSAke0FSQ0h9IGluCm04OGspCiAgIG9wdGltaXplPSctTzAn
-  CiAgIDs7CmhwcGEpCiAgIG9wdGltaXplPSctTzAnCiAgIDs7CiopCiAgIHRlc3QgIiRvcHRpbWl6
-  ZSIgfHwgb3B0aW1pemU9Jy1PMicKICAgOzsKZXNhYwoKIyBUaGlzIHNjcmlwdCBVVS91c2V0aHJl
-  YWRzLmNidSB3aWxsIGdldCAnY2FsbGVkLWJhY2snIGJ5IENvbmZpZ3VyZSAKIyBhZnRlciBpdCBo
-  YXMgcHJvbXB0ZWQgdGhlIHVzZXIgZm9yIHdoZXRoZXIgdG8gdXNlIHRocmVhZHMuCmNhdCA+IFVV
-  L3VzZXRocmVhZHMuY2J1IDw8J0VPQ0JVJwpjYXNlICIkdXNldGhyZWFkcyIgaW4KJGRlZmluZXx0
-  cnVlfFt5WV0qKQoJIyBhbnkgb3BlbmJzZCB2ZXJzaW9uIGRlcGVuZGVuY2llcyB3aXRoIHB0aHJl
-  YWRzPwoJY2NmbGFncz0iLXB0aHJlYWQgJGNjZmxhZ3MiCglsZGZsYWdzPSItcHRocmVhZCAkbGRm
-  bGFncyIKCWNhc2UgIiRvc3ZlcnMiIGluCglbMC0yXS4qfDMuWzAtMl0pCgkJIyBDaGFuZ2UgZnJv
-  bSAtbGMgdG8gLWxjX3IKCQlzZXQgYGVjaG8gIlggJGxpYnN3YW50ZWQgIiB8IHNlZCAncy8gYyAv
-  IGNfciAvJ2AKCQlzaGlmdAoJCWxpYnN3YW50ZWQ9IiQqIgoJOzsKCWVzYWMKCWNhc2UgIiRvc3Zl
-  cnMiIGluCglbMDEyXS4qfDMuWzAtNl0pCiAgICAgICAgCSMgQnJva2VuIGF0IGxlYXN0IHVwIHRv
-  IE9wZW5CU0QgMy42LCB3ZSdsbCBzZWUgYWJvdXQgMy43CgkJZF9nZXRzZXJ2YnluYW1lX3I9JHVu
-  ZGVmIDs7Cgllc2FjCmVzYWMKRU9DQlUKCiMgV2hlbiBidWlsZGluZyBpbiB0aGUgT3BlbkJTRCB0
-  cmVlIHdlIHVzZSBkaWZmZXJlbnQgcGF0aHMKIyBUaGlzIGlzIG9ubHkgcGFydCBvZiB0aGUgc3Rv
-  cnksIHRoZSByZXN0IGNvbWVzIGZyb20gY29uZmlnLm92ZXIKY2FzZSAiJG9wZW5ic2RfZGlzdHJp
-  YnV0aW9uIiBpbgonJ3wkdW5kZWZ8ZmFsc2UpIDs7CiopCgkjIFdlIHB1dCB0aGluZ3MgaW4gL3Vz
-  ciwgbm90IC91c3IvbG9jYWwKCXByZWZpeD0nL3VzcicKCXByZWZpeGV4cD0nL3VzcicKCXN5c21h
-  bj0nL3Vzci9zaGFyZS9tYW4vbWFuMScKCWxpYnB0aD0nL3Vzci9saWInCglnbGlicHRoPScvdXNy
-  L2xpYicKCSMgTG9jYWwgdGhpbmdzLCBob3dldmVyLCBkbyBnbyBpbiAvdXNyL2xvY2FsCglzaXRl
-  cHJlZml4PScvdXNyL2xvY2FsJwoJc2l0ZXByZWZpeGV4cD0nL3Vzci9sb2NhbCcKCSMgUG9ydHMg
-  aW5zdGFsbHMgbm9uLXN0ZCBsaWJzIGluIC91c3IvbG9jYWwvbGliIHNvIGxvb2sgdGhlcmUgdG9v
-  Cglsb2NpbmNwdGg9Jy91c3IvbG9jYWwvaW5jbHVkZScKCWxvY2xpYnB0aD0nL3Vzci9sb2NhbC9s
-  aWInCgkjIExpbmsgcGVybCB3aXRoIHNoYXJlZCBsaWJwZXJsCglpZiBbICIkdXNlZGwiID0gIiRk
-  ZWZpbmUiIC1hIC1yIHNobGliX3ZlcnNpb24gXTsgdGhlbgoJCXVzZXNocnBsaWI9dHJ1ZQoJCWxp
-  YnBlcmw9YC4gLi9zaGxpYl92ZXJzaW9uOyBlY2hvIGxpYnBlcmwuc28uJHttYWpvcn0uJHttaW5v
-  cn1gCglmaQoJOzsKZXNhYwoKIyBlbmQK',
+  fG04OGstWzItNF0uKnxtODhrLTUuWzAtMl18aHBwYS0zLlswLTVdfHZheC0qKQoJdGVzdCAteiAi
+  JHVzZWRsIiAmJiB1c2VkbD0kdW5kZWYKCTs7CiopCgl0ZXN0IC16ICIkdXNlZGwiICYmIHVzZWRs
+  PSRkZWZpbmUKCSMgV2UgdXNlIC1mUElDIGhlcmUgYmVjYXVzZSAtZnBpYyBpcyAqTk9UKiBlbm91
+  Z2ggZm9yIHNvbWUgb2YgdGhlCgkjIGV4dGVuc2lvbnMgbGlrZSBUayBvbiBzb21lIE9wZW5CU0Qg
+  cGxhdGZvcm1zIChpZTogc3BhcmMpCgljY2NkbGZsYWdzPSItRFBJQyAtZlBJQyAkY2NjZGxmbGFn
+  cyIKCWNhc2UgIiRvc3ZlcnMiIGluCglbMDFdLip8Mi5bMC03XXwyLlswLTddLiopCgkJbGRkbGZs
+  YWdzPSItQnNoYXJlYWJsZSAkbGRkbGZsYWdzIgoJCTs7CgkyLls4LTldfDMuMCkKCQlsZD0ke2Nj
+  Oi1jY30KCQlsZGRsZmxhZ3M9Ii1zaGFyZWQgLWZQSUMgJGxkZGxmbGFncyIKCQk7OwoJKikgIyBm
+  cm9tIDMuMSBvbndhcmRzCgkJbGQ9JHtjYzotY2N9CgkJbGRkbGZsYWdzPSItc2hhcmVkIC1mUElD
+  ICRsZGRsZmxhZ3MiCgkJbGlic3dhbnRlZD1gZWNobyAkbGlic3dhbnRlZCB8IHNlZCAncy8gZGwg
+  LyAvJ2AKCQk7OwoJZXNhYwoKCSMgV2UgbmVlZCB0byBmb3JjZSBsZCB0byBleHBvcnQgc3ltYm9s
+  cyBvbiBFTEYgcGxhdGZvcm1zLgoJIyBXaXRob3V0IHRoaXMsIGRsb3BlbigpIGlzIGNyaXBwbGVk
+  LgoJRUxGPWAke2NjOi1jY30gLWRNIC1FIC0gPC9kZXYvbnVsbCB8IGdyZXAgX19FTEZfX2AKCXRl
+  c3QgLW4gIiRFTEYiICYmIGxkZmxhZ3M9Ii1XbCwtRSAkbGRmbGFncyIKCTs7CmVzYWMKCiMKIyBU
+  d2Vha3MgZm9yIHZhcmlvdXMgdmVyc2lvbnMgb2YgT3BlbkJTRAojCmNhc2UgIiRvc3ZlcnMiIGlu
+  CjIuNSkKCSMgT3BlbkJTRCAyLjUgaGFzIGJyb2tlbiBvZGJtIHN1cHBvcnQKCWlfZGJtPSR1bmRl
+  ZgoJOzsKZXNhYwoKIyBPcGVuQlNEIGRvZXNuJ3QgbmVlZCBsaWJjcnlwdCBidXQgbWFueSBmb2xr
+  cyBrZWVwIGEgc3R1YiBsaWIKIyBhcm91bmQgZm9yIG9sZCBOZXRCU0QgYmluYXJpZXMuCmxpYnN3
+  YW50ZWQ9YGVjaG8gJGxpYnN3YW50ZWQgfCBzZWQgJ3MvIGNyeXB0IC8gLydgCgojIENvbmZpZ3Vy
+  ZSBjYW4ndCBmaWd1cmUgdGhpcyBvdXQgbm9uLWludGVyYWN0aXZlbHkKZF9zdWlkc2FmZT0kZGVm
+  aW5lCgojIGNjIGlzIGdjYyBzbyB3ZSBjYW4gZG8gYmV0dGVyIHRoYW4gLU8KIyBBbGxvdyBhIGNv
+  bW1hbmQtbGluZSBvdmVycmlkZSwgc3VjaCBhcyAtRG9wdGltaXplPS1nCmNhc2UgIiR7QVJDSH0t
+  JHtvc3ZlcnN9IiBpbgpocHBhLTMuM3xtODhrLTIuKnxtODhrLTMuWzAtM10pCiAgIHRlc3QgIiRv
+  cHRpbWl6ZSIgfHwgb3B0aW1pemU9Jy1PMCcKICAgOzsKbTg4ay0zLjQpCiAgIHRlc3QgIiRvcHRp
+  bWl6ZSIgfHwgb3B0aW1pemU9Jy1PMScKICAgOzsKKikKICAgdGVzdCAiJG9wdGltaXplIiB8fCBv
+  cHRpbWl6ZT0nLU8yJwogICA7Owplc2FjCgojIFRoaXMgc2NyaXB0IFVVL3VzZXRocmVhZHMuY2J1
+  IHdpbGwgZ2V0ICdjYWxsZWQtYmFjaycgYnkgQ29uZmlndXJlIAojIGFmdGVyIGl0IGhhcyBwcm9t
+  cHRlZCB0aGUgdXNlciBmb3Igd2hldGhlciB0byB1c2UgdGhyZWFkcy4KY2F0ID4gVVUvdXNldGhy
+  ZWFkcy5jYnUgPDwnRU9DQlUnCmNhc2UgIiR1c2V0aHJlYWRzIiBpbgokZGVmaW5lfHRydWV8W3lZ
+  XSopCgkjIGFueSBvcGVuYnNkIHZlcnNpb24gZGVwZW5kZW5jaWVzIHdpdGggcHRocmVhZHM/Cglj
+  Y2ZsYWdzPSItcHRocmVhZCAkY2NmbGFncyIKCWxkZmxhZ3M9Ii1wdGhyZWFkICRsZGZsYWdzIgoJ
+  Y2FzZSAiJG9zdmVycyIgaW4KCVswLTJdLip8My5bMC0yXSkKCQkjIENoYW5nZSBmcm9tIC1sYyB0
+  byAtbGNfcgoJCXNldCBgZWNobyAiWCAkbGlic3dhbnRlZCAiIHwgc2VkICdzLyBjIC8gY19yIC8n
+  YAoJCXNoaWZ0CgkJbGlic3dhbnRlZD0iJCoiCgk7OwoJZXNhYwoJY2FzZSAiJG9zdmVycyIgaW4K
+  CVswMTJdLip8My5bMC02XSkKICAgICAgICAJIyBCcm9rZW4gdXAgdG8gT3BlbkJTRCAzLjYsIGZp
+  eGVkIGluIE9wZW5CU0QgMy43CgkJZF9nZXRzZXJ2YnluYW1lX3I9JHVuZGVmIDs7Cgllc2FjCmVz
+  YWMKRU9DQlUKCiMgV2hlbiBidWlsZGluZyBpbiB0aGUgT3BlbkJTRCB0cmVlIHdlIHVzZSBkaWZm
+  ZXJlbnQgcGF0aHMKIyBUaGlzIGlzIG9ubHkgcGFydCBvZiB0aGUgc3RvcnksIHRoZSByZXN0IGNv
+  bWVzIGZyb20gY29uZmlnLm92ZXIKY2FzZSAiJG9wZW5ic2RfZGlzdHJpYnV0aW9uIiBpbgonJ3wk
+  dW5kZWZ8ZmFsc2UpIDs7CiopCgkjIFdlIHB1dCB0aGluZ3MgaW4gL3Vzciwgbm90IC91c3IvbG9j
+  YWwKCXByZWZpeD0nL3VzcicKCXByZWZpeGV4cD0nL3VzcicKCXN5c21hbj0nL3Vzci9zaGFyZS9t
+  YW4vbWFuMScKCWxpYnB0aD0nL3Vzci9saWInCglnbGlicHRoPScvdXNyL2xpYicKCSMgTG9jYWwg
+  dGhpbmdzLCBob3dldmVyLCBkbyBnbyBpbiAvdXNyL2xvY2FsCglzaXRlcHJlZml4PScvdXNyL2xv
+  Y2FsJwoJc2l0ZXByZWZpeGV4cD0nL3Vzci9sb2NhbCcKCSMgUG9ydHMgaW5zdGFsbHMgbm9uLXN0
+  ZCBsaWJzIGluIC91c3IvbG9jYWwvbGliIHNvIGxvb2sgdGhlcmUgdG9vCglsb2NpbmNwdGg9Jy91
+  c3IvbG9jYWwvaW5jbHVkZScKCWxvY2xpYnB0aD0nL3Vzci9sb2NhbC9saWInCgkjIExpbmsgcGVy
+  bCB3aXRoIHNoYXJlZCBsaWJwZXJsCglpZiBbICIkdXNlZGwiID0gIiRkZWZpbmUiIC1hIC1yIHNo
+  bGliX3ZlcnNpb24gXTsgdGhlbgoJCXVzZXNocnBsaWI9dHJ1ZQoJCWxpYnBlcmw9YC4gLi9zaGxp
+  Yl92ZXJzaW9uOyBlY2hvIGxpYnBlcmwuc28uJHttYWpvcn0uJHttaW5vcn1gCglmaQoJOzsKZXNh
+  YwoKIyBlbmQK',
   'solaris' =>
   'IyBoaW50cy9zb2xhcmlzXzIuc2gKIyBDb250cmlidXRpb25zIGJ5IChpbiBhbHBoYWJldGljYWwg
   b3JkZXIpIEFsYW4gQnVybGlzb24sIEFuZHkgRG91Z2hlcnR5LAojIERlYW4gUm9laHJpY2gsIEph
@@ -4201,343 +5434,349 @@ $fatpacked{"Devel/PatchPerl/Hints.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"
   fCBcCnNlZCAtbiAnLyAtWSAvcyEuKiAtWSAiUCxcKFteIl0qXCkiLiohXDEhcCcgfCB0ciAnOicg
   JyAnIHwgXApzZWQgLWUgJ3MhL3Vzci9saWIvc3BhcmN2OSEhJyAtZSAncyEvdXNyL2Njcy9saWIv
   c3BhcmN2OSEhJyBcCiAgICAtZSAncyEvdXNyL2xpYiEhZycgLWUgJ3MhL3Vzci9jY3MvbGliISFn
-  JwpFTkQKYAoKY2FzZSAiJGNjIiBpbgonJykJaWYgdGVzdCAtZiAvb3B0L1NVTldzcHJvL2Jpbi9j
-  YzsgdGhlbgoJCWNjPS9vcHQvU1VOV3Nwcm8vYmluL2NjCgkJY2F0IDw8RU9GID4mNAoKWW91IHNw
-  ZWNpZmllZCBubyBjYyBidXQgeW91IHNlZW0gdG8gaGF2ZSB0aGUgV29ya3Nob3AgY29tcGlsZXIK
-  KCRjYykgaW5zdGFsbGVkLCB1c2luZyB0aGF0LgpJZiB5b3Ugd2FudCBzb21ldGhpbmcgZWxzZSwg
-  c3BlY2lmeSB0aGF0IGluIHRoZSBjb21tYW5kIGxpbmUsCmUuZy4gQ29uZmlndXJlIC1EY2M9Z2Nj
-  CgpFT0YKCWZpCgk7Owplc2FjCgojIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMj
-  IyMjIyMjIyMjIyMjIyMjIyMKIyBHZW5lcmFsIHNhbml0eSB0ZXN0aW5nLiAgU2VlIGJlbG93IGZv
-  ciBleGNlcnB0cyBmcm9tIHRoZSBTb2xhcmlzIEZBUS4KIwojIEZyb20gcm9laHJpY2hAaXJvbndv
-  b2QtZmRkaS5jcmF5LmNvbSBXZWQgU2VwIDI3IDEyOjUxOjQ2IDE5OTUKIyBEYXRlOiBUaHUsIDcg
-  U2VwIDE5OTUgMTY6MzE6NDAgLTA1MDAKIyBGcm9tOiBEZWFuIFJvZWhyaWNoIDxyb2VocmljaEBp
-  cm9ud29vZC1mZGRpLmNyYXkuY29tPgojIFRvOiBwZXJsNS1wb3J0ZXJzQGFmcmljYS5uaWNvaC5j
-  b20KIyBTdWJqZWN0OiBSZTogT24gcGVybDUvc29sYXJpcy9nY2MKIwojIEhlcmUncyBhbm90aGVy
-  IGRyYWZ0IG9mIHRoZSBwZXJsNS9zb2xhcmlzL2djYyBzYW5pdHktY2hlY2tlci4KCmNhc2UgYHR5
-  cGUgJHtjYzotY2N9YCBpbgoqL3Vzci91Y2IvY2MqKSBjYXQgPDxFTkQgPiY0CgpOT1RFOiAgU29t
-  ZSBwZW9wbGUgaGF2ZSByZXBvcnRlZCBwcm9ibGVtcyB3aXRoIC91c3IvdWNiL2NjLgpJZiB5b3Ug
-  aGF2ZSBkaWZmaWN1bHRpZXMsIHBsZWFzZSBtYWtlIHN1cmUgdGhlIGRpcmVjdG9yeQpjb250YWlu
-  aW5nIHlvdXIgQyBjb21waWxlciBpcyBiZWZvcmUgL3Vzci91Y2IgaW4geW91ciBQQVRILgoKRU5E
-  Cjs7CmVzYWMKCgojIENoZWNrIHRoYXQgL2Rldi9mZCBpcyBtb3VudGVkLiAgSWYgaXQgaXMgbm90
-  IG1vdW50ZWQsIGxldCB0aGUKIyB1c2VyIGtub3cgdGhhdCBzdWlkIHNjcmlwdHMgbWF5IG5vdCB3
-  b3JrLgokcnVuIG1vdW50IHwgZ3JlcCAnXi9kZXYvZmQgJyAyPiYxID4gL2Rldi9udWxsCmNhc2Ug
-  JD8gaW4KMCkgOzsKKikKCWNhdCA8PEVORCA+JjQKCk5PVEU6IFlvdXIgc3lzdGVtIGRvZXMgbm90
-  IGhhdmUgL2Rldi9mZCBtb3VudGVkLiAgSWYgeW91IHdhbnQgdG8KYmUgYWJsZSB0byB1c2Ugc2V0
-  LXVpZCBzY3JpcHRzIHlvdSBtdXN0IGFzayB5b3VyIHN5c3RlbSBhZG1pbmlzdHJhdG9yCnRvIG1v
-  dW50IC9kZXYvZmQuCgpFTkQKCTs7CmVzYWMKCgojIFNlZSBpZiBsaWJ1Y2IgY2FuIGJlIGZvdW5k
-  IGluIC91c3IvbGliLiAgSWYgaXQgaXMsIHdhcm4gdGhlIHVzZXIKIyB0aGF0IHRoaXMgbWF5IGNh
-  dXNlIHByb2JsZW1zIHdoaWxlIGJ1aWxkaW5nIFBlcmwgZXh0ZW5zaW9ucy4KZm91bmRfbGlidWNi
-  PScnCmNhc2UgIiRydW4iIGluCicnKSAvdXNyL2Jpbi9scyAvdXNyL2xpYi9saWJ1Y2IqID4vZGV2
-  L251bGwgMj4mMQogICAgZm91bmRfbGlidWNiPSQ/CiAgICA7OwoqKSAgJHJ1biAvdXNyL2Jpbi9s
-  cyAnL3Vzci9saWIvbGlidWNiKicgPi9kZXYvbnVsbCAyPiYxCiAgICBmb3VuZF9saWJ1Y2I9JD8K
-  ICAgIDs7CmVzYWMKCmNhc2UgJGZvdW5kX2xpYnVjYiBpbgowKQoJY2F0IDw8RU5EID4mNAoKTk9U
-  RTogbGlidWNiIGhhcyBiZWVuIGZvdW5kIGluIC91c3IvbGliLiAgbGlidWNiIHNob3VsZCByZXNp
-  ZGUgaW4KL3Vzci91Y2JsaWIuICBZb3UgbWF5IGhhdmUgdHJvdWJsZSB3aGlsZSBidWlsZGluZyBQ
-  ZXJsIGV4dGVuc2lvbnMuCgpFTkQKOzsKZXNhYwoKIyBVc2Ugc2hlbGwgYnVpbHQtaW4gJ3R5cGUn
-  IGNvbW1hbmQgaW5zdGVhZCBvZiAvdXNyL2Jpbi93aGljaCB0bwojIGF2b2lkIHBvc3NpYmxlIGNz
-  aCBzdGFydC11cCBwcm9ibGVtcyBhbmQgYWxzbyB0byB1c2UgdGhlIHNhbWUgc2hlbGwKIyB3ZSds
-  bCBiZSB1c2luZyB0byBDb25maWd1cmUgYW5kIG1ha2UgcGVybC4KIyBUaGUgcGF0aCBuYW1lIGlz
-  IHRoZSBsYXN0IGZpZWxkIGluIHRoZSBvdXRwdXQsIGJ1dCB0aGUgdHlwZSBjb21tYW5kCiMgaGFz
-  IGFuIGFubm95aW5nIGFycmF5IG9mIHBvc3NpYmxlIG91dHB1dHMsIGUuZy46CiMJbWFrZSBpcyBo
-  YXNoZWQgKC9vcHQvZ251L2Jpbi9tYWtlKQojCWNjIGlzIC91c3IvdWNiL2NjCiMJZm9vIG5vdCBm
-  b3VuZAojIHVzZSBhIGNvbW1hbmQgbGlrZSB0eXBlIG1ha2UgfCBhd2sgJ3twcmludCAkTkZ9JyB8
-  IHNlZCAncy9bKCldLy9nJwoKIyBTZWUgaWYgbWFrZSgxKSBpcyBHTlUgbWFrZSgxKS4KIyBJZiBp
-  dCBpcywgbWFrZSBzdXJlIHRoZSBzZXRnaWQgYml0IGlzIG5vdCBzZXQuCm1ha2UgLXYgPiBtYWtl
-  LnZlcnMgMj4mMQppZiBncmVwIEdOVSBtYWtlLnZlcnMgPiAvZGV2L251bGwgMj4mMTsgdGhlbgog
-  ICAgdG1wPWB0eXBlIG1ha2UgfCBhd2sgJ3twcmludCAkTkZ9JyB8IHNlZCAncy9bKCldLy9nJ2AK
-  ICAgIGNhc2UgImAke2xzOi0nL3Vzci9iaW4vbHMnfSAtbEwgJHRtcGAiIGluCiAgICA/Pz8/Pz9z
-  KikKCSAgICBjYXQgPDxFTkQgPiYyCgpOT1RFOiBZb3VyIFBBVEggcG9pbnRzIHRvIEdOVSBtYWtl
-  LCBhbmQgeW91ciBHTlUgbWFrZSBoYXMgdGhlIHNldC1ncm91cC1pZApiaXQgc2V0LiAgWW91IG11
-  c3QgZWl0aGVyIHJlYXJyYW5nZSB5b3VyIFBBVEggdG8gcHV0IC91c3IvY2NzL2JpbiBiZWZvcmUg
-  dGhlCkdOVSB1dGlsaXRpZXMgb3IgeW91IG11c3QgYXNrIHlvdXIgc3lzdGVtIGFkbWluaXN0cmF0
-  b3IgdG8gZGlzYWJsZSB0aGUKc2V0LWdyb3VwLWlkIGJpdCBvbiBHTlUgbWFrZS4KCkVORAoJICAg
-  IDs7CiAgICBlc2FjCmZpCnJtIC1mIG1ha2UudmVycwoKY2F0ID4gVVUvY2MuY2J1IDw8J0VPQ0JV
-  JwojIFRoaXMgc2NyaXB0IFVVL2NjLmNidSB3aWxsIGdldCAnY2FsbGVkLWJhY2snIGJ5IENvbmZp
-  Z3VyZSBhZnRlciBpdAojIGhhcyBwcm9tcHRlZCB0aGUgdXNlciBmb3IgdGhlIEMgY29tcGlsZXIg
-  dG8gdXNlLgoKIyBJZiB0aGUgQyBjb21waWxlciBpcyBnY2M6CiMgICAtIGNoZWNrIHRoZSBmaXhl
-  ZC1pbmNsdWRlcwojICAgLSBjaGVjayBhcygxKSBhbmQgbGQoMSksIHRoZXkgc2hvdWxkIG5vdCBi
-  ZSBHTlUKIwkoR05VIGFzIGFuZCBsZCAyLjguMSBhbmQgbGF0ZXIgYXJlIHJlcG9ydGVkbHkgb2ss
-  IGhvd2V2ZXIuKQojIElmIHRoZSBDIGNvbXBpbGVyIGlzIG5vdCBnY2M6CiMgICAtIENoZWNrIGlm
-  IGl0IGlzIHRoZSBXb3Jrc2hvcC9Gb3J0ZSBjb21waWxlci4KIyAgICAgSWYgaXQgaXMsIHByZXBh
-  cmUgZm9yIDY0IGJpdCBhbmQgbG9uZyBkb3VibGVzLgojICAgLSBjaGVjayBhcygxKSBhbmQgbGQo
+  JwpFTkQKYAoKY2FzZSAiJGNjIiBpbgonJykgICAgZm9yIGkgaW4gYGxzIC1yIC9vcHQvc29sc3R1
+  ZGlvKi9iaW4vY2NgIC9vcHQvU1VOV3Nwcm8vYmluL2NjCiAgICAgICBkbwoJICAgICAgIGlmIHRl
+  c3QgLWYgIiRpIjsgdGhlbgoJCSAgICAgICBjYz0kaQoJCSAgICAgICBjYXQgPDxFT0YgPiY0CgpZ
+  b3Ugc3BlY2lmaWVkIG5vIGNjIGJ1dCB5b3Ugc2VlbSB0byBoYXZlIHRoZSBXb3Jrc2hvcCBjb21w
+  aWxlcgooJGNjKSBpbnN0YWxsZWQsIHVzaW5nIHRoYXQuCklmIHlvdSB3YW50IHNvbWV0aGluZyBl
+  bHNlLCBzcGVjaWZ5IHRoYXQgaW4gdGhlIGNvbW1hbmQgbGluZSwKZS5nLiBDb25maWd1cmUgLURj
+  Yz1nY2MKCkVPRgoJCQlicmVhawoJCWZpCglkb25lCgk7Owplc2FjCgojIyMjIyMjIyMjIyMjIyMj
+  IyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMKIyBHZW5lcmFsIHNhbml0eSB0
+  ZXN0aW5nLiAgU2VlIGJlbG93IGZvciBleGNlcnB0cyBmcm9tIHRoZSBTb2xhcmlzIEZBUS4KIwoj
+  IEZyb20gcm9laHJpY2hAaXJvbndvb2QtZmRkaS5jcmF5LmNvbSBXZWQgU2VwIDI3IDEyOjUxOjQ2
+  IDE5OTUKIyBEYXRlOiBUaHUsIDcgU2VwIDE5OTUgMTY6MzE6NDAgLTA1MDAKIyBGcm9tOiBEZWFu
+  IFJvZWhyaWNoIDxyb2VocmljaEBpcm9ud29vZC1mZGRpLmNyYXkuY29tPgojIFRvOiBwZXJsNS1w
+  b3J0ZXJzQGFmcmljYS5uaWNvaC5jb20KIyBTdWJqZWN0OiBSZTogT24gcGVybDUvc29sYXJpcy9n
+  Y2MKIwojIEhlcmUncyBhbm90aGVyIGRyYWZ0IG9mIHRoZSBwZXJsNS9zb2xhcmlzL2djYyBzYW5p
+  dHktY2hlY2tlci4KCmNhc2UgYHR5cGUgJHtjYzotY2N9YCBpbgoqL3Vzci91Y2IvY2MqKSBjYXQg
+  PDxFTkQgPiY0CgpOT1RFOiAgU29tZSBwZW9wbGUgaGF2ZSByZXBvcnRlZCBwcm9ibGVtcyB3aXRo
+  IC91c3IvdWNiL2NjLgpJZiB5b3UgaGF2ZSBkaWZmaWN1bHRpZXMsIHBsZWFzZSBtYWtlIHN1cmUg
+  dGhlIGRpcmVjdG9yeQpjb250YWluaW5nIHlvdXIgQyBjb21waWxlciBpcyBiZWZvcmUgL3Vzci91
+  Y2IgaW4geW91ciBQQVRILgoKRU5ECjs7CmVzYWMKCgojIENoZWNrIHRoYXQgL2Rldi9mZCBpcyBt
+  b3VudGVkLiAgSWYgaXQgaXMgbm90IG1vdW50ZWQsIGxldCB0aGUKIyB1c2VyIGtub3cgdGhhdCBz
+  dWlkIHNjcmlwdHMgbWF5IG5vdCB3b3JrLgokcnVuIG1vdW50IHwgZ3JlcCAnXi9kZXYvZmQgJyAy
+  PiYxID4gL2Rldi9udWxsCmNhc2UgJD8gaW4KMCkgOzsKKikKCWNhdCA8PEVORCA+JjQKCk5PVEU6
+  IFlvdXIgc3lzdGVtIGRvZXMgbm90IGhhdmUgL2Rldi9mZCBtb3VudGVkLiAgSWYgeW91IHdhbnQg
+  dG8KYmUgYWJsZSB0byB1c2Ugc2V0LXVpZCBzY3JpcHRzIHlvdSBtdXN0IGFzayB5b3VyIHN5c3Rl
+  bSBhZG1pbmlzdHJhdG9yCnRvIG1vdW50IC9kZXYvZmQuCgpFTkQKCTs7CmVzYWMKCgojIFNlZSBp
+  ZiBsaWJ1Y2IgY2FuIGJlIGZvdW5kIGluIC91c3IvbGliLiAgSWYgaXQgaXMsIHdhcm4gdGhlIHVz
+  ZXIKIyB0aGF0IHRoaXMgbWF5IGNhdXNlIHByb2JsZW1zIHdoaWxlIGJ1aWxkaW5nIFBlcmwgZXh0
+  ZW5zaW9ucy4KZm91bmRfbGlidWNiPScnCmNhc2UgIiRydW4iIGluCicnKSAvdXNyL2Jpbi9scyAv
+  dXNyL2xpYi9saWJ1Y2IqID4vZGV2L251bGwgMj4mMQogICAgZm91bmRfbGlidWNiPSQ/CiAgICA7
+  OwoqKSAgJHJ1biAvdXNyL2Jpbi9scyAnL3Vzci9saWIvbGlidWNiKicgPi9kZXYvbnVsbCAyPiYx
+  CiAgICBmb3VuZF9saWJ1Y2I9JD8KICAgIDs7CmVzYWMKCmNhc2UgJGZvdW5kX2xpYnVjYiBpbgow
+  KQoJY2F0IDw8RU5EID4mNAoKTk9URTogbGlidWNiIGhhcyBiZWVuIGZvdW5kIGluIC91c3IvbGli
+  LiAgbGlidWNiIHNob3VsZCByZXNpZGUgaW4KL3Vzci91Y2JsaWIuICBZb3UgbWF5IGhhdmUgdHJv
+  dWJsZSB3aGlsZSBidWlsZGluZyBQZXJsIGV4dGVuc2lvbnMuCgpFTkQKOzsKZXNhYwoKIyBVc2Ug
+  c2hlbGwgYnVpbHQtaW4gJ3R5cGUnIGNvbW1hbmQgaW5zdGVhZCBvZiAvdXNyL2Jpbi93aGljaCB0
+  bwojIGF2b2lkIHBvc3NpYmxlIGNzaCBzdGFydC11cCBwcm9ibGVtcyBhbmQgYWxzbyB0byB1c2Ug
+  dGhlIHNhbWUgc2hlbGwKIyB3ZSdsbCBiZSB1c2luZyB0byBDb25maWd1cmUgYW5kIG1ha2UgcGVy
+  bC4KIyBUaGUgcGF0aCBuYW1lIGlzIHRoZSBsYXN0IGZpZWxkIGluIHRoZSBvdXRwdXQsIGJ1dCB0
+  aGUgdHlwZSBjb21tYW5kCiMgaGFzIGFuIGFubm95aW5nIGFycmF5IG9mIHBvc3NpYmxlIG91dHB1
+  dHMsIGUuZy46CiMJbWFrZSBpcyBoYXNoZWQgKC9vcHQvZ251L2Jpbi9tYWtlKQojCWNjIGlzIC91
+  c3IvdWNiL2NjCiMJZm9vIG5vdCBmb3VuZAojIHVzZSBhIGNvbW1hbmQgbGlrZSB0eXBlIG1ha2Ug
+  fCBhd2sgJ3twcmludCAkTkZ9JyB8IHNlZCAncy9bKCldLy9nJwoKIyBTZWUgaWYgbWFrZSgxKSBp
+  cyBHTlUgbWFrZSgxKS4KIyBJZiBpdCBpcywgbWFrZSBzdXJlIHRoZSBzZXRnaWQgYml0IGlzIG5v
+  dCBzZXQuCm1ha2UgLXYgPiBtYWtlLnZlcnMgMj4mMQppZiBncmVwIEdOVSBtYWtlLnZlcnMgPiAv
+  ZGV2L251bGwgMj4mMTsgdGhlbgogICAgdG1wPWB0eXBlIG1ha2UgfCBhd2sgJ3twcmludCAkTkZ9
+  JyB8IHNlZCAncy9bKCldLy9nJ2AKICAgIGNhc2UgImAke2xzOi0nL3Vzci9iaW4vbHMnfSAtbEwg
+  JHRtcGAiIGluCiAgICA/Pz8/Pz9zKikKCSAgICBjYXQgPDxFTkQgPiYyCgpOT1RFOiBZb3VyIFBB
+  VEggcG9pbnRzIHRvIEdOVSBtYWtlLCBhbmQgeW91ciBHTlUgbWFrZSBoYXMgdGhlIHNldC1ncm91
+  cC1pZApiaXQgc2V0LiAgWW91IG11c3QgZWl0aGVyIHJlYXJyYW5nZSB5b3VyIFBBVEggdG8gcHV0
+  IC91c3IvY2NzL2JpbiBiZWZvcmUgdGhlCkdOVSB1dGlsaXRpZXMgb3IgeW91IG11c3QgYXNrIHlv
+  dXIgc3lzdGVtIGFkbWluaXN0cmF0b3IgdG8gZGlzYWJsZSB0aGUKc2V0LWdyb3VwLWlkIGJpdCBv
+  biBHTlUgbWFrZS4KCkVORAoJICAgIDs7CiAgICBlc2FjCmZpCnJtIC1mIG1ha2UudmVycwoKY2F0
+  ID4gVVUvY2MuY2J1IDw8J0VPQ0JVJwojIFRoaXMgc2NyaXB0IFVVL2NjLmNidSB3aWxsIGdldCAn
+  Y2FsbGVkLWJhY2snIGJ5IENvbmZpZ3VyZSBhZnRlciBpdAojIGhhcyBwcm9tcHRlZCB0aGUgdXNl
+  ciBmb3IgdGhlIEMgY29tcGlsZXIgdG8gdXNlLgoKIyBJZiB0aGUgQyBjb21waWxlciBpcyBnY2M6
+  CiMgICAtIGNoZWNrIHRoZSBmaXhlZC1pbmNsdWRlcwojICAgLSBjaGVjayBhcygxKSBhbmQgbGQo
   MSksIHRoZXkgc2hvdWxkIG5vdCBiZSBHTlUKIwkoR05VIGFzIGFuZCBsZCAyLjguMSBhbmQgbGF0
-  ZXIgYXJlIHJlcG9ydGVkbHkgb2ssIGhvd2V2ZXIuKQojCiMgV2F0Y2ggb3V0IGluIGNhc2UgdGhl
-  eSBoYXZlIG5vdCBzZXQgJGNjLgoKIyBQZXJsIGNvbXBpbGVkIHdpdGggc29tZSBjb21iaW5hdGlv
-  bnMgb2YgR05VIGFzIGFuZCBsZCBtYXkgbm90CiMgYmUgYWJsZSB0byBwZXJmb3JtIGR5bmFtaWMg
-  bG9hZGluZyBvZiBleHRlbnNpb25zLiAgSWYgeW91IGhhdmUgYQojIHByb2JsZW0gd2l0aCBkeW5h
-  bWljIGxvYWRpbmcsIGJlIHN1cmUgdGhhdCB5b3UgYXJlIHVzaW5nIHRoZSBTb2xhcmlzCiMgL3Vz
-  ci9jY3MvYmluL2FzIGFuZCAvdXNyL2Njcy9iaW4vbGQuICBZb3UgY2FuIGRvIHRoYXQgd2l0aAoj
-  CXNoIENvbmZpZ3VyZSAtRGNjPSdnY2MgLUIvdXNyL2Njcy9iaW4vJwojIChub3RlIHRoZSB0cmFp
-  bGluZyBzbGFzaCBpcyByZXF1aXJlZCkuCiMgQ29tYmluYXRpb25zIHRoYXQgYXJlIGtub3duIHRv
-  IHdvcmsgd2l0aCB0aGUgZm9sbG93aW5nIGhpbnRzOgojCiMgIGdjYy0yLjcuMiwgR05VIGFzIDIu
-  NywgR05VIGxkIDIuNwojICBlZ2NzLTEuMC4zLCBHTlUgYXMgMi45LjEgYW5kIEdOVSBsZCAyLjku
-  MQojCS0tQW5keSBEb3VnaGVydHkgIDxkb3VnaGVyYUBsYWZheWV0dGUuZWR1PgojCVR1ZSBBcHIg
-  MTMgMTc6MTk6NDMgRURUIDE5OTkKCiMgR2V0IGdjYyB0byBzaGFyZSBpdHMgc2VjcmV0cy4KZWNo
-  byAnaW50IG1haW4oKSB7IHJldHVybiAwOyB9JyA+IHRyeS5jCgkjIEluZGVudCB0byBhdm9pZCBw
-  cm9wYWdhdGlvbiB0byBjb25maWcuc2gKCXZlcmJvc2U9YCR7Y2M6LWNjfSAkY2NmbGFncyAtdiAt
-  byB0cnkgdHJ5LmMgMj4mMWAKCiMgWFhYIFRPRE86ICAnc3BlY3MnIG91dHB1dCBjaGFuZ2VkIGZy
-  b20gJ1JlYWRpbmcgc3BlY3MgZnJvbScgaW4gZ2NjLVsyM10gdG8gJ1VzaW5nCiMgYnVpbHQtaW4g
-  c3BlY3MnIGluIGdjYy00LiAgUGVyaGFwcyB3ZSBzaG91bGQganVzdCB1c2UgdGhlIHNhbWUgZ2Nj
-  IHRlc3QgYXMKIyBpbiBDb25maWd1cmUgdG8gc2VlIGlmIHdlJ3JlIHVzaW5nIGdjYy4KaWYgZWNo
-  byAiJHZlcmJvc2UiIHwgZWdyZXAgJyhSZWFkaW5nIHNwZWNzIGZyb20pfChVc2luZyBidWlsdC1p
-  biBzcGVjcyknID4vZGV2L251bGwgMj4mMTsgdGhlbgoJIwoJIyBVc2luZyBnY2MuCgkjCgljY19u
-  YW1lPSdnY2MnCgoJIyBTZWUgaWYgYXMoMSkgaXMgR05VIGFzKDEpLiAgR05VIGFzKDEpIG1pZ2h0
-  IG5vdCB3b3JrIGZvciB0aGlzIGpvYi4KCWlmIGVjaG8gIiR2ZXJib3NlIiB8IGdyZXAgJyAvdXNy
-  L2Njcy9iaW4vYXMgJyA+L2Rldi9udWxsIDI+JjE7IHRoZW4KCSAgICA6CgllbHNlCgkgICAgY2F0
-  IDw8RU5EID4mMgoKTk9URTogWW91IGFyZSB1c2luZyBHTlUgYXMoMSkuICBHTlUgYXMoMSkgbWln
-  aHQgbm90IGJ1aWxkIFBlcmwuICBJZiB5b3UKaGF2ZSB0cm91YmxlLCB5b3UgY2FuIHVzZSAvdXNy
-  L2Njcy9iaW4vYXMgYnkgaW5jbHVkaW5nIC1CL3Vzci9jY3MvYmluLwppbiB5b3VyICR7Y2M6LWNj
-  fSBjb21tYW5kLiAgKE5vdGUgdGhhdCB0aGUgdHJhaWxpbmcgIi8iIGlzIHJlcXVpcmVkLikKCkVO
-  RAoJICAgICMgQXBwYXJlbnRseSBub3QgbmVlZGVkLCBhdCBsZWFzdCBmb3IgYXMgMi43IGFuZCBs
-  YXRlci4KCSAgICAjIGNjPSIke2NjOi1jY30gJGNjZmxhZ3MgLUIvdXNyL2Njcy9iaW4vIgoJZmkK
-  CgkjIFNlZSBpZiBsZCgxKSBpcyBHTlUgbGQoMSkuICBHTlUgbGQoMSkgbWlnaHQgbm90IHdvcmsg
-  Zm9yIHRoaXMgam9iLgoJIyBSZWNvbXB1dGUgJHZlcmJvc2Ugc2luY2Ugd2UgbWF5IGhhdmUganVz
-  dCBjaGFuZ2VkICRjYy4KCXZlcmJvc2U9YCR7Y2M6LWNjfSAkY2NmbGFncyAtdiAtbyB0cnkgdHJ5
-  LmMgMj4mMSB8IGdyZXAgbGQgMj4mMWAKCglpZiBlY2hvICIkdmVyYm9zZSIgfCBncmVwICcgL3Vz
-  ci9jY3MvYmluL2xkICcgPi9kZXYvbnVsbCAyPiYxOyB0aGVuCgkgICAgIyBPaywgZ2NjIGRpcmVj
-  dGx5IGNhbGxzIHRoZSBTb2xhcmlzIC91c3IvY2NzL2Jpbi9sZC4KCSAgICA6CgllbGlmIGVjaG8g
-  IiR2ZXJib3NlIiB8IGdyZXAgImxkOiBTb2Z0d2FyZSBHZW5lcmF0aW9uIFV0aWxpdGllcyIgPi9k
-  ZXYvbnVsbCAyPiYxOyB0aGVuCgkgICAgIyBIbW0uICBnY2MgZG9lc24ndCBjYWxsIC91c3IvY2Nz
-  L2Jpbi9sZCBkaXJlY3RseSwgYnV0IGl0CgkgICAgIyBkb2VzIGFwcGVhciB0byBiZSB1c2luZyBp
-  dCBldmVudHVhbGx5LiAgZWdjcy0xLjAuMydzIGxkCgkgICAgIyB3cmFwcGVyIGRvZXMgdGhpcy4K
-  CSAgICAjIE1vc3QgU29sYXJpcyB2ZXJzaW9ucyBvZiBsZCBJJ3ZlIHNlZW4gY29udGFpbiB0aGUg
-  bWFnaWMKCSAgICAjIHN0cmluZyB1c2VkIGluIHRoZSBncmVwLgoJICAgIDoKCWVsaWYgZWNobyAi
-  JHZlcmJvc2UiIHwgZ3JlcCAiU29sYXJpcyBMaW5rIEVkaXRvcnMiID4vZGV2L251bGwgMj4mMTsg
-  dGhlbgoJICAgICMgSG93ZXZlciBzb21lIFNvbGFyaXMgOCB2ZXJzaW9ucyBwcmlvciB0byBsZCA1
-  LjgtMS4yODYgY29udGFpbgoJICAgICMgdGhpcyBzdHJpbmcgaW5zdGVhZC4KCSAgICA6CgllbHNl
-  CgkgICAgIyBObyBldmlkZW5jZSB5ZXQgb2YgL3Vzci9jY3MvYmluL2xkLiAgU29tZSB2ZXJzaW9u
-  cwoJICAgICMgb2YgZWdjcydzIGxkIHdyYXBwZXIgY2FsbCAvdXNyL2Njcy9iaW4vbGQgaW4gdHVy
-  biBidXQKCSAgICAjIGFwcGFyZW50bHkgZG9uJ3QgcmV2ZWFsIHRoYXQgdW5sZXNzIHlvdSBwYXNz
-  IGluIC1WLgoJICAgICMgKFRoaXMgbWF5IGFsbCBkZXBlbmQgb24gbG9jYWwgY29uZmlndXJhdGlv
-  bnMgdG9vLikKCgkgICAgIyBSZWNvbXB1dGUgdmVyYm9zZSB3aXRoIC1XbCwtdiB0byBmaW5kIEdO
-  VSBsZCBpZiBwcmVzZW50CgkgICAgdmVyYm9zZT1gJHtjYzotY2N9ICRjY2ZsYWdzIC1XbCwtdiAt
-  byB0cnkgdHJ5LmMgMj4mMSB8IGdyZXAgL2xkIDI+JjFgCgoJICAgIG15bGQ9YGVjaG8gJHZlcmJv
-  c2UgfCBhd2sgJy9cL2xkLyB7cHJpbnQgJDF9J2AKCSAgICAjIFRoaXMgYXNzdW1lcyB0aGF0IGdj
-  YydzIG91dHB1dCB3aWxsIG5vdCBjaGFuZ2UsIGFuZCB0aGF0CgkgICAgIyAvZnVsbC9wYXRoL3Rv
-  L2xkIHdpbGwgYmUgdGhlIGZpcnN0IHdvcmQgb2YgdGhlIG91dHB1dC4KCSAgICAjIFRodXMgbXls
-  ZCBpcyBzb21ldGhpbmcgbGlrZSAvb3B0L2dudS9zcGFyYy1zdW4tc29sYXJpczIuNS9iaW4vbGQK
-  CgkgICAgIyBBbGxvdyB0aGF0ICRteWxkIG1heSBiZSAnJywgZHVlIHRvIGNoYW5nZXMgaW4gZ2Nj
-  J3Mgb3V0cHV0CgkgICAgaWYgJHtteWxkOi1sZH0gLVYgMj4mMSB8CgkJZ3JlcCAibGQ6IFNvZnR3
-  YXJlIEdlbmVyYXRpb24gVXRpbGl0aWVzIiA+L2Rldi9udWxsIDI+JjE7IHRoZW4KCQkjIE9rLCAv
-  dXNyL2Njcy9iaW4vbGQgZXZlbnR1YWxseSBkb2VzIGdldCBjYWxsZWQuCgkJOgoJICAgIGVsaWYg
-  JHtteWxkOi1sZH0gLVYgMj4mMSB8CgkJZ3JlcCAiU29sYXJpcyBMaW5rIEVkaXRvcnMiID4vZGV2
-  L251bGwgMj4mMTsgdGhlbgoJCSMgT2ssIC91c3IvY2NzL2Jpbi9sZCBldmVudHVhbGx5IGRvZXMg
-  Z2V0IGNhbGxlZC4KCQk6CgkgICAgZWxzZQoJCWVjaG8gIkZvdW5kIEdOVSBsZD0nJG15bGQnIiA+
-  JjQKCQljYXQgPDxFTkQgPiYyCgpOT1RFOiBZb3UgYXJlIHVzaW5nIEdOVSBsZCgxKS4gIEdOVSBs
-  ZCgxKSBtaWdodCBub3QgYnVpbGQgUGVybC4gIElmIHlvdQpoYXZlIHRyb3VibGUsIHlvdSBjYW4g
-  dXNlIC91c3IvY2NzL2Jpbi9sZCBieSBpbmNsdWRpbmcgLUIvdXNyL2Njcy9iaW4vCmluIHlvdXIg
-  JHtjYzotY2N9IGNvbW1hbmQuICAoTm90ZSB0aGF0IHRoZSB0cmFpbGluZyAiLyIgaXMgcmVxdWly
-  ZWQuKQoKSSB3aWxsIHRyeSB0byB1c2UgR05VIGxkIGJ5IHBhc3NpbmcgaW4gdGhlIC1XbCwtRSBm
-  bGFnLCBidXQgaWYgdGhhdApkb2Vzbid0IHdvcmssIHlvdSBzaG91bGQgdXNlIC1CL3Vzci9jY3Mv
-  YmluLyBpbnN0ZWFkLgoKRU5ECgkJY2NkbGZsYWdzPSIkY2NkbGZsYWdzIC1XbCwtRSIKCQlsZGRs
-  ZmxhZ3M9IiRsZGRsZmxhZ3MgLVdsLC1FIC1zaGFyZWQiCgkgICAgZmkKCWZpCgplbHNlCgkjCgkj
-  IE5vdCB1c2luZyBnY2MuCgkjCgljYXQgPiB0cnkuYyA8PCAnRU9NJwojaW5jbHVkZSA8c3RkaW8u
-  aD4KaW50IG1haW4oKSB7CiNpZiBkZWZpbmVkKF9fU1VOUFJPX0MpCglwcmludGYoIndvcmtzaG9w
-  XG4iKTsKI2Vsc2UKI2lmIGRlZmluZWQoX19TVU5QUk9fQ0MpCglwcmludGYoIndvcmtzaG9wIEND
-  XG4iKTsKI2Vsc2UKCXByaW50ZigiXG4iKTsKI2VuZGlmCiNlbmRpZgpyZXR1cm4oMCk7Cn0KRU9N
-  Cgl0cnl3b3Jrc2hvcGNjPSIke2NjOi1jY30gJGNjZmxhZ3MgdHJ5LmMgLW8gdHJ5IgoJaWYgJHRy
-  eXdvcmtzaG9wY2MgPi9kZXYvbnVsbCAyPiYxOyB0aGVuCgkJY2NfbmFtZT1gJHJ1biAuL3RyeWAK
-  CQlpZiB0ZXN0ICIkY2NfbmFtZSIgPSAid29ya3Nob3AiOyB0aGVuCgkJCWNjdmVyc2lvbj0iYCR7
-  Y2M6LWNjfSAtViAyPiYxfHNlZCAtbiAtZSAnMXMvXltDY11bQ2NdOiAvL3AnYCIKCQlmaQoJCWlm
-  IHRlc3QgIiRjY19uYW1lIiA9ICJ3b3Jrc2hvcCBDQyI7IHRoZW4KCQkJY2N2ZXJzaW9uPSJgJHtj
-  YzotQ0N9IC1WIDI+JjF8c2VkIC1uIC1lICcxcy9eW0NjXVtDXTogLy9wJ2AiCgkJZmkKCQljYXNl
-  ICIkY2NfbmFtZSIgaW4KCQl3b3Jrc2hvcCopCgkJCSMgU2V0dGluZ3MgZm9yIGVpdGhlciBjYyBv
-  ciBDQwoJCQlpZiB0ZXN0ICEgIiR1c2U2NGJpdGFsbF9kb25lIjsgdGhlbgoJCQkJbG9jbGlicHRo
-  PSIvdXNyL2xpYiAvdXNyL2Njcy9saWIgYCRnZXR3b3Jrc2hvcGxpYnNgICRsb2NsaWJwdGgiCgkJ
-  CWZpCgkJCSMgU3VuIENDL2NjIGRvbid0IHN1cHBvcnQgZ2NjIGF0dHJpYnV0ZXMKCQkJZF9hdHRy
-  aWJ1dGVfZm9ybWF0PSd1bmRlZicKCQkJZF9hdHRyaWJ1dGVfbWFsbG9jPSd1bmRlZicKCQkJZF9h
-  dHRyaWJ1dGVfbm9ubnVsbD0ndW5kZWYnCgkJCWRfYXR0cmlidXRlX25vcmV0dXJuPSd1bmRlZicK
-  CQkJZF9hdHRyaWJ1dGVfcHVyZT0ndW5kZWYnCgkJCWRfYXR0cmlidXRlX3VudXNlZD0ndW5kZWYn
-  CgkJCWRfYXR0cmlidXRlX3dhcm5fdW51c2VkX3Jlc3VsdD0ndW5kZWYnCgkJCTs7CgkJZXNhYwoJ
-  ZmkKCgkjIFNlZSBpZiBhcygxKSBpcyBHTlUgYXMoMSkuICBHTlUgbWlnaHQgbm90IHdvcmsgZm9y
-  IHRoaXMgam9iLgoJY2FzZSBgYXMgLS12ZXJzaW9uIDwgL2Rldi9udWxsIDI+JjFgIGluCgkqR05V
-  KikKCQljYXQgPDxFTkQgPiYyCgpOT1RFOiBZb3UgYXJlIHVzaW5nIEdOVSBhcygxKS4gIEdOVSBh
-  cygxKSBtaWdodCBub3QgYnVpbGQgUGVybC4KWW91IG11c3QgYXJyYW5nZSB0byB1c2UgL3Vzci9j
-  Y3MvYmluL2FzLCBwZXJoYXBzIGJ5IGFkZGluZyAvdXNyL2Njcy9iaW4KdG8gdGhlIGJlZ2lubmlu
-  ZyBvZiB5b3VyIFBBVEguCgpFTkQKCQk7OwoJZXNhYwoKCSMgU2VlIGlmIGxkKDEpIGlzIEdOVSBs
-  ZCgxKS4gIEdOVSBsZCgxKSBtaWdodCBub3Qgd29yayBmb3IgdGhpcyBqb2IuCgkjIGxkIC0tdmVy
-  c2lvbiBkb2Vzbid0IHByb3Blcmx5IHJlcG9ydCBpdHNlbGYgYXMgYSBHTlUgdG9vbCwKCSMgYXMg
-  b2YgbGQgdmVyc2lvbiAyLjYsIHNvIHdlIG5lZWQgdG8gYmUgbW9yZSBzdHJpY3QuIFRXUCA5LzUv
-  OTYKCSMgU3VuJ3MgbGQgYWx3YXlzIGVtaXRzIHRoZSAiU29mdHdhcmUgR2VuZXJhdGlvbiBVdGls
-  aXRpZXMiIHN0cmluZy4KCWlmIGxkIC1WIDI+JjEgfCBncmVwICJsZDogU29mdHdhcmUgR2VuZXJh
-  dGlvbiBVdGlsaXRpZXMiID4vZGV2L251bGwgMj4mMTsgdGhlbgoJICAgICMgT2ssIGxkIGlzIC91
-  c3IvY2NzL2Jpbi9sZC4KCSAgICA6CgllbHNlCgkgICAgY2F0IDw8RU5EID4mMgoKTk9URTogWW91
-  IGFyZSBhcHBhcmVudGx5IHVzaW5nIEdOVSBsZCgxKS4gIEdOVSBsZCgxKSBtaWdodCBub3QgYnVp
-  bGQgUGVybC4KWW91IHNob3VsZCBhcnJhbmdlIHRvIHVzZSAvdXNyL2Njcy9iaW4vbGQsIHBlcmhh
-  cHMgYnkgYWRkaW5nIC91c3IvY2NzL2Jpbgp0byB0aGUgYmVnaW5uaW5nIG9mIHlvdXIgUEFUSC4K
-  CkVORAoJZmkKZmkKCiMgYXMgLS12ZXJzaW9uIG9yIGxkIC0tdmVyc2lvbiBtaWdodCBkdW1wIGNv
-  cmUuCnJtIC1mIHRyeSB0cnkuYyBjb3JlCkVPQ0JVCgpjYXQgPiBVVS91c2V0aHJlYWRzLmNidSA8
-  PCdFT0NCVScKIyBUaGlzIHNjcmlwdCBVVS91c2V0aHJlYWRzLmNidSB3aWxsIGdldCAnY2FsbGVk
-  LWJhY2snIGJ5IENvbmZpZ3VyZQojIGFmdGVyIGl0IGhhcyBwcm9tcHRlZCB0aGUgdXNlciBmb3Ig
-  d2hldGhlciB0byB1c2UgdGhyZWFkcy4KY2FzZSAiJHVzZXRocmVhZHMiIGluCiRkZWZpbmV8dHJ1
-  ZXxbeVldKikKCWNjZmxhZ3M9Ii1EX1JFRU5UUkFOVCAkY2NmbGFncyIKCgkjIC1scHRocmVhZCBv
-  dmVycmlkZXMgc29tZSBsaWIgQyBmdW5jdGlvbnMsIHNvIHB1dCBpdCBiZWZvcmUgYy4KCXNldCBg
-  ZWNobyBYICIkbGlic3dhbnRlZCAifCBzZWQgLWUgInMvIGMgLyBwdGhyZWFkIGMgLyJgCglzaGlm
-  dAoJbGlic3dhbnRlZD0iJCoiCgoJIyBzY2hlZF95aWVsZCBpcyBhdmFpbGFibGUgaW4gdGhlIC1s
-  cnQgbGlicmFyeS4gIEhvd2V2ZXIsCgkjIHdlIGNhbiBhbHNvIHBpY2sgdXAgdGhlIGVxdWl2YWxl
-  bnQgeWllbGQoKSBmdW5jdGlvbiBpbiB0aGUKCSMgbm9ybWFsIEMgbGlicmFyeS4gIFRvIGF2b2lk
-  IHB1bGxpbmcgaW4gdW5uZWNlc3NhcnkKCSMgbGlicmFyaWVzLCB3ZSdsbCBub3JtYWxseSBhdm9p
-  ZCBzY2hlZF95aWVsZCgpLy1scnQgYW5kCgkjIGp1c3QgdXNlIHlpZWxkKCkuICBIb3dldmVyLCB3
-  ZSdsbCBob25vciBhIGNvbW1hbmQtbGluZQoJIyBvdmVycmlkZSA6ICItRHNjaGVkX3lpZWxkPXNj
-  aGVkX3lpZWxkIi4KCSMgSWYgd2UgZW5kIHVwIHVzaW5nIHNjaGVkX3lpZWxkLCB3ZSdyZSBnb2lu
-  ZyB0byBuZWVkIC1scnQuCglzY2hlZF95aWVsZD0ke3NjaGVkX3lpZWxkOi15aWVsZH0KCWlmIHRl
-  c3QgIiRzY2hlZF95aWVsZCIgPSAic2NoZWRfeWllbGQiOyB0aGVuCgkgICAgc2V0IGBlY2hvIFgg
-  IiRsaWJzd2FudGVkICJ8IHNlZCAtZSAicy8gcHRocmVhZCAvIHJ0IHB0aHJlYWQgLyJgCgkgICAg
-  c2hpZnQKCSAgICBsaWJzd2FudGVkPSIkKiIKCWZpCgoJIyBPbiBTb2xhcmlzIDIuNiB4ODYgdGhl
-  cmUgaXMgYSBidWcgd2l0aCBzaWdzZXRqbXAoKSBhbmQgc2lnbG9uZ2ptcCgpCgkjIHdoZW4gbGlu
-  a2VkIHdpdGggdGhlIHRocmVhZHMgbGlicmFyeSwgc3VjaCB0aGF0IHdoYXRldmVyIHBvc2l0aXZl
-  CgkjIHZhbHVlIHlvdSBwYXNzIHRvIHNpZ2xvbmdqbXAoKSwgc2lnc2V0am1wKCkgcmV0dXJucyAx
-  LgoJIyBUaGFua3MgdG8gU2ltb24gUGFyc29ucyA8Uy5QYXJzb25zQGZ0ZWwuY28udWs+IGZvciB0
-  aGlzIHJlcG9ydC4KCSMgU3VuIEJ1Z0lEIGlzIDQxMTc5NDYsICJzaWdzZXRqbXAgYWx3YXlzIHJl
-  dHVybnMgMSB3aGVuIGNhbGxlZCBieQoJIyBzaWdsb25nam1wIGluIGEgTVQgcHJvZ3JhbSIuIEFz
-  IG9mIDE5OTgwNjIyLCB0aGVyZSBpcyBubyBwYXRjaAoJIyBhdmFpbGFibGUuCgljYXQgPnRyeS5j
-  IDw8J0VPTScKCS8qIFRlc3QgZm9yIHNpZyhzZXR8bG9uZylqbXAgYnVnLiAqLwoJI2luY2x1ZGUg
-  PHNldGptcC5oPgoKCWludCBtYWluKCkKCXsKCSAgICBzaWdqbXBfYnVmIGVudjsKCSAgICBpbnQg
-  cmV0OwoKCSAgICByZXQgPSBzaWdzZXRqbXAoZW52LCAxKTsKCSAgICBpZiAocmV0KSB7IHJldHVy
-  biByZXQgPT0gMjsgfQoJICAgIHNpZ2xvbmdqbXAoZW52LCAyKTsKCX0KRU9NCglpZiB0ZXN0ICJg
-  YXJjaGAiID0gaTg2cGMgLWEgYHVuYW1lIC1yYCA9IDUuNiAmJiBcCgkgICAke2NjOi1jY30gdHJ5
-  LmMgLWxwdGhyZWFkID4vZGV2L251bGwgMj4mMSAmJiAuL2Eub3V0OyB0aGVuCgkgICAgZF9zaWdz
-  ZXRqbXA9JHVuZGVmCglmaQoKCSMgVGhlc2UgcHJvdG90eXBlcyBzaG91bGQgYmUgdmlzaWJsZSBz
-  aW5jZSB3ZSB1c2luZwoJIyAtRF9SRUVOVFJBTlQsIGJ1dCB0aGF0IGRvZXMgbm90IHNlZW0gdG8g
-  d29yay4KCSMgSXQgZG9lcyBzZWVtIHRvIHdvcmsgZm9yIGdldG5ldGJ5YWRkcl9yLCB3ZWlyZGx5
-  IGVub3VnaCwKCSMgYW5kIG90aGVyIF9yIGZ1bmN0aW9ucy4gKFNvbGFyaXMgOCkKCglkX2N0ZXJt
-  aWRfcl9wcm90bz0iJGRlZmluZSIKCWRfZ2V0aG9zdGJ5YWRkcl9yX3Byb3RvPSIkZGVmaW5lIgoJ
-  ZF9nZXRob3N0YnluYW1lX3JfcHJvdG89IiRkZWZpbmUiCglkX2dldG5ldGJ5bmFtZV9yX3Byb3Rv
-  PSIkZGVmaW5lIgoJZF9nZXRwcm90b2J5bmFtZV9yX3Byb3RvPSIkZGVmaW5lIgoJZF9nZXRwcm90
-  b2J5bnVtYmVyX3JfcHJvdG89IiRkZWZpbmUiCglkX2dldHNlcnZieW5hbWVfcl9wcm90bz0iJGRl
-  ZmluZSIKCWRfZ2V0c2VydmJ5cG9ydF9yX3Byb3RvPSIkZGVmaW5lIgoKCSMgRGl0dG8uIChTb2xh
-  cmlzIDcpCglkX3JlYWRkaXJfcl9wcm90bz0iJGRlZmluZSIKCWRfcmVhZGRpcjY0X3JfcHJvdG89
-  IiRkZWZpbmUiCglkX3RtcG5hbV9yX3Byb3RvPSIkZGVmaW5lIgoJZF90dHluYW1lX3JfcHJvdG89
-  IiRkZWZpbmUiCgoJOzsKZXNhYwpFT0NCVQoKY2F0ID4gVVUvdXNlbGFyZ2VmaWxlcy5jYnUgPDwn
-  RU9DQlUnCiMgVGhpcyBzY3JpcHQgVVUvdXNlbGFyZ2VmaWxlcy5jYnUgd2lsbCBnZXQgJ2NhbGxl
-  ZC1iYWNrJyBieSBDb25maWd1cmUKIyBhZnRlciBpdCBoYXMgcHJvbXB0ZWQgdGhlIHVzZXIgZm9y
-  IHdoZXRoZXIgdG8gdXNlIGxhcmdlIGZpbGVzLgpjYXNlICIkdXNlbGFyZ2VmaWxlcyIgaW4KJyd8
-  JGRlZmluZXx0cnVlfFt5WV0qKQoKIyBLZWVwIHRoZXNlIGluIHRoZSBsZWZ0IG1hcmdpbi4KY2Nm
-  bGFnc191c2VsYXJnZWZpbGVzPSJgJHJ1biBnZXRjb25mIExGU19DRkxBR1MgMj4vZGV2L251bGxg
-  IgpsZGZsYWdzX3VzZWxhcmdlZmlsZXM9ImAkcnVuIGdldGNvbmYgTEZTX0xERkxBR1MgMj4vZGV2
-  L251bGxgIgpsaWJzd2FudGVkX3VzZWxhcmdlZmlsZXM9ImAkcnVuIGdldGNvbmYgTEZTX0xJQlMg
-  Mj4vZGV2L251bGx8c2VkIC1lICdzQF4tbEBAJyAtZSAnc0AgLWxAIEBnJ2AiCgogICAgY2NmbGFn
-  cz0iJGNjZmxhZ3MgJGNjZmxhZ3NfdXNlbGFyZ2VmaWxlcyIKICAgIGxkZmxhZ3M9IiRsZGZsYWdz
-  ICRsZGZsYWdzX3VzZWxhcmdlZmlsZXMiCiAgICBsaWJzd2FudGVkPSIkbGlic3dhbnRlZCAkbGli
-  c3dhbnRlZF91c2VsYXJnZWZpbGVzIgogICAgOzsKZXNhYwpFT0NCVQoKIyBUaGlzIGlzIHRydWx5
-  IGEgbWVzcy4KY2FzZSAiJHVzZW1vcmViaXRzIiBpbgoiJGRlZmluZSJ8dHJ1ZXxbeVldKikKCXVz
-  ZTY0Yml0aW50PSIkZGVmaW5lIgoJdXNlbG9uZ2RvdWJsZT0iJGRlZmluZSIKCTs7CmVzYWMKCmlm
-  IHRlc3QgYCRydW4gdW5hbWUgLXBgID0gaTM4NjsgdGhlbgogICAgY2FzZSAiJHVzZTY0Yml0aW50
-  IiBpbgogICAgIiRkZWZpbmUifHRydWV8W3lZXSopCiAgICAgICAgICAgIGNjZmxhZ3M9IiRjY2Zs
-  YWdzIC1EUFRSX0lTX0xPTkciCiAgICAgICAgICAgIDs7CiAgICBlc2FjCmZpCgppZiB0ZXN0IGAk
-  cnVuIHVuYW1lIC1wYCA9IHNwYXJjIC1vIGAkcnVuIHVuYW1lIC1wYCA9IGkzODY7IHRoZW4KICAg
-  IGNhdCA+IFVVL3VzZTY0Yml0aW50LmNidSA8PCdFT0NCVScKIyBUaGlzIHNjcmlwdCBVVS91c2U2
-  NGJpdGludC5jYnUgd2lsbCBnZXQgJ2NhbGxlZC1iYWNrJyBieSBDb25maWd1cmUKIyBhZnRlciBp
-  dCBoYXMgcHJvbXB0ZWQgdGhlIHVzZXIgZm9yIHdoZXRoZXIgdG8gdXNlIDY0IGJpdCBpbnRlZ2Vy
-  cy4KY2FzZSAiJHVzZTY0Yml0aW50IiBpbgoiJGRlZmluZSJ8dHJ1ZXxbeVldKikKCSAgICBjYXNl
-  ICJgJHJ1biB1bmFtZSAtcmAiIGluCgkgICAgNS5bMC00XSkKCQljYXQgPiY0IDw8RU9NClNvbGFy
-  aXMgYHVuYW1lIC1yfHNlZCAtZSAncy9eNVwuLzIuLydgIGRvZXMgbm90IHN1cHBvcnQgNjQtYml0
-  IGludGVnZXJzLgpZb3Ugc2hvdWxkIHVwZ3JhZGUgdG8gYXQgbGVhc3QgU29sYXJpcyAyLjUuCkVP
-  TQoJCWV4aXQgMQoJCTs7CgkgICAgZXNhYwoKIyBnY2MtMi44LjEgb24gU29sYXJpcyA4IHdpdGgg
-  LUR1c2U2NGJpdGludCBmYWlscyBvcC9wYXQudCB0ZXN0IDgyMgojIGlmIHdlIGNvbXBpbGUgcmVn
-  ZXhlYy5jIHdpdGggLU8uICBUdXJuIG9mZiBvcHRpbWl6YXRpb24gZm9yIHRoYXQgb25lCiMgZmls
-  ZS4gIFNlZSBoaW50cy9SRUFETUUuaGludHMgLCBlc3BlY2lhbGx5CiMgPWhlYWQyIFByb3BhZ2F0
-  aW5nIHZhcmlhYmxlcyB0byBjb25maWcuc2gsIG1ldGhvZCAzLgojICBBLiBEb3VnaGVydHkgIE1h
-  eSAyNCwgMjAwMgogICAgY2FzZSAiJHtnY2N2ZXJzaW9ufS0ke29wdGltaXplfSIgaW4KICAgIDIu
-  OCotTyopCgkjIEhvbm9yIGEgY29tbWFuZC1saW5lIG92ZXJyaWRlIChyYXRoZXIgdW5saWtlbHkp
-  CgljYXNlICIkcmVnZXhlY19jZmxhZ3MiIGluCgknJykgZWNobyAiRGlzYWJsaW5nIG9wdGltaXph
-  dGlvbiBvbiByZWdleGVjLmMgZm9yIGdjYyAkZ2NjdmVyc2lvbiIgPiY0CgkgICAgcmVnZXhlY19j
-  ZmxhZ3M9J29wdGltaXplPScKCSAgICBlY2hvICJyZWdleGVjX2NmbGFncz0nb3B0aW1pemU9XCJc
-  IiciID4+IGNvbmZpZy5zaAoJICAgIDs7Cgllc2FjCgk7OwogICAgZXNhYwogICAgOzsKZXNhYwpF
-  T0NCVQoKICAgIGNhdCA+IFVVL3VzZTY0Yml0YWxsLmNidSA8PCdFT0NCVScKIyBUaGlzIHNjcmlw
-  dCBVVS91c2U2NGJpdGFsbC5jYnUgd2lsbCBnZXQgJ2NhbGxlZC1iYWNrJyBieSBDb25maWd1cmUK
-  IyBhZnRlciBpdCBoYXMgcHJvbXB0ZWQgdGhlIHVzZXIgZm9yIHdoZXRoZXIgdG8gYmUgbWF4aW1h
-  bGx5IDY0IGJpdHR5LgpjYXNlICIkdXNlNjRiaXRhbGwtJHVzZTY0Yml0YWxsX2RvbmUiIGluCiIk
-  ZGVmaW5lLSJ8dHJ1ZS18W3lZXSotKQoJICAgIGNhc2UgImAkcnVuIHVuYW1lIC1yYCIgaW4KCSAg
-  ICA1LlswLTZdKQoJCWNhdCA+JjQgPDxFT00KU29sYXJpcyBgdW5hbWUgLXJ8c2VkIC1lICdzL141
-  XC4vMi4vJ2AgZG9lcyBub3Qgc3VwcG9ydCA2NC1iaXQgcG9pbnRlcnMuCllvdSBzaG91bGQgdXBn
-  cmFkZSB0byBhdCBsZWFzdCBTb2xhcmlzIDIuNy4KRU9NCgkJZXhpdCAxCgkJOzsKCSAgICBlc2Fj
-  CgkgICAgcHJvY2Vzc29yPWAkcnVuIHVuYW1lIC1wYDsKCSAgICBpZiB0ZXN0ICIkcHJvY2Vzc29y
-  IiA9IHNwYXJjOyB0aGVuCgkJbGliYz0nL3Vzci9saWIvc3BhcmN2OS9saWJjLnNvJwoJCWlmIHRl
-  c3QgISAtZiAkbGliYzsgdGhlbgoJCSAgICBjYXQgPiY0IDw8RU9NCgpJIGRvIG5vdCBzZWUgdGhl
-  IDY0LWJpdCBsaWJjLCAkbGliYy4KQ2Fubm90IGNvbnRpbnVlLCBhYm9ydGluZy4KCkVPTQoJCSAg
-  ICBleGl0IDEKCQlmaQoJICAgIGZpCgkgICAgY2FzZSAiJHtjYzotY2N9IC12IDI+L2Rldi9udWxs
-  IiBpbgoJICAgICpnY2MqKQoJCWVjaG8gJ2ludCBtYWluKCkgeyByZXR1cm4gMDsgfScgPiB0cnku
-  YwoJCWNhc2UgImAke2NjOi1jY30gJGNjZmxhZ3MgLW1jcHU9djkgLW02NCAtUyB0cnkuYyAyPiYx
-  IHwgZ3JlcCAnbTY0IGlzIG5vdCBzdXBwb3J0ZWQgYnkgdGhpcyBjb25maWd1cmF0aW9uJ2AiIGlu
-  CgkJKiJtNjQgaXMgbm90IHN1cHBvcnRlZCIqKQoJCSAgICBjYXQgPiY0IDw8RU9NCgpGdWxsIDY0
-  LWJpdCBidWlsZCBpcyBub3Qgc3VwcG9ydGVkIGJ5IHRoaXMgZ2NjIGNvbmZpZ3VyYXRpb24uCkNo
-  ZWNrIGh0dHA6Ly9nY2MuZ251Lm9yZy8gZm9yIHRoZSBsYXRlc3QgbmV3cyBvZiBhdmFpbGFiaWxp
-  dHkKb2YgZ2NjIGZvciA2NC1iaXQgU3BhcmMuCgpDYW5ub3QgY29udGludWUsIGFib3J0aW5nLgoK
-  RU9NCgkJICAgIGV4aXQgMQoJCSAgICA7OwoJCWVzYWMKCQlpZiB0ZXN0ICIkcHJvY2Vzc29yIiA9
-  IHNwYXJjOyB0aGVuCgkJICAgIGxvY2xpYnB0aD0iL3Vzci9saWIvc3BhcmN2OSAkbG9jbGlicHRo
-  IgoJCSAgICBjY2ZsYWdzPSIkY2NmbGFncyAtbWNwdT12OSIKCQlmaQoJCWNjZmxhZ3M9IiRjY2Zs
-  YWdzIC1tNjQiCgoJCSMgVGhpcyBhZGRzIGluIC1XYSwteGFyY2g9djkuICBJIHN1c3BlY3QgdGhh
-  dCdzIHN1cGVyZmx1b3VzLAoJCSMgc2luY2UgdGhlIC1tNjQgYWJvdmUgc2hvdWxkIGRvIHRoYXQg
-  YWxyZWFkeS4gIFNvbWVvbmUKCQkjIHdpdGggZ2NjLTMueC54LCBwbGVhc2UgdGVzdCB3aXRoIGdj
-  YyAtdi4gICBBLkQuIDIwLU5vdi0yMDAzCiMJCWlmIHRlc3QgJHByb2Nlc3NvciA9IHNwYXJjIC1h
-  IFhgJHJ1biBnZXRjb25mIFhCUzVfTFA2NF9PRkY2NF9DRkxBR1MgMj4vZGV2L251bGxgICE9IFg7
-  IHRoZW4KIwkJICAgIGNjZmxhZ3M9IiRjY2ZsYWdzIC1XYSxgJHJ1biBnZXRjb25mIFhCUzVfTFA2
-  NF9PRkY2NF9DRkxBR1MgMj4vZGV2L251bGxgIgojCQlmaQoJCWxkZmxhZ3M9IiRsZGZsYWdzIC1t
-  NjQiCgoJCSMgU2VlIFtwZXJsICM2NjYwNF06ICBPbiBTb2xhcmlzIDExLCBnY2MgLW02NCBvbiBh
-  bWQ2NAoJCSMgYXBwZWFycyBub3QgdG8gdW5kZXJzdGFuZCAtRy4gIChnY2MgLUcgaGFzIG5vdCBj
-  YXVzZWQKCQkjIHByb2JsZW1zIG9uIG90aGVyIHBsYXRmb3JtcyBpbiB0aGUgcGFzdC4pICBnY2Mg
-  dmVyc2lvbnMKCQkjIGF0IGxlYXN0IGFzIG9sZCBhcyAzLjQuMyBzdXBwb3J0IC1zaGFyZWQsIHNv
-  IGp1c3QKCQkjIHVzZSB0aGF0IHdpdGggU29sYXJpcyAxMSBhbmQgbGF0ZXIsIGJ1dCBrZWVwCgkJ
-  IyB0aGUgb2xkIGJlaGF2aW9yIGZvciBvbGRlciBTb2xhcmlzIHZlcnNpb25zLgoJCWNhc2UgIiRv
-  c3ZlcnMiIGluCgkJCTIuP3wyLjEwKSBsZGRsZmxhZ3M9IiRsZGRsZmxhZ3MgLUcgLW02NCIgOzsK
-  CQkJKikgbGRkbGZsYWdzPSIkbGRkbGZsYWdzIC1zaGFyZWQgLW02NCIgOzsKCQllc2FjCgkJOzsK
-  CSAgICAqKQoJCWdldGNvbmZjY2ZsYWdzPSJgJHJ1biBnZXRjb25mIFhCUzVfTFA2NF9PRkY2NF9D
-  RkxBR1MgMj4vZGV2L251bGxgIgoJCWdldGNvbmZsZGZsYWdzPSJgJHJ1biBnZXRjb25mIFhCUzVf
-  TFA2NF9PRkY2NF9MREZMQUdTIDI+L2Rldi9udWxsYCIKCQlnZXRjb25mbGRkbGZsYWdzPSJgJHJ1
-  biBnZXRjb25mIFhCUzVfTFA2NF9PRkY2NF9MREZMQUdTIDI+L2Rldi9udWxsYCIKCQllY2hvICJp
-  bnQgbWFpbigpIHsgcmV0dXJuKDApOyB9ICIgPiB0cnkuYwoJCWNhc2UgImAke2NjOi1jY30gJGdl
-  dGNvbmZjY2ZsYWdzIHRyeS5jIDI+JjEgfCBncmVwICdkZXByZWNhdGVkJ2AiIGluCgkJKiIgLXhh
-  cmNoPWdlbmVyaWM2NCBpcyBkZXByZWNhdGVkLCB1c2UgLW02NCAiKikKCQkgICAgZ2V0Y29uZmNj
-  ZmxhZ3M9YGVjaG8gJGdldGNvbmZjY2ZsYWdzIHwgc2VkIC1lICdzL3hhcmNoPWdlbmVyaWM2NC9t
-  NjQvJ2AKCQkgICAgZ2V0Y29uZmxkZmxhZ3M9YGVjaG8gJGdldGNvbmZsZGZsYWdzIHwgc2VkIC1l
-  ICdzL3hhcmNoPWdlbmVyaWM2NC9tNjQvJ2AKCQkgICAgZ2V0Y29uZmxkZGxmbGFncz1gZWNobyAk
-  Z2V0Y29uZmxkZGxmbGFncyB8IHNlZCAtZSAncy94YXJjaD1nZW5lcmljNjQvbTY0LydgCgkJICAg
-  IDs7CgkJZXNhYwoJCWNjZmxhZ3M9IiRjY2ZsYWdzICRnZXRjb25mY2NmbGFncyIKCQlsZGZsYWdz
-  PSIkbGRmbGFncyAkZ2V0Y29uZmxkZmxhZ3MiCgkJbGRkbGZsYWdzPSIkbGRkbGZsYWdzIC1HICRn
-  ZXRjb25mbGRkbGZsYWdzIgoKCQllY2hvICJpbnQgbWFpbigpIHsgcmV0dXJuKDApOyB9ICIgPiB0
-  cnkuYwoJCXRyeXdvcmtzaG9wY2M9IiR7Y2M6LWNjfSB0cnkuYyAtbyB0cnkgJGNjZmxhZ3MiCgkJ
-  aWYgdGVzdCAiJHByb2Nlc3NvciIgPSBzcGFyYzsgdGhlbgoJCSAgICBsb2NsaWJwdGg9Ii91c3Iv
-  bGliL3NwYXJjdjkgL3Vzci9jY3MvbGliL3NwYXJjdjkgJGxvY2xpYnB0aCIKCQlmaQoJCWxvY2xp
-  YnB0aD0iYCRnZXR3b3Jrc2hvcGxpYnNgICRsb2NsaWJwdGgiCgkJOzsKCSAgICBlc2FjCgkgICAg
-  dW5zZXQgcHJvY2Vzc29yCgkgICAgdXNlNjRiaXRhbGxfZG9uZT15ZXMKCSAgICBhcmNobmFtZTY0
-  PTY0CgkgICAgOzsKZXNhYwpFT0NCVQoKICAgICMgQWN0dWFsbHksIHdlIHdhbnQgdG8gcnVuIHRo
-  aXMgYWxyZWFkeSBub3csIGlmIHNvIHJlcXVlc3RlZCwKICAgICMgYmVjYXVzZSB3ZSBuZWVkIHRv
-  IGZpeCB1cCB0aGluZ3MgcmlnaHQgbm93LgogICAgY2FzZSAiJHVzZTY0Yml0YWxsIiBpbgogICAg
-  IiRkZWZpbmUifHRydWV8W3lZXSopCgkjIENCVXMgZXhwZWN0IHRvIGJlIHJ1biBpbiBVVQoJY2Qg
-  VVU7IC4gLi91c2U2NGJpdGFsbC5jYnU7IGNkIC4uCgk7OwogICAgZXNhYwpmaQoKY2F0ID4gVVUv
-  dXNlbG9uZ2RvdWJsZS5jYnUgPDwnRU9DQlUnCiMgVGhpcyBzY3JpcHQgVVUvdXNlbG9uZ2RvdWJs
-  ZS5jYnUgd2lsbCBnZXQgJ2NhbGxlZC1iYWNrJyBieSBDb25maWd1cmUKIyBhZnRlciBpdCBoYXMg
-  cHJvbXB0ZWQgdGhlIHVzZXIgZm9yIHdoZXRoZXIgdG8gdXNlIGxvbmcgZG91Ymxlcy4KY2FzZSAi
-  JHVzZWxvbmdkb3VibGUiIGluCiIkZGVmaW5lInx0cnVlfFt5WV0qKQoJaWYgdGVzdCAiJGNjX25h
-  bWUiID0gIndvcmtzaG9wIjsgdGhlbgoJCWNhdCA+IHRyeS5jIDw8ICdFT00nCiNpbmNsdWRlIDxz
-  dW5tYXRoLmg+CmludCBtYWluKCkgeyAodm9pZCkgcG93bCgyLCAyNTYpOyByZXR1cm4oMCk7IH0K
-  RU9NCgkJaWYgJHtjYzotY2N9IHRyeS5jIC1sc3VubWF0aCAtbyB0cnkgPiAvZGV2L251bGwgMj4m
-  MSAmJiAuL3RyeTsgdGhlbgoJCQlsaWJzd2FudGVkPSIkbGlic3dhbnRlZCBzdW5tYXRoIgoJCWZp
-  CgllbHNlCgkJY2F0ID4mNCA8PEVPTQoKVGhlIFN1biBXb3Jrc2hvcCBtYXRoIGxpYnJhcnkgaXMg
-  ZWl0aGVyIG5vdCBhdmFpbGFibGUgb3Igbm90IHdvcmtpbmcsCnNvIEkgZG8gbm90IGtub3cgaG93
-  IHRvIGRvIGxvbmcgZG91Ymxlcywgc29ycnkuCkknbSB0aGVyZWZvcmUgZGlzYWJsaW5nIHRoZSB1
-  c2Ugb2YgbG9uZyBkb3VibGVzLgpFT00KCQl1c2Vsb25nZG91YmxlPSIkdW5kZWYiCglmaQoJOzsK
-  ZXNhYwpFT0NCVQoKIwojIElmIHVuc2V0ZW52IGlzIGF2YWlsYWJsZSwgdXNlIGl0IGluIGNvbmp1
-  bmN0aW9uIHdpdGggUEVSTF9VU0VfU0FGRV9QVVRFTlYgdG8KIyB3b3JrIGFyb3VuZCBTdW4gYnVn
-  aWQgNjMzMzgzMC4gIEJvdGggdW5zZXRlbnYgYW5kIDYzMzM4MzAgb25seSBhcHBlYXIgaW4KIyBT
-  b2xhcmlzIDEwLCBzbyB3ZSBkb24ndCBuZWVkIHRvIHByb2JlIGV4cGxpY2l0bHkgZm9yIGFuIE9T
-  IHZlcnNpb24uICBXZSBoYXZlCiMgdG8gYXBwZW5kIHRoaXMgdGVzdCB0byB0aGUgZW5kIG9mIGNv
-  bmZpZy5vdmVyIGFzIGl0IG5lZWRzIHRvIHJ1biBhZnRlcgojIENvbmZpZ3VyZSBoYXMgcHJvYmVk
-  IGZvciB1bnNldGVudiwgYW5kIHRoaXMgaGludHMgZmlsZSBpcyBwcm9jZXNzZWQgYmVmb3JlCiMg
-  dGhhdCBoYXMgaGFwcGVuZWQuCiMKY2F0ID4+IGNvbmZpZy5vdmVyIDw8J0VPT1ZFUicKaWYgdGVz
-  dCAiJGRfdW5zZXRlbnYiID0gIiRkZWZpbmUiIC1hIFwKICAgIGBleHByICIkY2NmbGFncyIgOiAn
-  LiotRF9QRVJMX1VTRV9TQUZFX1BVVEVOVidgIC1lcSAwOyB0aGVuCiAgICAgICAgY2NmbGFncz0i
-  JGNjZmxhZ3MgLURQRVJMX1VTRV9TQUZFX1BVVEVOViIKZmkKRU9PVkVSCgpybSAtZiB0cnkuYyB0
-  cnkubyB0cnkgYS5vdXQKCiMgSWYgdXNpbmcgQysrLCB0aGUgQ29uZmlndXJlIHNjYW4gZm9yIGRs
-  b3BlbigpIHdpbGwgZmFpbCBpbiBTb2xhcmlzCiMgYmVjYXVzZSBvbmUgb2YgdGhlIHR3byAoMSkg
-  YW4gZXh0ZXJuICJDIiBsaW5rYWdlIGRlZmluaXRpb24gaXMgbmVlZGVkCiMgKDIpICNpbmNsdWRl
-  IDxkbGZjbi5oPiBpcyBuZWVkZWQsICphbmQqIGEgY2FzdCB0byAodm9pZCooKikoKSkKIyBpcyBu
-  ZWVkZWQgZm9yIHRoZSAmZGxvcGVuLiAgQWRkaW5nIGFueSBvZiB0aGVzZSB3b3VsZCByZXF1aXJl
-  IGNoYW5naW5nCiMgYSBkZWxpY2F0ZSBzcG90IGluIENvbmZpZ3VyZSwgc28gZWFzaWVyIGp1c3Qg
-  dG8gZm9yY2Ugb3VyIGd1ZXNzIGhlcmUKIyBmb3IgU29sYXJpcy4gIE11Y2ggdGhlIHNhbWUgZ29l
-  cyBmb3IgZGxlcnJvcigpLgpjYXNlICIkY2MiIGluCipnKysqfCpDQyopCiAgZF9kbG9wZW49J2Rl
-  ZmluZScKICBkX2RsZXJyb3I9J2RlZmluZScKICA7Owplc2FjCgo=',
+  ZXIgYXJlIHJlcG9ydGVkbHkgb2ssIGhvd2V2ZXIuKQojIElmIHRoZSBDIGNvbXBpbGVyIGlzIG5v
+  dCBnY2M6CiMgICAtIENoZWNrIGlmIGl0IGlzIHRoZSBXb3Jrc2hvcC9Gb3J0ZSBjb21waWxlci4K
+  IyAgICAgSWYgaXQgaXMsIHByZXBhcmUgZm9yIDY0IGJpdCBhbmQgbG9uZyBkb3VibGVzLgojICAg
+  LSBjaGVjayBhcygxKSBhbmQgbGQoMSksIHRoZXkgc2hvdWxkIG5vdCBiZSBHTlUKIwkoR05VIGFz
+  IGFuZCBsZCAyLjguMSBhbmQgbGF0ZXIgYXJlIHJlcG9ydGVkbHkgb2ssIGhvd2V2ZXIuKQojCiMg
+  V2F0Y2ggb3V0IGluIGNhc2UgdGhleSBoYXZlIG5vdCBzZXQgJGNjLgoKIyBQZXJsIGNvbXBpbGVk
+  IHdpdGggc29tZSBjb21iaW5hdGlvbnMgb2YgR05VIGFzIGFuZCBsZCBtYXkgbm90CiMgYmUgYWJs
+  ZSB0byBwZXJmb3JtIGR5bmFtaWMgbG9hZGluZyBvZiBleHRlbnNpb25zLiAgSWYgeW91IGhhdmUg
+  YQojIHByb2JsZW0gd2l0aCBkeW5hbWljIGxvYWRpbmcsIGJlIHN1cmUgdGhhdCB5b3UgYXJlIHVz
+  aW5nIHRoZSBTb2xhcmlzCiMgL3Vzci9jY3MvYmluL2FzIGFuZCAvdXNyL2Njcy9iaW4vbGQuICBZ
+  b3UgY2FuIGRvIHRoYXQgd2l0aAojCXNoIENvbmZpZ3VyZSAtRGNjPSdnY2MgLUIvdXNyL2Njcy9i
+  aW4vJwojIChub3RlIHRoZSB0cmFpbGluZyBzbGFzaCBpcyByZXF1aXJlZCkuCiMgQ29tYmluYXRp
+  b25zIHRoYXQgYXJlIGtub3duIHRvIHdvcmsgd2l0aCB0aGUgZm9sbG93aW5nIGhpbnRzOgojCiMg
+  IGdjYy0yLjcuMiwgR05VIGFzIDIuNywgR05VIGxkIDIuNwojICBlZ2NzLTEuMC4zLCBHTlUgYXMg
+  Mi45LjEgYW5kIEdOVSBsZCAyLjkuMQojCS0tQW5keSBEb3VnaGVydHkgIDxkb3VnaGVyYUBsYWZh
+  eWV0dGUuZWR1PgojCVR1ZSBBcHIgMTMgMTc6MTk6NDMgRURUIDE5OTkKCiMgR2V0IGdjYyB0byBz
+  aGFyZSBpdHMgc2VjcmV0cy4KZWNobyAnaW50IG1haW4oKSB7IHJldHVybiAwOyB9JyA+IHRyeS5j
+  CgkjIEluZGVudCB0byBhdm9pZCBwcm9wYWdhdGlvbiB0byBjb25maWcuc2gKCXZlcmJvc2U9YCR7
+  Y2M6LWNjfSAkY2NmbGFncyAtdiAtbyB0cnkgdHJ5LmMgMj4mMWAKCiMgWFhYIFRPRE86ICAnc3Bl
+  Y3MnIG91dHB1dCBjaGFuZ2VkIGZyb20gJ1JlYWRpbmcgc3BlY3MgZnJvbScgaW4gZ2NjLVsyM10g
+  dG8gJ1VzaW5nCiMgYnVpbHQtaW4gc3BlY3MnIGluIGdjYy00LiAgUGVyaGFwcyB3ZSBzaG91bGQg
+  anVzdCB1c2UgdGhlIHNhbWUgZ2NjIHRlc3QgYXMKIyBpbiBDb25maWd1cmUgdG8gc2VlIGlmIHdl
+  J3JlIHVzaW5nIGdjYy4KaWYgZWNobyAiJHZlcmJvc2UiIHwgZWdyZXAgJyhSZWFkaW5nIHNwZWNz
+  IGZyb20pfChVc2luZyBidWlsdC1pbiBzcGVjcyknID4vZGV2L251bGwgMj4mMTsgdGhlbgoJIwoJ
+  IyBVc2luZyBnY2MuCgkjCgljY19uYW1lPSdnY2MnCgoJIyBTZWUgaWYgYXMoMSkgaXMgR05VIGFz
+  KDEpLiAgR05VIGFzKDEpIG1pZ2h0IG5vdCB3b3JrIGZvciB0aGlzIGpvYi4KCWlmIGVjaG8gIiR2
+  ZXJib3NlIiB8IGdyZXAgJyAvdXNyL2Njcy9iaW4vYXMgJyA+L2Rldi9udWxsIDI+JjE7IHRoZW4K
+  CSAgICA6CgllbHNlCgkgICAgY2F0IDw8RU5EID4mMgoKTk9URTogWW91IGFyZSB1c2luZyBHTlUg
+  YXMoMSkuICBHTlUgYXMoMSkgbWlnaHQgbm90IGJ1aWxkIFBlcmwuICBJZiB5b3UKaGF2ZSB0cm91
+  YmxlLCB5b3UgY2FuIHVzZSAvdXNyL2Njcy9iaW4vYXMgYnkgaW5jbHVkaW5nIC1CL3Vzci9jY3Mv
+  YmluLwppbiB5b3VyICR7Y2M6LWNjfSBjb21tYW5kLiAgKE5vdGUgdGhhdCB0aGUgdHJhaWxpbmcg
+  Ii8iIGlzIHJlcXVpcmVkLikKCkVORAoJICAgICMgQXBwYXJlbnRseSBub3QgbmVlZGVkLCBhdCBs
+  ZWFzdCBmb3IgYXMgMi43IGFuZCBsYXRlci4KCSAgICAjIGNjPSIke2NjOi1jY30gJGNjZmxhZ3Mg
+  LUIvdXNyL2Njcy9iaW4vIgoJZmkKCgkjIFNlZSBpZiBsZCgxKSBpcyBHTlUgbGQoMSkuICBHTlUg
+  bGQoMSkgbWlnaHQgbm90IHdvcmsgZm9yIHRoaXMgam9iLgoJIyBSZWNvbXB1dGUgJHZlcmJvc2Ug
+  c2luY2Ugd2UgbWF5IGhhdmUganVzdCBjaGFuZ2VkICRjYy4KCXZlcmJvc2U9YCR7Y2M6LWNjfSAk
+  Y2NmbGFncyAtdiAtbyB0cnkgdHJ5LmMgMj4mMSB8IGdyZXAgbGQgMj4mMWAKCglpZiBlY2hvICIk
+  dmVyYm9zZSIgfCBncmVwICcgL3Vzci9jY3MvYmluL2xkICcgPi9kZXYvbnVsbCAyPiYxOyB0aGVu
+  CgkgICAgIyBPaywgZ2NjIGRpcmVjdGx5IGNhbGxzIHRoZSBTb2xhcmlzIC91c3IvY2NzL2Jpbi9s
+  ZC4KCSAgICA6CgllbGlmIGVjaG8gIiR2ZXJib3NlIiB8IGdyZXAgImxkOiBTb2Z0d2FyZSBHZW5l
+  cmF0aW9uIFV0aWxpdGllcyIgPi9kZXYvbnVsbCAyPiYxOyB0aGVuCgkgICAgIyBIbW0uICBnY2Mg
+  ZG9lc24ndCBjYWxsIC91c3IvY2NzL2Jpbi9sZCBkaXJlY3RseSwgYnV0IGl0CgkgICAgIyBkb2Vz
+  IGFwcGVhciB0byBiZSB1c2luZyBpdCBldmVudHVhbGx5LiAgZWdjcy0xLjAuMydzIGxkCgkgICAg
+  IyB3cmFwcGVyIGRvZXMgdGhpcy4KCSAgICAjIE1vc3QgU29sYXJpcyB2ZXJzaW9ucyBvZiBsZCBJ
+  J3ZlIHNlZW4gY29udGFpbiB0aGUgbWFnaWMKCSAgICAjIHN0cmluZyB1c2VkIGluIHRoZSBncmVw
+  LgoJICAgIDoKCWVsaWYgZWNobyAiJHZlcmJvc2UiIHwgZ3JlcCAiU29sYXJpcyBMaW5rIEVkaXRv
+  cnMiID4vZGV2L251bGwgMj4mMTsgdGhlbgoJICAgICMgSG93ZXZlciBzb21lIFNvbGFyaXMgOCB2
+  ZXJzaW9ucyBwcmlvciB0byBsZCA1LjgtMS4yODYgY29udGFpbgoJICAgICMgdGhpcyBzdHJpbmcg
+  aW5zdGVhZC4KCSAgICA6CgllbHNlCgkgICAgIyBObyBldmlkZW5jZSB5ZXQgb2YgL3Vzci9jY3Mv
+  YmluL2xkLiAgU29tZSB2ZXJzaW9ucwoJICAgICMgb2YgZWdjcydzIGxkIHdyYXBwZXIgY2FsbCAv
+  dXNyL2Njcy9iaW4vbGQgaW4gdHVybiBidXQKCSAgICAjIGFwcGFyZW50bHkgZG9uJ3QgcmV2ZWFs
+  IHRoYXQgdW5sZXNzIHlvdSBwYXNzIGluIC1WLgoJICAgICMgKFRoaXMgbWF5IGFsbCBkZXBlbmQg
+  b24gbG9jYWwgY29uZmlndXJhdGlvbnMgdG9vLikKCgkgICAgIyBSZWNvbXB1dGUgdmVyYm9zZSB3
+  aXRoIC1XbCwtdiB0byBmaW5kIEdOVSBsZCBpZiBwcmVzZW50CgkgICAgdmVyYm9zZT1gJHtjYzot
+  Y2N9ICRjY2ZsYWdzIC1XbCwtdiAtbyB0cnkgdHJ5LmMgMj4mMSB8IGdyZXAgL2xkIDI+JjFgCgoJ
+  ICAgIG15bGQ9YGVjaG8gJHZlcmJvc2UgfCBhd2sgJy9cL2xkLyB7cHJpbnQgJDF9J2AKCSAgICAj
+  IFRoaXMgYXNzdW1lcyB0aGF0IGdjYydzIG91dHB1dCB3aWxsIG5vdCBjaGFuZ2UsIGFuZCB0aGF0
+  CgkgICAgIyAvZnVsbC9wYXRoL3RvL2xkIHdpbGwgYmUgdGhlIGZpcnN0IHdvcmQgb2YgdGhlIG91
+  dHB1dC4KCSAgICAjIFRodXMgbXlsZCBpcyBzb21ldGhpbmcgbGlrZSAvb3B0L2dudS9zcGFyYy1z
+  dW4tc29sYXJpczIuNS9iaW4vbGQKCgkgICAgIyBBbGxvdyB0aGF0ICRteWxkIG1heSBiZSAnJywg
+  ZHVlIHRvIGNoYW5nZXMgaW4gZ2NjJ3Mgb3V0cHV0CgkgICAgaWYgJHtteWxkOi1sZH0gLVYgMj4m
+  MSB8CgkJZ3JlcCAibGQ6IFNvZnR3YXJlIEdlbmVyYXRpb24gVXRpbGl0aWVzIiA+L2Rldi9udWxs
+  IDI+JjE7IHRoZW4KCQkjIE9rLCAvdXNyL2Njcy9iaW4vbGQgZXZlbnR1YWxseSBkb2VzIGdldCBj
+  YWxsZWQuCgkJOgoJICAgIGVsaWYgJHtteWxkOi1sZH0gLVYgMj4mMSB8CgkJZ3JlcCAiU29sYXJp
+  cyBMaW5rIEVkaXRvcnMiID4vZGV2L251bGwgMj4mMTsgdGhlbgoJCSMgT2ssIC91c3IvY2NzL2Jp
+  bi9sZCBldmVudHVhbGx5IGRvZXMgZ2V0IGNhbGxlZC4KCQk6CgkgICAgZWxzZQoJCWVjaG8gIkZv
+  dW5kIEdOVSBsZD0nJG15bGQnIiA+JjQKCQljYXQgPDxFTkQgPiYyCgpOT1RFOiBZb3UgYXJlIHVz
+  aW5nIEdOVSBsZCgxKS4gIEdOVSBsZCgxKSBtaWdodCBub3QgYnVpbGQgUGVybC4gIElmIHlvdQpo
+  YXZlIHRyb3VibGUsIHlvdSBjYW4gdXNlIC91c3IvY2NzL2Jpbi9sZCBieSBpbmNsdWRpbmcgLUIv
+  dXNyL2Njcy9iaW4vCmluIHlvdXIgJHtjYzotY2N9IGNvbW1hbmQuICAoTm90ZSB0aGF0IHRoZSB0
+  cmFpbGluZyAiLyIgaXMgcmVxdWlyZWQuKQoKSSB3aWxsIHRyeSB0byB1c2UgR05VIGxkIGJ5IHBh
+  c3NpbmcgaW4gdGhlIC1XbCwtRSBmbGFnLCBidXQgaWYgdGhhdApkb2Vzbid0IHdvcmssIHlvdSBz
+  aG91bGQgdXNlIC1CL3Vzci9jY3MvYmluLyBpbnN0ZWFkLgoKRU5ECgkJY2NkbGZsYWdzPSIkY2Nk
+  bGZsYWdzIC1XbCwtRSIKCQlsZGRsZmxhZ3M9IiRsZGRsZmxhZ3MgLVdsLC1FIC1zaGFyZWQiCgkg
+  ICAgZmkKCWZpCgplbHNlCgkjCgkjIE5vdCB1c2luZyBnY2MuCgkjCgljYXQgPiB0cnkuYyA8PCAn
+  RU9NJwojaW5jbHVkZSA8c3RkaW8uaD4KaW50IG1haW4oKSB7CiNpZiBkZWZpbmVkKF9fU1VOUFJP
+  X0MpCglwcmludGYoIndvcmtzaG9wXG4iKTsKI2Vsc2UKI2lmIGRlZmluZWQoX19TVU5QUk9fQ0Mp
+  CglwcmludGYoIndvcmtzaG9wIENDXG4iKTsKI2Vsc2UKCXByaW50ZigiXG4iKTsKI2VuZGlmCiNl
+  bmRpZgpyZXR1cm4oMCk7Cn0KRU9NCgl0cnl3b3Jrc2hvcGNjPSIke2NjOi1jY30gJGNjZmxhZ3Mg
+  dHJ5LmMgLW8gdHJ5IgoJaWYgJHRyeXdvcmtzaG9wY2MgPi9kZXYvbnVsbCAyPiYxOyB0aGVuCgkJ
+  Y2NfbmFtZT1gJHJ1biAuL3RyeWAKCQlpZiB0ZXN0ICIkY2NfbmFtZSIgPSAid29ya3Nob3AiOyB0
+  aGVuCgkJCWNjdmVyc2lvbj0iYCR7Y2M6LWNjfSAtViAyPiYxfHNlZCAtbiAtZSAnMXMvXltDY11b
+  Q2M5XTkqOiAvL3AnYCIKCQlmaQoJCWlmIHRlc3QgIiRjY19uYW1lIiA9ICJ3b3Jrc2hvcCBDQyI7
+  IHRoZW4KCQkJY2N2ZXJzaW9uPSJgJHtjYzotQ0N9IC1WIDI+JjF8c2VkIC1uIC1lICcxcy9eW0Nj
+  XVtDXTogLy9wJ2AiCgkJZmkKCQljYXNlICIkY2NfbmFtZSIgaW4KCQl3b3Jrc2hvcCopCgkJCSMg
+  U2V0dGluZ3MgZm9yIGVpdGhlciBjYyBvciBDQwoJCQlpZiB0ZXN0ICEgIiR1c2U2NGJpdGFsbF9k
+  b25lIjsgdGhlbgoJCQkJbG9jbGlicHRoPSIvdXNyL2xpYiAvdXNyL2Njcy9saWIgYCRnZXR3b3Jr
+  c2hvcGxpYnNgICRsb2NsaWJwdGgiCgkJCWZpCgkJCSMgU3VuIENDL2NjIGRvbid0IHN1cHBvcnQg
+  Z2NjIGF0dHJpYnV0ZXMKCQkJZF9hdHRyaWJ1dGVfZm9ybWF0PSd1bmRlZicKCQkJZF9hdHRyaWJ1
+  dGVfbWFsbG9jPSd1bmRlZicKCQkJZF9hdHRyaWJ1dGVfbm9ubnVsbD0ndW5kZWYnCgkJCWRfYXR0
+  cmlidXRlX25vcmV0dXJuPSd1bmRlZicKCQkJZF9hdHRyaWJ1dGVfcHVyZT0ndW5kZWYnCgkJCWRf
+  YXR0cmlidXRlX3VudXNlZD0ndW5kZWYnCgkJCWRfYXR0cmlidXRlX3dhcm5fdW51c2VkX3Jlc3Vs
+  dD0ndW5kZWYnCgkJCWNhc2UgIiRjYyIgaW4KCQkJKmM5OSkJIyBjOTkgcmVqZWN0cyBiYXJlICct
+  TycuCgkJCQljYXNlICIkb3B0aW1pemUiIGluCgkJCQknJ3wtTykgb3B0aW1pemU9LU8zIDs7CgkJ
+  CQllc2FjCgkJCQkjIFdpdGhvdXQgLVhhIGM5OSBkb2Vzbid0IHNlZQoJCQkJIyBtYW55IE9TIGlu
+  dGVyZmFjZXMuCgkJCQljYXNlICIkY2NmbGFncyIgaW4KCQkJCSotWGEqKQk7OwoJCQkJKikgY2Nm
+  bGFncz0iJGNjZmxhZ3MgLVhhIiA7OwoJCQkJZXNhYwoJCQkJOzsKCQkJZXNhYwoJCQk7OwoJCWVz
+  YWMKCWZpCgoJIyBTZWUgaWYgYXMoMSkgaXMgR05VIGFzKDEpLiAgR05VIG1pZ2h0IG5vdCB3b3Jr
+  IGZvciB0aGlzIGpvYi4KCWNhc2UgYGFzIC0tdmVyc2lvbiA8IC9kZXYvbnVsbCAyPiYxYCBpbgoJ
+  KkdOVSopCgkJY2F0IDw8RU5EID4mMgoKTk9URTogWW91IGFyZSB1c2luZyBHTlUgYXMoMSkuICBH
+  TlUgYXMoMSkgbWlnaHQgbm90IGJ1aWxkIFBlcmwuCllvdSBtdXN0IGFycmFuZ2UgdG8gdXNlIC91
+  c3IvY2NzL2Jpbi9hcywgcGVyaGFwcyBieSBhZGRpbmcgL3Vzci9jY3MvYmluCnRvIHRoZSBiZWdp
+  bm5pbmcgb2YgeW91ciBQQVRILgoKRU5ECgkJOzsKCWVzYWMKCgkjIFNlZSBpZiBsZCgxKSBpcyBH
+  TlUgbGQoMSkuICBHTlUgbGQoMSkgbWlnaHQgbm90IHdvcmsgZm9yIHRoaXMgam9iLgoJIyBsZCAt
+  LXZlcnNpb24gZG9lc24ndCBwcm9wZXJseSByZXBvcnQgaXRzZWxmIGFzIGEgR05VIHRvb2wsCgkj
+  IGFzIG9mIGxkIHZlcnNpb24gMi42LCBzbyB3ZSBuZWVkIHRvIGJlIG1vcmUgc3RyaWN0LiBUV1Ag
+  OS81Lzk2CgkjIFN1bidzIGxkIGFsd2F5cyBlbWl0cyB0aGUgIlNvZnR3YXJlIEdlbmVyYXRpb24g
+  VXRpbGl0aWVzIiBzdHJpbmcuCglpZiBsZCAtViAyPiYxIHwgZ3JlcCAibGQ6IFNvZnR3YXJlIEdl
+  bmVyYXRpb24gVXRpbGl0aWVzIiA+L2Rldi9udWxsIDI+JjE7IHRoZW4KCSAgICAjIE9rLCBsZCBp
+  cyAvdXNyL2Njcy9iaW4vbGQuCgkgICAgOgoJZWxzZQoJICAgIGNhdCA8PEVORCA+JjIKCk5PVEU6
+  IFlvdSBhcmUgYXBwYXJlbnRseSB1c2luZyBHTlUgbGQoMSkuICBHTlUgbGQoMSkgbWlnaHQgbm90
+  IGJ1aWxkIFBlcmwuCllvdSBzaG91bGQgYXJyYW5nZSB0byB1c2UgL3Vzci9jY3MvYmluL2xkLCBw
+  ZXJoYXBzIGJ5IGFkZGluZyAvdXNyL2Njcy9iaW4KdG8gdGhlIGJlZ2lubmluZyBvZiB5b3VyIFBB
+  VEguCgpFTkQKCWZpCmZpCgojIGFzIC0tdmVyc2lvbiBvciBsZCAtLXZlcnNpb24gbWlnaHQgZHVt
+  cCBjb3JlLgpybSAtZiB0cnkgdHJ5LmMgY29yZQpFT0NCVQoKY2F0ID4gVVUvdXNldGhyZWFkcy5j
+  YnUgPDwnRU9DQlUnCiMgVGhpcyBzY3JpcHQgVVUvdXNldGhyZWFkcy5jYnUgd2lsbCBnZXQgJ2Nh
+  bGxlZC1iYWNrJyBieSBDb25maWd1cmUKIyBhZnRlciBpdCBoYXMgcHJvbXB0ZWQgdGhlIHVzZXIg
+  Zm9yIHdoZXRoZXIgdG8gdXNlIHRocmVhZHMuCmNhc2UgIiR1c2V0aHJlYWRzIiBpbgokZGVmaW5l
+  fHRydWV8W3lZXSopCgljY2ZsYWdzPSItRF9SRUVOVFJBTlQgJGNjZmxhZ3MiCgoJIyAtbHB0aHJl
+  YWQgb3ZlcnJpZGVzIHNvbWUgbGliIEMgZnVuY3Rpb25zLCBzbyBwdXQgaXQgYmVmb3JlIGMuCglz
+  ZXQgYGVjaG8gWCAiJGxpYnN3YW50ZWQgInwgc2VkIC1lICJzLyBjIC8gcHRocmVhZCBjIC8iYAoJ
+  c2hpZnQKCWxpYnN3YW50ZWQ9IiQqIgoKCSMgc2NoZWRfeWllbGQgaXMgYXZhaWxhYmxlIGluIHRo
+  ZSAtbHJ0IGxpYnJhcnkuICBIb3dldmVyLAoJIyB3ZSBjYW4gYWxzbyBwaWNrIHVwIHRoZSBlcXVp
+  dmFsZW50IHlpZWxkKCkgZnVuY3Rpb24gaW4gdGhlCgkjIG5vcm1hbCBDIGxpYnJhcnkuICBUbyBh
+  dm9pZCBwdWxsaW5nIGluIHVubmVjZXNzYXJ5CgkjIGxpYnJhcmllcywgd2UnbGwgbm9ybWFsbHkg
+  YXZvaWQgc2NoZWRfeWllbGQoKS8tbHJ0IGFuZAoJIyBqdXN0IHVzZSB5aWVsZCgpLiAgSG93ZXZl
+  ciwgd2UnbGwgaG9ub3IgYSBjb21tYW5kLWxpbmUKCSMgb3ZlcnJpZGUgOiAiLURzY2hlZF95aWVs
+  ZD1zY2hlZF95aWVsZCIuCgkjIElmIHdlIGVuZCB1cCB1c2luZyBzY2hlZF95aWVsZCwgd2UncmUg
+  Z29pbmcgdG8gbmVlZCAtbHJ0LgoJc2NoZWRfeWllbGQ9JHtzY2hlZF95aWVsZDoteWllbGR9Cglp
+  ZiB0ZXN0ICIkc2NoZWRfeWllbGQiID0gInNjaGVkX3lpZWxkIjsgdGhlbgoJICAgIHNldCBgZWNo
+  byBYICIkbGlic3dhbnRlZCAifCBzZWQgLWUgInMvIHB0aHJlYWQgLyBydCBwdGhyZWFkIC8iYAoJ
+  ICAgIHNoaWZ0CgkgICAgbGlic3dhbnRlZD0iJCoiCglmaQoKCSMgT24gU29sYXJpcyAyLjYgeDg2
+  IHRoZXJlIGlzIGEgYnVnIHdpdGggc2lnc2V0am1wKCkgYW5kIHNpZ2xvbmdqbXAoKQoJIyB3aGVu
+  IGxpbmtlZCB3aXRoIHRoZSB0aHJlYWRzIGxpYnJhcnksIHN1Y2ggdGhhdCB3aGF0ZXZlciBwb3Np
+  dGl2ZQoJIyB2YWx1ZSB5b3UgcGFzcyB0byBzaWdsb25nam1wKCksIHNpZ3NldGptcCgpIHJldHVy
+  bnMgMS4KCSMgVGhhbmtzIHRvIFNpbW9uIFBhcnNvbnMgPFMuUGFyc29uc0BmdGVsLmNvLnVrPiBm
+  b3IgdGhpcyByZXBvcnQuCgkjIFN1biBCdWdJRCBpcyA0MTE3OTQ2LCAic2lnc2V0am1wIGFsd2F5
+  cyByZXR1cm5zIDEgd2hlbiBjYWxsZWQgYnkKCSMgc2lnbG9uZ2ptcCBpbiBhIE1UIHByb2dyYW0i
+  LiBBcyBvZiAxOTk4MDYyMiwgdGhlcmUgaXMgbm8gcGF0Y2gKCSMgYXZhaWxhYmxlLgoJY2F0ID50
+  cnkuYyA8PCdFT00nCgkvKiBUZXN0IGZvciBzaWcoc2V0fGxvbmcpam1wIGJ1Zy4gKi8KCSNpbmNs
+  dWRlIDxzZXRqbXAuaD4KCglpbnQgbWFpbigpCgl7CgkgICAgc2lnam1wX2J1ZiBlbnY7CgkgICAg
+  aW50IHJldDsKCgkgICAgcmV0ID0gc2lnc2V0am1wKGVudiwgMSk7CgkgICAgaWYgKHJldCkgeyBy
+  ZXR1cm4gcmV0ID09IDI7IH0KCSAgICBzaWdsb25nam1wKGVudiwgMik7Cgl9CkVPTQoJaWYgdGVz
+  dCAiYGFyY2hgIiA9IGk4NnBjIC1hIGB1bmFtZSAtcmAgPSA1LjYgJiYgXAoJICAgJHtjYzotY2N9
+  IHRyeS5jIC1scHRocmVhZCA+L2Rldi9udWxsIDI+JjEgJiYgLi9hLm91dDsgdGhlbgoJICAgIGRf
+  c2lnc2V0am1wPSR1bmRlZgoJZmkKCgkjIFRoZXNlIHByb3RvdHlwZXMgc2hvdWxkIGJlIHZpc2li
+  bGUgc2luY2Ugd2UgdXNpbmcKCSMgLURfUkVFTlRSQU5ULCBidXQgdGhhdCBkb2VzIG5vdCBzZWVt
+  IHRvIHdvcmsuCgkjIEl0IGRvZXMgc2VlbSB0byB3b3JrIGZvciBnZXRuZXRieWFkZHJfciwgd2Vp
+  cmRseSBlbm91Z2gsCgkjIGFuZCBvdGhlciBfciBmdW5jdGlvbnMuIChTb2xhcmlzIDgpCgoJZF9j
+  dGVybWlkX3JfcHJvdG89IiRkZWZpbmUiCglkX2dldGhvc3RieWFkZHJfcl9wcm90bz0iJGRlZmlu
+  ZSIKCWRfZ2V0aG9zdGJ5bmFtZV9yX3Byb3RvPSIkZGVmaW5lIgoJZF9nZXRuZXRieW5hbWVfcl9w
+  cm90bz0iJGRlZmluZSIKCWRfZ2V0cHJvdG9ieW5hbWVfcl9wcm90bz0iJGRlZmluZSIKCWRfZ2V0
+  cHJvdG9ieW51bWJlcl9yX3Byb3RvPSIkZGVmaW5lIgoJZF9nZXRzZXJ2YnluYW1lX3JfcHJvdG89
+  IiRkZWZpbmUiCglkX2dldHNlcnZieXBvcnRfcl9wcm90bz0iJGRlZmluZSIKCgkjIERpdHRvLiAo
+  U29sYXJpcyA3KQoJZF9yZWFkZGlyX3JfcHJvdG89IiRkZWZpbmUiCglkX3JlYWRkaXI2NF9yX3By
+  b3RvPSIkZGVmaW5lIgoJZF90bXBuYW1fcl9wcm90bz0iJGRlZmluZSIKCWRfdHR5bmFtZV9yX3By
+  b3RvPSIkZGVmaW5lIgoKCTs7CmVzYWMKRU9DQlUKCmNhdCA+IFVVL3VzZWxhcmdlZmlsZXMuY2J1
+  IDw8J0VPQ0JVJwojIFRoaXMgc2NyaXB0IFVVL3VzZWxhcmdlZmlsZXMuY2J1IHdpbGwgZ2V0ICdj
+  YWxsZWQtYmFjaycgYnkgQ29uZmlndXJlCiMgYWZ0ZXIgaXQgaGFzIHByb21wdGVkIHRoZSB1c2Vy
+  IGZvciB3aGV0aGVyIHRvIHVzZSBsYXJnZSBmaWxlcy4KY2FzZSAiJHVzZWxhcmdlZmlsZXMiIGlu
+  CicnfCRkZWZpbmV8dHJ1ZXxbeVldKikKCiMgS2VlcCB0aGVzZSBpbiB0aGUgbGVmdCBtYXJnaW4u
+  CmNjZmxhZ3NfdXNlbGFyZ2VmaWxlcz0iYCRydW4gZ2V0Y29uZiBMRlNfQ0ZMQUdTIDI+L2Rldi9u
+  dWxsYCIKbGRmbGFnc191c2VsYXJnZWZpbGVzPSJgJHJ1biBnZXRjb25mIExGU19MREZMQUdTIDI+
+  L2Rldi9udWxsYCIKbGlic3dhbnRlZF91c2VsYXJnZWZpbGVzPSJgJHJ1biBnZXRjb25mIExGU19M
+  SUJTIDI+L2Rldi9udWxsfHNlZCAtZSAnc0BeLWxAQCcgLWUgJ3NAIC1sQCBAZydgIgoKICAgIGNj
+  ZmxhZ3M9IiRjY2ZsYWdzICRjY2ZsYWdzX3VzZWxhcmdlZmlsZXMiCiAgICBsZGZsYWdzPSIkbGRm
+  bGFncyAkbGRmbGFnc191c2VsYXJnZWZpbGVzIgogICAgbGlic3dhbnRlZD0iJGxpYnN3YW50ZWQg
+  JGxpYnN3YW50ZWRfdXNlbGFyZ2VmaWxlcyIKICAgIDs7CmVzYWMKRU9DQlUKCiMgVGhpcyBpcyB0
+  cnVseSBhIG1lc3MuCmNhc2UgIiR1c2Vtb3JlYml0cyIgaW4KIiRkZWZpbmUifHRydWV8W3lZXSop
+  Cgl1c2U2NGJpdGludD0iJGRlZmluZSIKCXVzZWxvbmdkb3VibGU9IiRkZWZpbmUiCgk7Owplc2Fj
+  CgppZiB0ZXN0IGAkcnVuIHVuYW1lIC1wYCA9IGkzODY7IHRoZW4KICAgIGNhc2UgIiR1c2U2NGJp
+  dGludCIgaW4KICAgICIkZGVmaW5lInx0cnVlfFt5WV0qKQogICAgICAgICAgICBjY2ZsYWdzPSIk
+  Y2NmbGFncyAtRFBUUl9JU19MT05HIgogICAgICAgICAgICA7OwogICAgZXNhYwpmaQoKaWYgdGVz
+  dCBgJHJ1biB1bmFtZSAtcGAgPSBzcGFyYyAtbyBgJHJ1biB1bmFtZSAtcGAgPSBpMzg2OyB0aGVu
+  CiAgICBjYXQgPiBVVS91c2U2NGJpdGludC5jYnUgPDwnRU9DQlUnCiMgVGhpcyBzY3JpcHQgVVUv
+  dXNlNjRiaXRpbnQuY2J1IHdpbGwgZ2V0ICdjYWxsZWQtYmFjaycgYnkgQ29uZmlndXJlCiMgYWZ0
+  ZXIgaXQgaGFzIHByb21wdGVkIHRoZSB1c2VyIGZvciB3aGV0aGVyIHRvIHVzZSA2NCBiaXQgaW50
+  ZWdlcnMuCmNhc2UgIiR1c2U2NGJpdGludCIgaW4KIiRkZWZpbmUifHRydWV8W3lZXSopCgkgICAg
+  Y2FzZSAiYCRydW4gdW5hbWUgLXJgIiBpbgoJICAgIDUuWzAtNF0pCgkJY2F0ID4mNCA8PEVPTQpT
+  b2xhcmlzIGB1bmFtZSAtcnxzZWQgLWUgJ3MvXjVcLi8yLi8nYCBkb2VzIG5vdCBzdXBwb3J0IDY0
+  LWJpdCBpbnRlZ2Vycy4KWW91IHNob3VsZCB1cGdyYWRlIHRvIGF0IGxlYXN0IFNvbGFyaXMgMi41
+  LgpFT00KCQlleGl0IDEKCQk7OwoJICAgIGVzYWMKCiMgZ2NjLTIuOC4xIG9uIFNvbGFyaXMgOCB3
+  aXRoIC1EdXNlNjRiaXRpbnQgZmFpbHMgb3AvcGF0LnQgdGVzdCA4MjIKIyBpZiB3ZSBjb21waWxl
+  IHJlZ2V4ZWMuYyB3aXRoIC1PLiAgVHVybiBvZmYgb3B0aW1pemF0aW9uIGZvciB0aGF0IG9uZQoj
+  IGZpbGUuICBTZWUgaGludHMvUkVBRE1FLmhpbnRzICwgZXNwZWNpYWxseQojID1oZWFkMiBQcm9w
+  YWdhdGluZyB2YXJpYWJsZXMgdG8gY29uZmlnLnNoLCBtZXRob2QgMy4KIyAgQS4gRG91Z2hlcnR5
+  ICBNYXkgMjQsIDIwMDIKICAgIGNhc2UgIiR7Z2NjdmVyc2lvbn0tJHtvcHRpbWl6ZX0iIGluCiAg
+  ICAyLjgqLU8qKQoJIyBIb25vciBhIGNvbW1hbmQtbGluZSBvdmVycmlkZSAocmF0aGVyIHVubGlr
+  ZWx5KQoJY2FzZSAiJHJlZ2V4ZWNfY2ZsYWdzIiBpbgoJJycpIGVjaG8gIkRpc2FibGluZyBvcHRp
+  bWl6YXRpb24gb24gcmVnZXhlYy5jIGZvciBnY2MgJGdjY3ZlcnNpb24iID4mNAoJICAgIHJlZ2V4
+  ZWNfY2ZsYWdzPSdvcHRpbWl6ZT0nCgkgICAgZWNobyAicmVnZXhlY19jZmxhZ3M9J29wdGltaXpl
+  PVwiXCInIiA+PiBjb25maWcuc2gKCSAgICA7OwoJZXNhYwoJOzsKICAgIGVzYWMKICAgIDs7CmVz
+  YWMKRU9DQlUKCiAgICBjYXQgPiBVVS91c2U2NGJpdGFsbC5jYnUgPDwnRU9DQlUnCiMgVGhpcyBz
+  Y3JpcHQgVVUvdXNlNjRiaXRhbGwuY2J1IHdpbGwgZ2V0ICdjYWxsZWQtYmFjaycgYnkgQ29uZmln
+  dXJlCiMgYWZ0ZXIgaXQgaGFzIHByb21wdGVkIHRoZSB1c2VyIGZvciB3aGV0aGVyIHRvIGJlIG1h
+  eGltYWxseSA2NCBiaXR0eS4KY2FzZSAiJHVzZTY0Yml0YWxsLSR1c2U2NGJpdGFsbF9kb25lIiBp
+  bgoiJGRlZmluZS0ifHRydWUtfFt5WV0qLSkKCSAgICBjYXNlICJgJHJ1biB1bmFtZSAtcmAiIGlu
+  CgkgICAgNS5bMC02XSkKCQljYXQgPiY0IDw8RU9NClNvbGFyaXMgYHVuYW1lIC1yfHNlZCAtZSAn
+  cy9eNVwuLzIuLydgIGRvZXMgbm90IHN1cHBvcnQgNjQtYml0IHBvaW50ZXJzLgpZb3Ugc2hvdWxk
+  IHVwZ3JhZGUgdG8gYXQgbGVhc3QgU29sYXJpcyAyLjcuCkVPTQoJCWV4aXQgMQoJCTs7CgkgICAg
+  ZXNhYwoJICAgIHByb2Nlc3Nvcj1gJHJ1biB1bmFtZSAtcGA7CgkgICAgaWYgdGVzdCAiJHByb2Nl
+  c3NvciIgPSBzcGFyYzsgdGhlbgoJCWxpYmM9Jy91c3IvbGliL3NwYXJjdjkvbGliYy5zbycKCQlp
+  ZiB0ZXN0ICEgLWYgJGxpYmM7IHRoZW4KCQkgICAgY2F0ID4mNCA8PEVPTQoKSSBkbyBub3Qgc2Vl
+  IHRoZSA2NC1iaXQgbGliYywgJGxpYmMuCkNhbm5vdCBjb250aW51ZSwgYWJvcnRpbmcuCgpFT00K
+  CQkgICAgZXhpdCAxCgkJZmkKCSAgICBmaQoJICAgIGNhc2UgIiR7Y2M6LWNjfSAtdiAyPi9kZXYv
+  bnVsbCIgaW4KCSAgICAqZ2NjKikKCQllY2hvICdpbnQgbWFpbigpIHsgcmV0dXJuIDA7IH0nID4g
+  dHJ5LmMKCQljYXNlICJgJHtjYzotY2N9ICRjY2ZsYWdzIC1tY3B1PXY5IC1tNjQgLVMgdHJ5LmMg
+  Mj4mMSB8IGdyZXAgJ202NCBpcyBub3Qgc3VwcG9ydGVkIGJ5IHRoaXMgY29uZmlndXJhdGlvbidg
+  IiBpbgoJCSoibTY0IGlzIG5vdCBzdXBwb3J0ZWQiKikKCQkgICAgY2F0ID4mNCA8PEVPTQoKRnVs
+  bCA2NC1iaXQgYnVpbGQgaXMgbm90IHN1cHBvcnRlZCBieSB0aGlzIGdjYyBjb25maWd1cmF0aW9u
+  LgpDaGVjayBodHRwOi8vZ2NjLmdudS5vcmcvIGZvciB0aGUgbGF0ZXN0IG5ld3Mgb2YgYXZhaWxh
+  YmlsaXR5Cm9mIGdjYyBmb3IgNjQtYml0IFNwYXJjLgoKQ2Fubm90IGNvbnRpbnVlLCBhYm9ydGlu
+  Zy4KCkVPTQoJCSAgICBleGl0IDEKCQkgICAgOzsKCQllc2FjCgkJaWYgdGVzdCAiJHByb2Nlc3Nv
+  ciIgPSBzcGFyYzsgdGhlbgoJCSAgICBsb2NsaWJwdGg9Ii91c3IvbGliL3NwYXJjdjkgJGxvY2xp
+  YnB0aCIKCQkgICAgY2NmbGFncz0iJGNjZmxhZ3MgLW1jcHU9djkiCgkJZmkKCQljY2ZsYWdzPSIk
+  Y2NmbGFncyAtbTY0IgoKCQkjIFRoaXMgYWRkcyBpbiAtV2EsLXhhcmNoPXY5LiAgSSBzdXNwZWN0
+  IHRoYXQncyBzdXBlcmZsdW91cywKCQkjIHNpbmNlIHRoZSAtbTY0IGFib3ZlIHNob3VsZCBkbyB0
+  aGF0IGFscmVhZHkuICBTb21lb25lCgkJIyB3aXRoIGdjYy0zLngueCwgcGxlYXNlIHRlc3Qgd2l0
+  aCBnY2MgLXYuICAgQS5ELiAyMC1Ob3YtMjAwMwojCQlpZiB0ZXN0ICRwcm9jZXNzb3IgPSBzcGFy
+  YyAtYSBYYCRydW4gZ2V0Y29uZiBYQlM1X0xQNjRfT0ZGNjRfQ0ZMQUdTIDI+L2Rldi9udWxsYCAh
+  PSBYOyB0aGVuCiMJCSAgICBjY2ZsYWdzPSIkY2NmbGFncyAtV2EsYCRydW4gZ2V0Y29uZiBYQlM1
+  X0xQNjRfT0ZGNjRfQ0ZMQUdTIDI+L2Rldi9udWxsYCIKIwkJZmkKCQlsZGZsYWdzPSIkbGRmbGFn
+  cyAtbTY0IgoKCQkjIFNlZSBbcGVybCAjNjY2MDRdOiAgT24gU29sYXJpcyAxMSwgZ2NjIC1tNjQg
+  b24gYW1kNjQKCQkjIGFwcGVhcnMgbm90IHRvIHVuZGVyc3RhbmQgLUcuICAoZ2NjIC1HIGhhcyBu
+  b3QgY2F1c2VkCgkJIyBwcm9ibGVtcyBvbiBvdGhlciBwbGF0Zm9ybXMgaW4gdGhlIHBhc3QuKSAg
+  Z2NjIHZlcnNpb25zCgkJIyBhdCBsZWFzdCBhcyBvbGQgYXMgMy40LjMgc3VwcG9ydCAtc2hhcmVk
+  LCBzbyBqdXN0CgkJIyB1c2UgdGhhdCB3aXRoIFNvbGFyaXMgMTEgYW5kIGxhdGVyLCBidXQga2Vl
+  cAoJCSMgdGhlIG9sZCBiZWhhdmlvciBmb3Igb2xkZXIgU29sYXJpcyB2ZXJzaW9ucy4KCQljYXNl
+  ICIkb3N2ZXJzIiBpbgoJCQkyLj98Mi4xMCkgbGRkbGZsYWdzPSIkbGRkbGZsYWdzIC1HIC1tNjQi
+  IDs7CgkJCSopIGxkZGxmbGFncz0iJGxkZGxmbGFncyAtc2hhcmVkIC1tNjQiIDs7CgkJZXNhYwoJ
+  CTs7CgkgICAgKikKCQlnZXRjb25mY2NmbGFncz0iYCRydW4gZ2V0Y29uZiBYQlM1X0xQNjRfT0ZG
+  NjRfQ0ZMQUdTIDI+L2Rldi9udWxsYCIKCQlnZXRjb25mbGRmbGFncz0iYCRydW4gZ2V0Y29uZiBY
+  QlM1X0xQNjRfT0ZGNjRfTERGTEFHUyAyPi9kZXYvbnVsbGAiCgkJZ2V0Y29uZmxkZGxmbGFncz0i
+  YCRydW4gZ2V0Y29uZiBYQlM1X0xQNjRfT0ZGNjRfTERGTEFHUyAyPi9kZXYvbnVsbGAiCgkJZWNo
+  byAiaW50IG1haW4oKSB7IHJldHVybigwKTsgfSAiID4gdHJ5LmMKCQljYXNlICJgJHtjYzotY2N9
+  ICRnZXRjb25mY2NmbGFncyB0cnkuYyAyPiYxIHwgZ3JlcCAnZGVwcmVjYXRlZCdgIiBpbgoJCSoi
+  IC14YXJjaD1nZW5lcmljNjQgaXMgZGVwcmVjYXRlZCwgdXNlIC1tNjQgIiopCgkJICAgIGdldGNv
+  bmZjY2ZsYWdzPWBlY2hvICRnZXRjb25mY2NmbGFncyB8IHNlZCAtZSAncy94YXJjaD1nZW5lcmlj
+  NjQvbTY0LydgCgkJICAgIGdldGNvbmZsZGZsYWdzPWBlY2hvICRnZXRjb25mbGRmbGFncyB8IHNl
+  ZCAtZSAncy94YXJjaD1nZW5lcmljNjQvbTY0LydgCgkJICAgIGdldGNvbmZsZGRsZmxhZ3M9YGVj
+  aG8gJGdldGNvbmZsZGRsZmxhZ3MgfCBzZWQgLWUgJ3MveGFyY2g9Z2VuZXJpYzY0L202NC8nYAoJ
+  CSAgICA7OwoJCWVzYWMKCQljY2ZsYWdzPSIkY2NmbGFncyAkZ2V0Y29uZmNjZmxhZ3MiCgkJbGRm
+  bGFncz0iJGxkZmxhZ3MgJGdldGNvbmZsZGZsYWdzIgoJCWxkZGxmbGFncz0iJGxkZGxmbGFncyAt
+  RyAkZ2V0Y29uZmxkZGxmbGFncyIKCgkJZWNobyAiaW50IG1haW4oKSB7IHJldHVybigwKTsgfSAi
+  ID4gdHJ5LmMKCQl0cnl3b3Jrc2hvcGNjPSIke2NjOi1jY30gdHJ5LmMgLW8gdHJ5ICRjY2ZsYWdz
+  IgoJCWlmIHRlc3QgIiRwcm9jZXNzb3IiID0gc3BhcmM7IHRoZW4KCQkgICAgbG9jbGlicHRoPSIv
+  dXNyL2xpYi9zcGFyY3Y5IC91c3IvY2NzL2xpYi9zcGFyY3Y5ICRsb2NsaWJwdGgiCgkJZmkKCQls
+  b2NsaWJwdGg9ImAkZ2V0d29ya3Nob3BsaWJzYCAkbG9jbGlicHRoIgoJCTs7CgkgICAgZXNhYwoJ
+  ICAgIHVuc2V0IHByb2Nlc3NvcgoJICAgIHVzZTY0Yml0YWxsX2RvbmU9eWVzCgkgICAgYXJjaG5h
+  bWU2ND02NAoJICAgIDs7CmVzYWMKRU9DQlUKCiAgICAjIEFjdHVhbGx5LCB3ZSB3YW50IHRvIHJ1
+  biB0aGlzIGFscmVhZHkgbm93LCBpZiBzbyByZXF1ZXN0ZWQsCiAgICAjIGJlY2F1c2Ugd2UgbmVl
+  ZCB0byBmaXggdXAgdGhpbmdzIHJpZ2h0IG5vdy4KICAgIGNhc2UgIiR1c2U2NGJpdGFsbCIgaW4K
+  ICAgICIkZGVmaW5lInx0cnVlfFt5WV0qKQoJIyBDQlVzIGV4cGVjdCB0byBiZSBydW4gaW4gVVUK
+  CWNkIFVVOyAuIC4vdXNlNjRiaXRhbGwuY2J1OyBjZCAuLgoJOzsKICAgIGVzYWMKZmkKCmNhdCA+
+  IFVVL3VzZWxvbmdkb3VibGUuY2J1IDw8J0VPQ0JVJwojIFRoaXMgc2NyaXB0IFVVL3VzZWxvbmdk
+  b3VibGUuY2J1IHdpbGwgZ2V0ICdjYWxsZWQtYmFjaycgYnkgQ29uZmlndXJlCiMgYWZ0ZXIgaXQg
+  aGFzIHByb21wdGVkIHRoZSB1c2VyIGZvciB3aGV0aGVyIHRvIHVzZSBsb25nIGRvdWJsZXMuCmNh
+  c2UgIiR1c2Vsb25nZG91YmxlIiBpbgoiJGRlZmluZSJ8dHJ1ZXxbeVldKikKCWlmIHRlc3QgIiRj
+  Y19uYW1lIiA9ICJ3b3Jrc2hvcCI7IHRoZW4KCQljYXQgPiB0cnkuYyA8PCAnRU9NJwojaW5jbHVk
+  ZSA8c3VubWF0aC5oPgppbnQgbWFpbigpIHsgKHZvaWQpIHBvd2woMiwgMjU2KTsgcmV0dXJuKDAp
+  OyB9CkVPTQoJCWlmICR7Y2M6LWNjfSB0cnkuYyAtbHN1bm1hdGggLW8gdHJ5ID4gL2Rldi9udWxs
+  IDI+JjEgJiYgLi90cnk7IHRoZW4KCQkJbGlic3dhbnRlZD0iJGxpYnN3YW50ZWQgc3VubWF0aCIK
+  CQlmaQoJZWxzZQoJCWNhdCA+JjQgPDxFT00KClRoZSBTdW4gV29ya3Nob3AgbWF0aCBsaWJyYXJ5
+  IGlzIGVpdGhlciBub3QgYXZhaWxhYmxlIG9yIG5vdCB3b3JraW5nLApzbyBJIGRvIG5vdCBrbm93
+  IGhvdyB0byBkbyBsb25nIGRvdWJsZXMsIHNvcnJ5LgpJJ20gdGhlcmVmb3JlIGRpc2FibGluZyB0
+  aGUgdXNlIG9mIGxvbmcgZG91Ymxlcy4KRU9NCgkJdXNlbG9uZ2RvdWJsZT0iJHVuZGVmIgoJZmkK
+  CTs7CmVzYWMKRU9DQlUKCiMKIyBJZiB1bnNldGVudiBpcyBhdmFpbGFibGUsIHVzZSBpdCBpbiBj
+  b25qdW5jdGlvbiB3aXRoIFBFUkxfVVNFX1NBRkVfUFVURU5WIHRvCiMgd29yayBhcm91bmQgU3Vu
+  IGJ1Z2lkIDYzMzM4MzAuICBCb3RoIHVuc2V0ZW52IGFuZCA2MzMzODMwIG9ubHkgYXBwZWFyIGlu
+  CiMgU29sYXJpcyAxMCwgc28gd2UgZG9uJ3QgbmVlZCB0byBwcm9iZSBleHBsaWNpdGx5IGZvciBh
+  biBPUyB2ZXJzaW9uLiAgV2UgaGF2ZQojIHRvIGFwcGVuZCB0aGlzIHRlc3QgdG8gdGhlIGVuZCBv
+  ZiBjb25maWcub3ZlciBhcyBpdCBuZWVkcyB0byBydW4gYWZ0ZXIKIyBDb25maWd1cmUgaGFzIHBy
+  b2JlZCBmb3IgdW5zZXRlbnYsIGFuZCB0aGlzIGhpbnRzIGZpbGUgaXMgcHJvY2Vzc2VkIGJlZm9y
+  ZQojIHRoYXQgaGFzIGhhcHBlbmVkLgojCmNhdCA+PiBjb25maWcub3ZlciA8PCdFT09WRVInCmlm
+  IHRlc3QgIiRkX3Vuc2V0ZW52IiA9ICIkZGVmaW5lIiAtYSBcCiAgICBgZXhwciAiJGNjZmxhZ3Mi
+  IDogJy4qLURQRVJMX1VTRV9TQUZFX1BVVEVOVidgIC1lcSAwOyB0aGVuCiAgICAgICAgY2NmbGFn
+  cz0iJGNjZmxhZ3MgLURQRVJMX1VTRV9TQUZFX1BVVEVOViIKZmkKRU9PVkVSCgpybSAtZiB0cnku
+  YyB0cnkubyB0cnkgYS5vdXQKCiMgSWYgdXNpbmcgQysrLCB0aGUgQ29uZmlndXJlIHNjYW4gZm9y
+  IGRsb3BlbigpIHdpbGwgZmFpbCBpbiBTb2xhcmlzCiMgYmVjYXVzZSBvbmUgb2YgdGhlIHR3byAo
+  MSkgYW4gZXh0ZXJuICJDIiBsaW5rYWdlIGRlZmluaXRpb24gaXMgbmVlZGVkCiMgKDIpICNpbmNs
+  dWRlIDxkbGZjbi5oPiBpcyBuZWVkZWQsICphbmQqIGEgY2FzdCB0byAodm9pZCooKikoKSkKIyBp
+  cyBuZWVkZWQgZm9yIHRoZSAmZGxvcGVuLiAgQWRkaW5nIGFueSBvZiB0aGVzZSB3b3VsZCByZXF1
+  aXJlIGNoYW5naW5nCiMgYSBkZWxpY2F0ZSBzcG90IGluIENvbmZpZ3VyZSwgc28gZWFzaWVyIGp1
+  c3QgdG8gZm9yY2Ugb3VyIGd1ZXNzIGhlcmUKIyBmb3IgU29sYXJpcy4gIE11Y2ggdGhlIHNhbWUg
+  Z29lcyBmb3IgZGxlcnJvcigpLgpjYXNlICIkY2MiIGluCipnKysqfCpDQyopCiAgZF9kbG9wZW49
+  J2RlZmluZScKICBkX2RsZXJyb3I9J2RlZmluZScKICA7Owplc2FjCgo=',
   );
   
   my %files = (
@@ -4584,7 +5823,7 @@ $fatpacked{"Devel/PatchPerl/Hints.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"
   
   =head1 VERSION
   
-  version 1.24
+  version 1.30
   
   =head1 SYNOPSIS
   
@@ -4657,7 +5896,7 @@ DEVEL_PATCHPERL_HINTS
 
 $fatpacked{"Devel/PatchPerl/Plugin.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'DEVEL_PATCHPERL_PLUGIN';
   package Devel::PatchPerl::Plugin;
-  $Devel::PatchPerl::Plugin::VERSION = '1.24';
+  $Devel::PatchPerl::Plugin::VERSION = '1.30';
   #ABSTRACT: Devel::PatchPerl plugins explained
   
   use strict;
@@ -4677,7 +5916,7 @@ $fatpacked{"Devel/PatchPerl/Plugin.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\
   
   =head1 VERSION
   
-  version 1.24
+  version 1.30
   
   =head1 DESCRIPTION
   
@@ -4748,13 +5987,18274 @@ $fatpacked{"Devel/PatchPerl/Plugin.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\
   =cut
 DEVEL_PATCHPERL_PLUGIN
 
+$fatpacked{"ExtUtils/Command/MM.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_COMMAND_MM';
+  package ExtUtils::Command::MM;
+  
+  require 5.006;
+  
+  use strict;
+  use warnings;
+  
+  require Exporter;
+  our @ISA = qw(Exporter);
+  
+  our @EXPORT  = qw(test_harness pod2man perllocal_install uninstall
+                    warn_if_old_packlist test_s cp_nonempty);
+  our $VERSION = '7.04';
+  
+  my $Is_VMS = $^O eq 'VMS';
+  
+  eval {  require Time::HiRes; die unless Time::HiRes->can("stat"); };
+  *mtime = $@ ?
+   sub { [             stat($_[0])]->[9] } :
+   sub { [Time::HiRes::stat($_[0])]->[9] } ;
+  
+  =head1 NAME
+  
+  ExtUtils::Command::MM - Commands for the MM's to use in Makefiles
+  
+  =head1 SYNOPSIS
+  
+    perl "-MExtUtils::Command::MM" -e "function" "--" arguments...
+  
+  
+  =head1 DESCRIPTION
+  
+  B<FOR INTERNAL USE ONLY!>  The interface is not stable.
+  
+  ExtUtils::Command::MM encapsulates code which would otherwise have to
+  be done with large "one" liners.
+  
+  Any $(FOO) used in the examples are make variables, not Perl.
+  
+  =over 4
+  
+  =item B<test_harness>
+  
+    test_harness($verbose, @test_libs);
+  
+  Runs the tests on @ARGV via Test::Harness passing through the $verbose
+  flag.  Any @test_libs will be unshifted onto the test's @INC.
+  
+  @test_libs are run in alphabetical order.
+  
+  =cut
+  
+  sub test_harness {
+      require Test::Harness;
+      require File::Spec;
+  
+      $Test::Harness::verbose = shift;
+  
+      # Because Windows doesn't do this for us and listing all the *.t files
+      # out on the command line can blow over its exec limit.
+      require ExtUtils::Command;
+      my @argv = ExtUtils::Command::expand_wildcards(@ARGV);
+  
+      local @INC = @INC;
+      unshift @INC, map { File::Spec->rel2abs($_) } @_;
+      Test::Harness::runtests(sort { lc $a cmp lc $b } @argv);
+  }
+  
+  
+  
+  =item B<pod2man>
+  
+    pod2man( '--option=value',
+             $podfile1 => $manpage1,
+             $podfile2 => $manpage2,
+             ...
+           );
+  
+    # or args on @ARGV
+  
+  pod2man() is a function performing most of the duties of the pod2man
+  program.  Its arguments are exactly the same as pod2man as of 5.8.0
+  with the addition of:
+  
+      --perm_rw   octal permission to set the resulting manpage to
+  
+  And the removal of:
+  
+      --verbose/-v
+      --help/-h
+  
+  If no arguments are given to pod2man it will read from @ARGV.
+  
+  If Pod::Man is unavailable, this function will warn and return undef.
+  
+  =cut
+  
+  sub pod2man {
+      local @ARGV = @_ ? @_ : @ARGV;
+  
+      {
+          local $@;
+          if( !eval { require Pod::Man } ) {
+              warn "Pod::Man is not available: $@".
+                   "Man pages will not be generated during this install.\n";
+              return 0;
+          }
+      }
+      require Getopt::Long;
+  
+      # We will cheat and just use Getopt::Long.  We fool it by putting
+      # our arguments into @ARGV.  Should be safe.
+      my %options = ();
+      Getopt::Long::config ('bundling_override');
+      Getopt::Long::GetOptions (\%options,
+                  'section|s=s', 'release|r=s', 'center|c=s',
+                  'date|d=s', 'fixed=s', 'fixedbold=s', 'fixeditalic=s',
+                  'fixedbolditalic=s', 'official|o', 'quotes|q=s', 'lax|l',
+                  'name|n=s', 'perm_rw=i', 'utf8|u'
+      );
+      delete $options{utf8} unless $Pod::Man::VERSION >= 2.17;
+  
+      # If there's no files, don't bother going further.
+      return 0 unless @ARGV;
+  
+      # Official sets --center, but don't override things explicitly set.
+      if ($options{official} && !defined $options{center}) {
+          $options{center} = q[Perl Programmer's Reference Guide];
+      }
+  
+      # This isn't a valid Pod::Man option and is only accepted for backwards
+      # compatibility.
+      delete $options{lax};
+      my $count = scalar @ARGV / 2;
+      my $plural = $count == 1 ? 'document' : 'documents';
+      print "Manifying $count pod $plural\n";
+  
+      do {{  # so 'next' works
+          my ($pod, $man) = splice(@ARGV, 0, 2);
+  
+          next if ((-e $man) &&
+                   (mtime($man) > mtime($pod)) &&
+                   (mtime($man) > mtime("Makefile")));
+  
+          my $parser = Pod::Man->new(%options);
+          $parser->parse_from_file($pod, $man)
+            or do { warn("Could not install $man\n");  next };
+  
+          if (exists $options{perm_rw}) {
+              chmod(oct($options{perm_rw}), $man)
+                or do { warn("chmod $options{perm_rw} $man: $!\n"); next };
+          }
+      }} while @ARGV;
+  
+      return 1;
+  }
+  
+  
+  =item B<warn_if_old_packlist>
+  
+    perl "-MExtUtils::Command::MM" -e warn_if_old_packlist <somefile>
+  
+  Displays a warning that an old packlist file was found.  Reads the
+  filename from @ARGV.
+  
+  =cut
+  
+  sub warn_if_old_packlist {
+      my $packlist = $ARGV[0];
+  
+      return unless -f $packlist;
+      print <<"PACKLIST_WARNING";
+  WARNING: I have found an old package in
+      $packlist.
+  Please make sure the two installations are not conflicting
+  PACKLIST_WARNING
+  
+  }
+  
+  
+  =item B<perllocal_install>
+  
+      perl "-MExtUtils::Command::MM" -e perllocal_install
+          <type> <module name> <key> <value> ...
+  
+      # VMS only, key|value pairs come on STDIN
+      perl "-MExtUtils::Command::MM" -e perllocal_install
+          <type> <module name> < <key>|<value> ...
+  
+  Prints a fragment of POD suitable for appending to perllocal.pod.
+  Arguments are read from @ARGV.
+  
+  'type' is the type of what you're installing.  Usually 'Module'.
+  
+  'module name' is simply the name of your module.  (Foo::Bar)
+  
+  Key/value pairs are extra information about the module.  Fields include:
+  
+      installed into      which directory your module was out into
+      LINKTYPE            dynamic or static linking
+      VERSION             module version number
+      EXE_FILES           any executables installed in a space seperated
+                          list
+  
+  =cut
+  
+  sub perllocal_install {
+      my($type, $name) = splice(@ARGV, 0, 2);
+  
+      # VMS feeds args as a piped file on STDIN since it usually can't
+      # fit all the args on a single command line.
+      my @mod_info = $Is_VMS ? split /\|/, <STDIN>
+                             : @ARGV;
+  
+      my $pod;
+      $pod = sprintf <<POD, scalar localtime;
+   =head2 %s: C<$type> L<$name|$name>
+  
+   =over 4
+  
+  POD
+  
+      do {
+          my($key, $val) = splice(@mod_info, 0, 2);
+  
+          $pod .= <<POD
+   =item *
+  
+   C<$key: $val>
+  
+  POD
+  
+      } while(@mod_info);
+  
+      $pod .= "=back\n\n";
+      $pod =~ s/^ //mg;
+      print $pod;
+  
+      return 1;
+  }
+  
+  =item B<uninstall>
+  
+      perl "-MExtUtils::Command::MM" -e uninstall <packlist>
+  
+  A wrapper around ExtUtils::Install::uninstall().  Warns that
+  uninstallation is deprecated and doesn't actually perform the
+  uninstallation.
+  
+  =cut
+  
+  sub uninstall {
+      my($packlist) = shift @ARGV;
+  
+      require ExtUtils::Install;
+  
+      print <<'WARNING';
+  
+  Uninstall is unsafe and deprecated, the uninstallation was not performed.
+  We will show what would have been done.
+  
+  WARNING
+  
+      ExtUtils::Install::uninstall($packlist, 1, 1);
+  
+      print <<'WARNING';
+  
+  Uninstall is unsafe and deprecated, the uninstallation was not performed.
+  Please check the list above carefully, there may be errors.
+  Remove the appropriate files manually.
+  Sorry for the inconvenience.
+  
+  WARNING
+  
+  }
+  
+  =item B<test_s>
+  
+     perl "-MExtUtils::Command::MM" -e test_s <file>
+  
+  Tests if a file exists and is not empty (size > 0).
+  I<Exits> with 0 if it does, 1 if it does not.
+  
+  =cut
+  
+  sub test_s {
+    exit(-s $ARGV[0] ? 0 : 1);
+  }
+  
+  =item B<cp_nonempty>
+  
+    perl "-MExtUtils::Command::MM" -e cp_nonempty <srcfile> <dstfile> <perm>
+  
+  Tests if the source file exists and is not empty (size > 0). If it is not empty
+  it copies it to the given destination with the given permissions.
+  
+  =back
+  
+  =cut
+  
+  sub cp_nonempty {
+    my @args = @ARGV;
+    return 0 unless -s $args[0];
+    require ExtUtils::Command;
+    {
+      local @ARGV = @args[0,1];
+      ExtUtils::Command::cp(@ARGV);
+    }
+    {
+      local @ARGV = @args[2,1];
+      ExtUtils::Command::chmod(@ARGV);
+    }
+  }
+  
+  
+  1;
+EXTUTILS_COMMAND_MM
+
+$fatpacked{"ExtUtils/Liblist.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_LIBLIST';
+  package ExtUtils::Liblist;
+  
+  use strict;
+  
+  our $VERSION = '7.04';
+  
+  use File::Spec;
+  require ExtUtils::Liblist::Kid;
+  our @ISA = qw(ExtUtils::Liblist::Kid File::Spec);
+  
+  # Backwards compatibility with old interface.
+  sub ext {
+      goto &ExtUtils::Liblist::Kid::ext;
+  }
+  
+  sub lsdir {
+    shift;
+    my $rex = qr/$_[1]/;
+    opendir DIR, $_[0];
+    my @out = grep /$rex/, readdir DIR;
+    closedir DIR;
+    return @out;
+  }
+  
+  __END__
+  
+  =head1 NAME
+  
+  ExtUtils::Liblist - determine libraries to use and how to use them
+  
+  =head1 SYNOPSIS
+  
+    require ExtUtils::Liblist;
+  
+    $MM->ext($potential_libs, $verbose, $need_names);
+  
+    # Usually you can get away with:
+    ExtUtils::Liblist->ext($potential_libs, $verbose, $need_names)
+  
+  =head1 DESCRIPTION
+  
+  This utility takes a list of libraries in the form C<-llib1 -llib2
+  -llib3> and returns lines suitable for inclusion in an extension
+  Makefile.  Extra library paths may be included with the form
+  C<-L/another/path> this will affect the searches for all subsequent
+  libraries.
+  
+  It returns an array of four or five scalar values: EXTRALIBS,
+  BSLOADLIBS, LDLOADLIBS, LD_RUN_PATH, and, optionally, a reference to
+  the array of the filenames of actual libraries.  Some of these don't
+  mean anything unless on Unix.  See the details about those platform
+  specifics below.  The list of the filenames is returned only if
+  $need_names argument is true.
+  
+  Dependent libraries can be linked in one of three ways:
+  
+  =over 2
+  
+  =item * For static extensions
+  
+  by the ld command when the perl binary is linked with the extension
+  library. See EXTRALIBS below.
+  
+  =item * For dynamic extensions at build/link time
+  
+  by the ld command when the shared object is built/linked. See
+  LDLOADLIBS below.
+  
+  =item * For dynamic extensions at load time
+  
+  by the DynaLoader when the shared object is loaded. See BSLOADLIBS
+  below.
+  
+  =back
+  
+  =head2 EXTRALIBS
+  
+  List of libraries that need to be linked with when linking a perl
+  binary which includes this extension. Only those libraries that
+  actually exist are included.  These are written to a file and used
+  when linking perl.
+  
+  =head2 LDLOADLIBS and LD_RUN_PATH
+  
+  List of those libraries which can or must be linked into the shared
+  library when created using ld. These may be static or dynamic
+  libraries.  LD_RUN_PATH is a colon separated list of the directories
+  in LDLOADLIBS. It is passed as an environment variable to the process
+  that links the shared library.
+  
+  =head2 BSLOADLIBS
+  
+  List of those libraries that are needed but can be linked in
+  dynamically at run time on this platform.  SunOS/Solaris does not need
+  this because ld records the information (from LDLOADLIBS) into the
+  object file.  This list is used to create a .bs (bootstrap) file.
+  
+  =head1 PORTABILITY
+  
+  This module deals with a lot of system dependencies and has quite a
+  few architecture specific C<if>s in the code.
+  
+  =head2 VMS implementation
+  
+  The version of ext() which is executed under VMS differs from the
+  Unix-OS/2 version in several respects:
+  
+  =over 2
+  
+  =item *
+  
+  Input library and path specifications are accepted with or without the
+  C<-l> and C<-L> prefixes used by Unix linkers.  If neither prefix is
+  present, a token is considered a directory to search if it is in fact
+  a directory, and a library to search for otherwise.  Authors who wish
+  their extensions to be portable to Unix or OS/2 should use the Unix
+  prefixes, since the Unix-OS/2 version of ext() requires them.
+  
+  =item *
+  
+  Wherever possible, shareable images are preferred to object libraries,
+  and object libraries to plain object files.  In accordance with VMS
+  naming conventions, ext() looks for files named I<lib>shr and I<lib>rtl;
+  it also looks for I<lib>lib and libI<lib> to accommodate Unix conventions
+  used in some ported software.
+  
+  =item *
+  
+  For each library that is found, an appropriate directive for a linker options
+  file is generated.  The return values are space-separated strings of
+  these directives, rather than elements used on the linker command line.
+  
+  =item *
+  
+  LDLOADLIBS contains both the libraries found based on C<$potential_libs> and
+  the CRTLs, if any, specified in Config.pm.  EXTRALIBS contains just those
+  libraries found based on C<$potential_libs>.  BSLOADLIBS and LD_RUN_PATH
+  are always empty.
+  
+  =back
+  
+  In addition, an attempt is made to recognize several common Unix library
+  names, and filter them out or convert them to their VMS equivalents, as
+  appropriate.
+  
+  In general, the VMS version of ext() should properly handle input from
+  extensions originally designed for a Unix or VMS environment.  If you
+  encounter problems, or discover cases where the search could be improved,
+  please let us know.
+  
+  =head2 Win32 implementation
+  
+  The version of ext() which is executed under Win32 differs from the
+  Unix-OS/2 version in several respects:
+  
+  =over 2
+  
+  =item *
+  
+  If C<$potential_libs> is empty, the return value will be empty.
+  Otherwise, the libraries specified by C<$Config{perllibs}> (see Config.pm)
+  will be appended to the list of C<$potential_libs>.  The libraries
+  will be searched for in the directories specified in C<$potential_libs>,
+  C<$Config{libpth}>, and in C<$Config{installarchlib}/CORE>.
+  For each library that is found,  a space-separated list of fully qualified
+  library pathnames is generated.
+  
+  =item *
+  
+  Input library and path specifications are accepted with or without the
+  C<-l> and C<-L> prefixes used by Unix linkers.
+  
+  An entry of the form C<-La:\foo> specifies the C<a:\foo> directory to look
+  for the libraries that follow.
+  
+  An entry of the form C<-lfoo> specifies the library C<foo>, which may be
+  spelled differently depending on what kind of compiler you are using.  If
+  you are using GCC, it gets translated to C<libfoo.a>, but for other win32
+  compilers, it becomes C<foo.lib>.  If no files are found by those translated
+  names, one more attempt is made to find them using either C<foo.a> or
+  C<libfoo.lib>, depending on whether GCC or some other win32 compiler is
+  being used, respectively.
+  
+  If neither the C<-L> or C<-l> prefix is present in an entry, the entry is
+  considered a directory to search if it is in fact a directory, and a
+  library to search for otherwise.  The C<$Config{lib_ext}> suffix will
+  be appended to any entries that are not directories and don't already have
+  the suffix.
+  
+  Note that the C<-L> and C<-l> prefixes are B<not required>, but authors
+  who wish their extensions to be portable to Unix or OS/2 should use the
+  prefixes, since the Unix-OS/2 version of ext() requires them.
+  
+  =item *
+  
+  Entries cannot be plain object files, as many Win32 compilers will
+  not handle object files in the place of libraries.
+  
+  =item *
+  
+  Entries in C<$potential_libs> beginning with a colon and followed by
+  alphanumeric characters are treated as flags.  Unknown flags will be ignored.
+  
+  An entry that matches C</:nodefault/i> disables the appending of default
+  libraries found in C<$Config{perllibs}> (this should be only needed very rarely).
+  
+  An entry that matches C</:nosearch/i> disables all searching for
+  the libraries specified after it.  Translation of C<-Lfoo> and
+  C<-lfoo> still happens as appropriate (depending on compiler being used,
+  as reflected by C<$Config{cc}>), but the entries are not verified to be
+  valid files or directories.
+  
+  An entry that matches C</:search/i> reenables searching for
+  the libraries specified after it.  You can put it at the end to
+  enable searching for default libraries specified by C<$Config{perllibs}>.
+  
+  =item *
+  
+  The libraries specified may be a mixture of static libraries and
+  import libraries (to link with DLLs).  Since both kinds are used
+  pretty transparently on the Win32 platform, we do not attempt to
+  distinguish between them.
+  
+  =item *
+  
+  LDLOADLIBS and EXTRALIBS are always identical under Win32, and BSLOADLIBS
+  and LD_RUN_PATH are always empty (this may change in future).
+  
+  =item *
+  
+  You must make sure that any paths and path components are properly
+  surrounded with double-quotes if they contain spaces. For example,
+  C<$potential_libs> could be (literally):
+  
+  	"-Lc:\Program Files\vc\lib" msvcrt.lib "la test\foo bar.lib"
+  
+  Note how the first and last entries are protected by quotes in order
+  to protect the spaces.
+  
+  =item *
+  
+  Since this module is most often used only indirectly from extension
+  C<Makefile.PL> files, here is an example C<Makefile.PL> entry to add
+  a library to the build process for an extension:
+  
+          LIBS => ['-lgl']
+  
+  When using GCC, that entry specifies that MakeMaker should first look
+  for C<libgl.a> (followed by C<gl.a>) in all the locations specified by
+  C<$Config{libpth}>.
+  
+  When using a compiler other than GCC, the above entry will search for
+  C<gl.lib> (followed by C<libgl.lib>).
+  
+  If the library happens to be in a location not in C<$Config{libpth}>,
+  you need:
+  
+          LIBS => ['-Lc:\gllibs -lgl']
+  
+  Here is a less often used example:
+  
+          LIBS => ['-lgl', ':nosearch -Ld:\mesalibs -lmesa -luser32']
+  
+  This specifies a search for library C<gl> as before.  If that search
+  fails to find the library, it looks at the next item in the list. The
+  C<:nosearch> flag will prevent searching for the libraries that follow,
+  so it simply returns the value as C<-Ld:\mesalibs -lmesa -luser32>,
+  since GCC can use that value as is with its linker.
+  
+  When using the Visual C compiler, the second item is returned as
+  C<-libpath:d:\mesalibs mesa.lib user32.lib>.
+  
+  When using the Borland compiler, the second item is returned as
+  C<-Ld:\mesalibs mesa.lib user32.lib>, and MakeMaker takes care of
+  moving the C<-Ld:\mesalibs> to the correct place in the linker
+  command line.
+  
+  =back
+  
+  
+  =head1 SEE ALSO
+  
+  L<ExtUtils::MakeMaker>
+  
+  =cut
+  
+EXTUTILS_LIBLIST
+
+$fatpacked{"ExtUtils/Liblist/Kid.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_LIBLIST_KID';
+  package ExtUtils::Liblist::Kid;
+  
+  # XXX Splitting this out into its own .pm is a temporary solution.
+  
+  # This kid package is to be used by MakeMaker.  It will not work if
+  # $self is not a Makemaker.
+  
+  use 5.006;
+  
+  # Broken out of MakeMaker from version 4.11
+  
+  use strict;
+  use warnings;
+  our $VERSION = '7.04';
+  
+  use ExtUtils::MakeMaker::Config;
+  use Cwd 'cwd';
+  use File::Basename;
+  use File::Spec;
+  
+  sub ext {
+      if    ( $^O eq 'VMS' )     { return &_vms_ext; }
+      elsif ( $^O eq 'MSWin32' ) { return &_win32_ext; }
+      else                       { return &_unix_os2_ext; }
+  }
+  
+  sub _unix_os2_ext {
+      my ( $self, $potential_libs, $verbose, $give_libs ) = @_;
+      $verbose ||= 0;
+  
+      if ( $^O =~ /os2|android/ and $Config{perllibs} ) {
+  
+          # Dynamic libraries are not transitive, so we may need including
+          # the libraries linked against perl.dll/libperl.so again.
+  
+          $potential_libs .= " " if $potential_libs;
+          $potential_libs .= $Config{perllibs};
+      }
+      return ( "", "", "", "", ( $give_libs ? [] : () ) ) unless $potential_libs;
+      warn "Potential libraries are '$potential_libs':\n" if $verbose;
+  
+      my ( $so ) = $Config{so};
+      my ( $libs ) = defined $Config{perllibs} ? $Config{perllibs} : $Config{libs};
+      my $Config_libext = $Config{lib_ext} || ".a";
+      my $Config_dlext = $Config{dlext};
+  
+      # compute $extralibs, $bsloadlibs and $ldloadlibs from
+      # $potential_libs
+      # this is a rewrite of Andy Dougherty's extliblist in perl
+  
+      my ( @searchpath );    # from "-L/path" entries in $potential_libs
+      my ( @libpath ) = split " ", $Config{'libpth'} || '';
+      my ( @ldloadlibs, @bsloadlibs, @extralibs, @ld_run_path, %ld_run_path_seen );
+      my ( @libs,       %libs_seen );
+      my ( $fullname,   @fullname );
+      my ( $pwd )   = cwd();    # from Cwd.pm
+      my ( $found ) = 0;
+  
+      foreach my $thislib ( split ' ', $potential_libs ) {
+          my ( $custom_name ) = '';
+  
+          # Handle possible linker path arguments.
+          if ( $thislib =~ s/^(-[LR]|-Wl,-R|-Wl,-rpath,)// ) {    # save path flag type
+              my ( $ptype ) = $1;
+              unless ( -d $thislib ) {
+                  warn "$ptype$thislib ignored, directory does not exist\n"
+                    if $verbose;
+                  next;
+              }
+              my ( $rtype ) = $ptype;
+              if ( ( $ptype eq '-R' ) or ( $ptype =~ m!^-Wl,-[Rr]! ) ) {
+                  if ( $Config{'lddlflags'} =~ /-Wl,-[Rr]/ ) {
+                      $rtype = '-Wl,-R';
+                  }
+                  elsif ( $Config{'lddlflags'} =~ /-R/ ) {
+                      $rtype = '-R';
+                  }
+              }
+              unless ( File::Spec->file_name_is_absolute( $thislib ) ) {
+                  warn "Warning: $ptype$thislib changed to $ptype$pwd/$thislib\n";
+                  $thislib = $self->catdir( $pwd, $thislib );
+              }
+              push( @searchpath, $thislib );
+              push( @extralibs,  "$ptype$thislib" );
+              push( @ldloadlibs, "$rtype$thislib" );
+              next;
+          }
+  
+          if ( $thislib =~ m!^-Wl,! ) {
+              push( @extralibs,  $thislib );
+              push( @ldloadlibs, $thislib );
+              next;
+          }
+  
+          # Handle possible library arguments.
+          if ( $thislib =~ s/^-l(:)?// ) {
+              # Handle -l:foo.so, which means that the library will
+              # actually be called foo.so, not libfoo.so.  This
+              # is used in Android by ExtUtils::Depends to allow one XS
+              # module to link to another.
+              $custom_name = $1 || '';
+          }
+          else {
+              warn "Unrecognized argument in LIBS ignored: '$thislib'\n";
+              next;
+          }
+  
+          my ( $found_lib ) = 0;
+          foreach my $thispth ( @searchpath, @libpath ) {
+  
+              # Try to find the full name of the library.  We need this to
+              # determine whether it's a dynamically-loadable library or not.
+              # This tends to be subject to various os-specific quirks.
+              # For gcc-2.6.2 on linux (March 1995), DLD can not load
+              # .sa libraries, with the exception of libm.sa, so we
+              # deliberately skip them.
+              if ((@fullname =
+                   $self->lsdir($thispth, "^\Qlib$thislib.$so.\E[0-9]+")) ||
+                  (@fullname =
+                   $self->lsdir($thispth, "^\Qlib$thislib.\E[0-9]+\Q\.$so"))) {
+                  # Take care that libfoo.so.10 wins against libfoo.so.9.
+                  # Compare two libraries to find the most recent version
+                  # number.  E.g.  if you have libfoo.so.9.0.7 and
+                  # libfoo.so.10.1, first convert all digits into two
+                  # decimal places.  Then we'll add ".00" to the shorter
+                  # strings so that we're comparing strings of equal length
+                  # Thus we'll compare libfoo.so.09.07.00 with
+                  # libfoo.so.10.01.00.  Some libraries might have letters
+                  # in the version.  We don't know what they mean, but will
+                  # try to skip them gracefully -- we'll set any letter to
+                  # '0'.  Finally, sort in reverse so we can take the
+                  # first element.
+  
+                  #TODO: iterate through the directory instead of sorting
+  
+                  $fullname = "$thispth/" . (
+                      sort {
+                          my ( $ma ) = $a;
+                          my ( $mb ) = $b;
+                          $ma =~ tr/A-Za-z/0/s;
+                          $ma =~ s/\b(\d)\b/0$1/g;
+                          $mb =~ tr/A-Za-z/0/s;
+                          $mb =~ s/\b(\d)\b/0$1/g;
+                          while ( length( $ma ) < length( $mb ) ) { $ma .= ".00"; }
+                          while ( length( $mb ) < length( $ma ) ) { $mb .= ".00"; }
+  
+                          # Comparison deliberately backwards
+                          $mb cmp $ma;
+                        } @fullname
+                  )[0];
+              }
+              elsif ( -f ( $fullname = "$thispth/lib$thislib.$so" )
+                  && ( ( $Config{'dlsrc'} ne "dl_dld.xs" ) || ( $thislib eq "m" ) ) )
+              {
+              }
+              elsif (-f ( $fullname = "$thispth/lib${thislib}_s$Config_libext" )
+                  && ( $Config{'archname'} !~ /RM\d\d\d-svr4/ )
+                  && ( $thislib .= "_s" ) )
+              {    # we must explicitly use _s version
+              }
+              elsif ( -f ( $fullname = "$thispth/lib$thislib$Config_libext" ) ) {
+              }
+              elsif ( defined( $Config_dlext )
+                  && -f ( $fullname = "$thispth/lib$thislib.$Config_dlext" ) )
+              {
+              }
+              elsif ( -f ( $fullname = "$thispth/$thislib$Config_libext" ) ) {
+              }
+              elsif ( -f ( $fullname = "$thispth/lib$thislib.dll$Config_libext" ) ) {
+              }
+              elsif ( $^O eq 'cygwin' && -f ( $fullname = "$thispth/$thislib.dll" ) ) {
+              }
+              elsif ( -f ( $fullname = "$thispth/Slib$thislib$Config_libext" ) ) {
+              }
+              elsif ($^O eq 'dgux'
+                  && -l ( $fullname = "$thispth/lib$thislib$Config_libext" )
+                  && readlink( $fullname ) =~ /^elink:/s )
+              {
+  
+                  # Some of DG's libraries look like misconnected symbolic
+                  # links, but development tools can follow them.  (They
+                  # look like this:
+                  #
+                  #    libm.a -> elink:${SDE_PATH:-/usr}/sde/\
+                  #    ${TARGET_BINARY_INTERFACE:-m88kdgux}/usr/lib/libm.a
+                  #
+                  # , the compilation tools expand the environment variables.)
+              }
+              elsif ( $custom_name && -f ( $fullname = "$thispth/$thislib" ) ) {
+              }
+              else {
+                  warn "$thislib not found in $thispth\n" if $verbose;
+                  next;
+              }
+              warn "'-l$thislib' found at $fullname\n" if $verbose;
+              push @libs, $fullname unless $libs_seen{$fullname}++;
+              $found++;
+              $found_lib++;
+  
+              # Now update library lists
+  
+              # what do we know about this library...
+              my $is_dyna = ( $fullname !~ /\Q$Config_libext\E\z/ );
+              my $in_perl = ( $libs =~ /\B-l:?\Q${thislib}\E\b/s );
+  
+              # include the path to the lib once in the dynamic linker path
+              # but only if it is a dynamic lib and not in Perl itself
+              my ( $fullnamedir ) = dirname( $fullname );
+              push @ld_run_path, $fullnamedir
+                if $is_dyna
+                    && !$in_perl
+                    && !$ld_run_path_seen{$fullnamedir}++;
+  
+              # Do not add it into the list if it is already linked in
+              # with the main perl executable.
+              # We have to special-case the NeXT, because math and ndbm
+              # are both in libsys_s
+              unless (
+                  $in_perl
+                  || ( $Config{'osname'} eq 'next'
+                      && ( $thislib eq 'm' || $thislib eq 'ndbm' ) )
+                )
+              {
+                  push( @extralibs, "-l$custom_name$thislib" );
+              }
+  
+              # We might be able to load this archive file dynamically
+              if (   ( $Config{'dlsrc'} =~ /dl_next/ && $Config{'osvers'} lt '4_0' )
+                  || ( $Config{'dlsrc'} =~ /dl_dld/ ) )
+              {
+  
+                  # We push -l$thislib instead of $fullname because
+                  # it avoids hardwiring a fixed path into the .bs file.
+                  # Mkbootstrap will automatically add dl_findfile() to
+                  # the .bs file if it sees a name in the -l format.
+                  # USE THIS, when dl_findfile() is fixed:
+                  # push(@bsloadlibs, "-l$thislib");
+                  # OLD USE WAS while checking results against old_extliblist
+                  push( @bsloadlibs, "$fullname" );
+              }
+              else {
+                  if ( $is_dyna ) {
+  
+                      # For SunOS4, do not add in this shared library if
+                      # it is already linked in the main perl executable
+                      push( @ldloadlibs, "-l$custom_name$thislib" )
+                        unless ( $in_perl and $^O eq 'sunos' );
+                  }
+                  else {
+                      push( @ldloadlibs, "-l$custom_name$thislib" );
+                  }
+              }
+              last;    # found one here so don't bother looking further
+          }
+          warn "Warning (mostly harmless): " . "No library found for -l$thislib\n"
+            unless $found_lib > 0;
+      }
+  
+      unless ( $found ) {
+          return ( '', '', '', '', ( $give_libs ? \@libs : () ) );
+      }
+      else {
+          return ( "@extralibs", "@bsloadlibs", "@ldloadlibs", join( ":", @ld_run_path ), ( $give_libs ? \@libs : () ) );
+      }
+  }
+  
+  sub _win32_ext {
+  
+      require Text::ParseWords;
+  
+      my ( $self, $potential_libs, $verbose, $give_libs ) = @_;
+      $verbose ||= 0;
+  
+      # If user did not supply a list, we punt.
+      # (caller should probably use the list in $Config{libs})
+      return ( "", "", "", "", ( $give_libs ? [] : () ) ) unless $potential_libs;
+  
+      # TODO: make this use MM_Win32.pm's compiler detection
+      my %libs_seen;
+      my @extralibs;
+      my $cc = $Config{cc} || '';
+      my $VC = $cc =~ /\bcl\b/i;
+      my $GC = $cc =~ /\bgcc\b/i;
+  
+      my $libext     = _win32_lib_extensions();
+      my @searchpath = ( '' );                                    # from "-L/path" entries in $potential_libs
+      my @libpath    = _win32_default_search_paths( $VC, $GC );
+      my $pwd        = cwd();                                     # from Cwd.pm
+      my $search     = 1;
+  
+      # compute @extralibs from $potential_libs
+      my @lib_search_list = _win32_make_lib_search_list( $potential_libs, $verbose );
+      for ( @lib_search_list ) {
+  
+          my $thislib = $_;
+  
+          # see if entry is a flag
+          if ( /^:\w+$/ ) {
+              $search = 0 if lc eq ':nosearch';
+              $search = 1 if lc eq ':search';
+              _debug( "Ignoring unknown flag '$thislib'\n", $verbose ) if !/^:(no)?(search|default)$/i;
+              next;
+          }
+  
+          # if searching is disabled, do compiler-specific translations
+          unless ( $search ) {
+              s/^-l(.+)$/$1.lib/ unless $GC;
+              s/^-L/-libpath:/ if $VC;
+              push( @extralibs, $_ );
+              next;
+          }
+  
+          # handle possible linker path arguments
+          if ( s/^-L// and not -d ) {
+              _debug( "$thislib ignored, directory does not exist\n", $verbose );
+              next;
+          }
+          elsif ( -d ) {
+              unless ( File::Spec->file_name_is_absolute( $_ ) ) {
+                  warn "Warning: '$thislib' changed to '-L$pwd/$_'\n";
+                  $_ = $self->catdir( $pwd, $_ );
+              }
+              push( @searchpath, $_ );
+              next;
+          }
+  
+          my @paths = ( @searchpath, @libpath );
+          my ( $fullname, $path ) = _win32_search_file( $thislib, $libext, \@paths, $verbose, $GC );
+  
+          if ( !$fullname ) {
+              warn "Warning (mostly harmless): No library found for $thislib\n";
+              next;
+          }
+  
+          _debug( "'$thislib' found as '$fullname'\n", $verbose );
+          push( @extralibs, $fullname );
+          $libs_seen{$fullname} = 1 if $path;    # why is this a special case?
+      }
+  
+      my @libs = keys %libs_seen;
+  
+      return ( '', '', '', '', ( $give_libs ? \@libs : () ) ) unless @extralibs;
+  
+      # make sure paths with spaces are properly quoted
+      @extralibs = map { qq["$_"] } @extralibs;
+      @libs      = map { qq["$_"] } @libs;
+  
+      my $lib = join( ' ', @extralibs );
+  
+      # normalize back to backward slashes (to help braindead tools)
+      # XXX this may break equally braindead GNU tools that don't understand
+      # backslashes, either.  Seems like one can't win here.  Cursed be CP/M.
+      $lib =~ s,/,\\,g;
+  
+      _debug( "Result: $lib\n", $verbose );
+      wantarray ? ( $lib, '', $lib, '', ( $give_libs ? \@libs : () ) ) : $lib;
+  }
+  
+  sub _win32_make_lib_search_list {
+      my ( $potential_libs, $verbose ) = @_;
+  
+      # If Config.pm defines a set of default libs, we always
+      # tack them on to the user-supplied list, unless the user
+      # specified :nodefault
+      my $libs = $Config{'perllibs'};
+      $potential_libs = join( ' ', $potential_libs, $libs ) if $libs and $potential_libs !~ /:nodefault/i;
+      _debug( "Potential libraries are '$potential_libs':\n", $verbose );
+  
+      $potential_libs =~ s,\\,/,g;    # normalize to forward slashes
+  
+      my @list = Text::ParseWords::quotewords( '\s+', 0, $potential_libs );
+  
+      return @list;
+  }
+  
+  sub _win32_default_search_paths {
+      my ( $VC, $GC ) = @_;
+  
+      my $libpth = $Config{'libpth'} || '';
+      $libpth =~ s,\\,/,g;            # normalize to forward slashes
+  
+      my @libpath = Text::ParseWords::quotewords( '\s+', 0, $libpth );
+      push @libpath, "$Config{installarchlib}/CORE";    # add "$Config{installarchlib}/CORE" to default search path
+  
+      push @libpath, split /;/, $ENV{LIB}          if $VC and $ENV{LIB};
+      push @libpath, split /;/, $ENV{LIBRARY_PATH} if $GC and $ENV{LIBRARY_PATH};
+  
+      return @libpath;
+  }
+  
+  sub _win32_search_file {
+      my ( $thislib, $libext, $paths, $verbose, $GC ) = @_;
+  
+      my @file_list = _win32_build_file_list( $thislib, $GC, $libext );
+  
+      for my $lib_file ( @file_list ) {
+          for my $path ( @{$paths} ) {
+              my $fullname = $lib_file;
+              $fullname = "$path\\$fullname" if $path;
+  
+              return ( $fullname, $path ) if -f $fullname;
+  
+              _debug( "'$thislib' not found as '$fullname'\n", $verbose );
+          }
+      }
+  
+      return;
+  }
+  
+  sub _win32_build_file_list {
+      my ( $lib, $GC, $extensions ) = @_;
+  
+      my @pre_fixed = _win32_build_prefixed_list( $lib, $GC );
+      return map _win32_attach_extensions( $_, $extensions ), @pre_fixed;
+  }
+  
+  sub _win32_build_prefixed_list {
+      my ( $lib, $GC ) = @_;
+  
+      return $lib if $lib !~ s/^-l//;
+      return $lib if $lib =~ /^lib/ and !$GC;
+  
+      ( my $no_prefix = $lib ) =~ s/^lib//i;
+      $lib = "lib$lib" if $no_prefix eq $lib;
+  
+      return ( $lib, $no_prefix ) if $GC;
+      return ( $no_prefix, $lib );
+  }
+  
+  sub _win32_attach_extensions {
+      my ( $lib, $extensions ) = @_;
+      return map _win32_try_attach_extension( $lib, $_ ), @{$extensions};
+  }
+  
+  sub _win32_try_attach_extension {
+      my ( $lib, $extension ) = @_;
+  
+      return $lib if $lib =~ /\Q$extension\E$/i;
+      return "$lib$extension";
+  }
+  
+  sub _win32_lib_extensions {
+      my @extensions;
+      push @extensions, $Config{'lib_ext'} if $Config{'lib_ext'};
+      push @extensions, '.dll.a' if grep { m!^\.a$! } @extensions;
+      push @extensions, '.lib' unless grep { m!^\.lib$! } @extensions;
+      return \@extensions;
+  }
+  
+  sub _debug {
+      my ( $message, $verbose ) = @_;
+      return if !$verbose;
+      warn $message;
+      return;
+  }
+  
+  sub _vms_ext {
+      my ( $self, $potential_libs, $verbose, $give_libs ) = @_;
+      $verbose ||= 0;
+  
+      my ( @crtls, $crtlstr );
+      @crtls = ( ( $Config{'ldflags'} =~ m-/Debug-i ? $Config{'dbgprefix'} : '' ) . 'PerlShr/Share' );
+      push( @crtls, grep { not /\(/ } split /\s+/, $Config{'perllibs'} );
+      push( @crtls, grep { not /\(/ } split /\s+/, $Config{'libc'} );
+  
+      # In general, we pass through the basic libraries from %Config unchanged.
+      # The one exception is that if we're building in the Perl source tree, and
+      # a library spec could be resolved via a logical name, we go to some trouble
+      # to insure that the copy in the local tree is used, rather than one to
+      # which a system-wide logical may point.
+      if ( $self->{PERL_SRC} ) {
+          my ( $locspec, $type );
+          foreach my $lib ( @crtls ) {
+              if ( ( $locspec, $type ) = $lib =~ m{^([\w\$-]+)(/\w+)?} and $locspec =~ /perl/i ) {
+                  if    ( lc $type eq '/share' )   { $locspec .= $Config{'exe_ext'}; }
+                  elsif ( lc $type eq '/library' ) { $locspec .= $Config{'lib_ext'}; }
+                  else                             { $locspec .= $Config{'obj_ext'}; }
+                  $locspec = $self->catfile( $self->{PERL_SRC}, $locspec );
+                  $lib = "$locspec$type" if -e $locspec;
+              }
+          }
+      }
+      $crtlstr = @crtls ? join( ' ', @crtls ) : '';
+  
+      unless ( $potential_libs ) {
+          warn "Result:\n\tEXTRALIBS: \n\tLDLOADLIBS: $crtlstr\n" if $verbose;
+          return ( '', '', $crtlstr, '', ( $give_libs ? [] : () ) );
+      }
+  
+      my ( %found, @fndlibs, $ldlib );
+      my $cwd = cwd();
+      my ( $so, $lib_ext, $obj_ext ) = @Config{ 'so', 'lib_ext', 'obj_ext' };
+  
+      # List of common Unix library names and their VMS equivalents
+      # (VMS equivalent of '' indicates that the library is automatically
+      # searched by the linker, and should be skipped here.)
+      my ( @flibs, %libs_seen );
+      my %libmap = (
+          'm'      => '',
+          'f77'    => '',
+          'F77'    => '',
+          'V77'    => '',
+          'c'      => '',
+          'malloc' => '',
+          'crypt'  => '',
+          'resolv' => '',
+          'c_s'    => '',
+          'socket' => '',
+          'X11'    => 'DECW$XLIBSHR',
+          'Xt'     => 'DECW$XTSHR',
+          'Xm'     => 'DECW$XMLIBSHR',
+          'Xmu'    => 'DECW$XMULIBSHR'
+      );
+  
+      warn "Potential libraries are '$potential_libs'\n" if $verbose;
+  
+      # First, sort out directories and library names in the input
+      my ( @dirs, @libs );
+      foreach my $lib ( split ' ', $potential_libs ) {
+          push( @dirs, $1 ),   next if $lib =~ /^-L(.*)/;
+          push( @dirs, $lib ), next if $lib =~ /[:>\]]$/;
+          push( @dirs, $lib ), next if -d $lib;
+          push( @libs, $1 ),   next if $lib =~ /^-l(.*)/;
+          push( @libs, $lib );
+      }
+      push( @dirs, split( ' ', $Config{'libpth'} ) );
+  
+      # Now make sure we've got VMS-syntax absolute directory specs
+      # (We don't, however, check whether someone's hidden a relative
+      # path in a logical name.)
+      foreach my $dir ( @dirs ) {
+          unless ( -d $dir ) {
+              warn "Skipping nonexistent Directory $dir\n" if $verbose > 1;
+              $dir = '';
+              next;
+          }
+          warn "Resolving directory $dir\n" if $verbose;
+          if ( File::Spec->file_name_is_absolute( $dir ) ) {
+              $dir = VMS::Filespec::vmspath( $dir );
+          }
+          else {
+              $dir = $self->catdir( $cwd, $dir );
+          }
+      }
+      @dirs = grep { length( $_ ) } @dirs;
+      unshift( @dirs, '' );    # Check each $lib without additions first
+  
+    LIB: foreach my $lib ( @libs ) {
+          if ( exists $libmap{$lib} ) {
+              next unless length $libmap{$lib};
+              $lib = $libmap{$lib};
+          }
+  
+          my ( @variants, $cand );
+          my ( $ctype ) = '';
+  
+          # If we don't have a file type, consider it a possibly abbreviated name and
+          # check for common variants.  We try these first to grab libraries before
+          # a like-named executable image (e.g. -lperl resolves to perlshr.exe
+          # before perl.exe).
+          if ( $lib !~ /\.[^:>\]]*$/ ) {
+              push( @variants, "${lib}shr", "${lib}rtl", "${lib}lib" );
+              push( @variants, "lib$lib" ) if $lib !~ /[:>\]]/;
+          }
+          push( @variants, $lib );
+          warn "Looking for $lib\n" if $verbose;
+          foreach my $variant ( @variants ) {
+              my ( $fullname, $name );
+  
+              foreach my $dir ( @dirs ) {
+                  my ( $type );
+  
+                  $name = "$dir$variant";
+                  warn "\tChecking $name\n" if $verbose > 2;
+                  $fullname = VMS::Filespec::rmsexpand( $name );
+                  if ( defined $fullname and -f $fullname ) {
+  
+                      # It's got its own suffix, so we'll have to figure out the type
+                      if    ( $fullname =~ /(?:$so|exe)$/i )      { $type = 'SHR'; }
+                      elsif ( $fullname =~ /(?:$lib_ext|olb)$/i ) { $type = 'OLB'; }
+                      elsif ( $fullname =~ /(?:$obj_ext|obj)$/i ) {
+                          warn "Warning (mostly harmless): " . "Plain object file $fullname found in library list\n";
+                          $type = 'OBJ';
+                      }
+                      else {
+                          warn "Warning (mostly harmless): " . "Unknown library type for $fullname; assuming shared\n";
+                          $type = 'SHR';
+                      }
+                  }
+                  elsif (-f ( $fullname = VMS::Filespec::rmsexpand( $name, $so ) )
+                      or -f ( $fullname = VMS::Filespec::rmsexpand( $name, '.exe' ) ) )
+                  {
+                      $type = 'SHR';
+                      $name = $fullname unless $fullname =~ /exe;?\d*$/i;
+                  }
+                  elsif (
+                      not length( $ctype ) and    # If we've got a lib already,
+                                                  # don't bother
+                      ( -f ( $fullname = VMS::Filespec::rmsexpand( $name, $lib_ext ) ) or -f ( $fullname = VMS::Filespec::rmsexpand( $name, '.olb' ) ) )
+                    )
+                  {
+                      $type = 'OLB';
+                      $name = $fullname unless $fullname =~ /olb;?\d*$/i;
+                  }
+                  elsif (
+                      not length( $ctype ) and    # If we've got a lib already,
+                                                  # don't bother
+                      ( -f ( $fullname = VMS::Filespec::rmsexpand( $name, $obj_ext ) ) or -f ( $fullname = VMS::Filespec::rmsexpand( $name, '.obj' ) ) )
+                    )
+                  {
+                      warn "Warning (mostly harmless): " . "Plain object file $fullname found in library list\n";
+                      $type = 'OBJ';
+                      $name = $fullname unless $fullname =~ /obj;?\d*$/i;
+                  }
+                  if ( defined $type ) {
+                      $ctype = $type;
+                      $cand  = $name;
+                      last if $ctype eq 'SHR';
+                  }
+              }
+              if ( $ctype ) {
+  
+                  push @{ $found{$ctype} }, $cand;
+                  warn "\tFound as $cand (really $fullname), type $ctype\n"
+                    if $verbose > 1;
+                  push @flibs, $name unless $libs_seen{$fullname}++;
+                  next LIB;
+              }
+          }
+          warn "Warning (mostly harmless): " . "No library found for $lib\n";
+      }
+  
+      push @fndlibs, @{ $found{OBJ} } if exists $found{OBJ};
+      push @fndlibs, map { "$_/Library" } @{ $found{OLB} } if exists $found{OLB};
+      push @fndlibs, map { "$_/Share" } @{ $found{SHR} }   if exists $found{SHR};
+      my $lib = join( ' ', @fndlibs );
+  
+      $ldlib = $crtlstr ? "$lib $crtlstr" : $lib;
+      $ldlib =~ s/^\s+|\s+$//g;
+      warn "Result:\n\tEXTRALIBS: $lib\n\tLDLOADLIBS: $ldlib\n" if $verbose;
+      wantarray ? ( $lib, '', $ldlib, '', ( $give_libs ? \@flibs : () ) ) : $lib;
+  }
+  
+  1;
+EXTUTILS_LIBLIST_KID
+
+$fatpacked{"ExtUtils/MM.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_MM';
+  package ExtUtils::MM;
+  
+  use strict;
+  use ExtUtils::MakeMaker::Config;
+  
+  our $VERSION = '7.04';
+  
+  require ExtUtils::Liblist;
+  require ExtUtils::MakeMaker;
+  our @ISA = qw(ExtUtils::Liblist ExtUtils::MakeMaker);
+  
+  =head1 NAME
+  
+  ExtUtils::MM - OS adjusted ExtUtils::MakeMaker subclass
+  
+  =head1 SYNOPSIS
+  
+    require ExtUtils::MM;
+    my $mm = MM->new(...);
+  
+  =head1 DESCRIPTION
+  
+  B<FOR INTERNAL USE ONLY>
+  
+  ExtUtils::MM is a subclass of ExtUtils::MakeMaker which automatically
+  chooses the appropriate OS specific subclass for you
+  (ie. ExtUils::MM_Unix, etc...).
+  
+  It also provides a convenient alias via the MM class (I didn't want
+  MakeMaker modules outside of ExtUtils/).
+  
+  This class might turn out to be a temporary solution, but MM won't go
+  away.
+  
+  =cut
+  
+  {
+      # Convenient alias.
+      package MM;
+      our @ISA = qw(ExtUtils::MM);
+      sub DESTROY {}
+  }
+  
+  sub _is_win95 {
+      # miniperl might not have the Win32 functions available and we need
+      # to run in miniperl.
+      my $have_win32 = eval { require Win32 };
+      return $have_win32 && defined &Win32::IsWin95 ? Win32::IsWin95()
+                                                    : ! defined $ENV{SYSTEMROOT};
+  }
+  
+  my %Is = ();
+  $Is{VMS}    = $^O eq 'VMS';
+  $Is{OS2}    = $^O eq 'os2';
+  $Is{MacOS}  = $^O eq 'MacOS';
+  if( $^O eq 'MSWin32' ) {
+      _is_win95() ? $Is{Win95} = 1 : $Is{Win32} = 1;
+  }
+  $Is{UWIN}   = $^O =~ /^uwin(-nt)?$/;
+  $Is{Cygwin} = $^O eq 'cygwin';
+  $Is{NW5}    = $Config{osname} eq 'NetWare';  # intentional
+  $Is{BeOS}   = ($^O =~ /beos/i or $^O eq 'haiku');
+  $Is{DOS}    = $^O eq 'dos';
+  if( $Is{NW5} ) {
+      $^O = 'NetWare';
+      delete $Is{Win32};
+  }
+  $Is{VOS}    = $^O eq 'vos';
+  $Is{QNX}    = $^O eq 'qnx';
+  $Is{AIX}    = $^O eq 'aix';
+  $Is{Darwin} = $^O eq 'darwin';
+  
+  $Is{Unix}   = !grep { $_ } values %Is;
+  
+  map { delete $Is{$_} unless $Is{$_} } keys %Is;
+  _assert( keys %Is == 1 );
+  my($OS) = keys %Is;
+  
+  
+  my $class = "ExtUtils::MM_$OS";
+  eval "require $class" unless $INC{"ExtUtils/MM_$OS.pm"}; ## no critic
+  die $@ if $@;
+  unshift @ISA, $class;
+  
+  
+  sub _assert {
+      my $sanity = shift;
+      die sprintf "Assert failed at %s line %d\n", (caller)[1,2] unless $sanity;
+      return;
+  }
+EXTUTILS_MM
+
+$fatpacked{"ExtUtils/MM_AIX.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_MM_AIX';
+  package ExtUtils::MM_AIX;
+  
+  use strict;
+  our $VERSION = '7.04';
+  
+  require ExtUtils::MM_Unix;
+  our @ISA = qw(ExtUtils::MM_Unix);
+  
+  use ExtUtils::MakeMaker qw(neatvalue);
+  
+  
+  =head1 NAME
+  
+  ExtUtils::MM_AIX - AIX specific subclass of ExtUtils::MM_Unix
+  
+  =head1 SYNOPSIS
+  
+    Don't use this module directly.
+    Use ExtUtils::MM and let it choose.
+  
+  =head1 DESCRIPTION
+  
+  This is a subclass of ExtUtils::MM_Unix which contains functionality for
+  AIX.
+  
+  Unless otherwise stated it works just like ExtUtils::MM_Unix
+  
+  =head2 Overridden methods
+  
+  =head3 dlsyms
+  
+  Define DL_FUNCS and DL_VARS and write the *.exp files.
+  
+  =cut
+  
+  sub dlsyms {
+      my($self,%attribs) = @_;
+  
+      return '' unless $self->needs_linking();
+  
+      my($funcs) = $attribs{DL_FUNCS} || $self->{DL_FUNCS} || {};
+      my($vars)  = $attribs{DL_VARS} || $self->{DL_VARS} || [];
+      my($funclist)  = $attribs{FUNCLIST} || $self->{FUNCLIST} || [];
+      my(@m);
+  
+      push(@m,"
+  dynamic :: $self->{BASEEXT}.exp
+  
+  ") unless $self->{SKIPHASH}{'dynamic'}; # dynamic and static are subs, so...
+  
+      push(@m,"
+  static :: $self->{BASEEXT}.exp
+  
+  ") unless $self->{SKIPHASH}{'static'};  # we avoid a warning if we tick them
+  
+      push(@m,"
+  $self->{BASEEXT}.exp: Makefile.PL
+  ",'	$(PERLRUN) -e \'use ExtUtils::Mksymlists; \\
+  	Mksymlists("NAME" => "',$self->{NAME},'", "DL_FUNCS" => ',
+  	neatvalue($funcs), ', "FUNCLIST" => ', neatvalue($funclist),
+  	', "DL_VARS" => ', neatvalue($vars), ');\'
+  ');
+  
+      join('',@m);
+  }
+  
+  
+  =head1 AUTHOR
+  
+  Michael G Schwern <schwern@pobox.com> with code from ExtUtils::MM_Unix
+  
+  =head1 SEE ALSO
+  
+  L<ExtUtils::MakeMaker>
+  
+  =cut
+  
+  
+  1;
+EXTUTILS_MM_AIX
+
+$fatpacked{"ExtUtils/MM_Any.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_MM_ANY';
+  package ExtUtils::MM_Any;
+  
+  use strict;
+  our $VERSION = '7.04';
+  
+  use Carp;
+  use File::Spec;
+  use File::Basename;
+  BEGIN { our @ISA = qw(File::Spec); }
+  
+  # We need $Verbose
+  use ExtUtils::MakeMaker qw($Verbose);
+  
+  use ExtUtils::MakeMaker::Config;
+  
+  
+  # So we don't have to keep calling the methods over and over again,
+  # we have these globals to cache the values.  Faster and shrtr.
+  my $Curdir  = __PACKAGE__->curdir;
+  my $Rootdir = __PACKAGE__->rootdir;
+  my $Updir   = __PACKAGE__->updir;
+  
+  
+  =head1 NAME
+  
+  ExtUtils::MM_Any - Platform-agnostic MM methods
+  
+  =head1 SYNOPSIS
+  
+    FOR INTERNAL USE ONLY!
+  
+    package ExtUtils::MM_SomeOS;
+  
+    # Temporarily, you have to subclass both.  Put MM_Any first.
+    require ExtUtils::MM_Any;
+    require ExtUtils::MM_Unix;
+    @ISA = qw(ExtUtils::MM_Any ExtUtils::Unix);
+  
+  =head1 DESCRIPTION
+  
+  B<FOR INTERNAL USE ONLY!>
+  
+  ExtUtils::MM_Any is a superclass for the ExtUtils::MM_* set of
+  modules.  It contains methods which are either inherently
+  cross-platform or are written in a cross-platform manner.
+  
+  Subclass off of ExtUtils::MM_Any I<and> ExtUtils::MM_Unix.  This is a
+  temporary solution.
+  
+  B<THIS MAY BE TEMPORARY!>
+  
+  
+  =head1 METHODS
+  
+  Any methods marked I<Abstract> must be implemented by subclasses.
+  
+  
+  =head2 Cross-platform helper methods
+  
+  These are methods which help writing cross-platform code.
+  
+  
+  
+  =head3 os_flavor  I<Abstract>
+  
+      my @os_flavor = $mm->os_flavor;
+  
+  @os_flavor is the style of operating system this is, usually
+  corresponding to the MM_*.pm file we're using.
+  
+  The first element of @os_flavor is the major family (ie. Unix,
+  Windows, VMS, OS/2, etc...) and the rest are sub families.
+  
+  Some examples:
+  
+      Cygwin98       ('Unix',  'Cygwin', 'Cygwin9x')
+      Windows        ('Win32')
+      Win98          ('Win32', 'Win9x')
+      Linux          ('Unix',  'Linux')
+      MacOS X        ('Unix',  'Darwin', 'MacOS', 'MacOS X')
+      OS/2           ('OS/2')
+  
+  This is used to write code for styles of operating system.
+  See os_flavor_is() for use.
+  
+  
+  =head3 os_flavor_is
+  
+      my $is_this_flavor = $mm->os_flavor_is($this_flavor);
+      my $is_this_flavor = $mm->os_flavor_is(@one_of_these_flavors);
+  
+  Checks to see if the current operating system is one of the given flavors.
+  
+  This is useful for code like:
+  
+      if( $mm->os_flavor_is('Unix') ) {
+          $out = `foo 2>&1`;
+      }
+      else {
+          $out = `foo`;
+      }
+  
+  =cut
+  
+  sub os_flavor_is {
+      my $self = shift;
+      my %flavors = map { ($_ => 1) } $self->os_flavor;
+      return (grep { $flavors{$_} } @_) ? 1 : 0;
+  }
+  
+  
+  =head3 can_load_xs
+  
+      my $can_load_xs = $self->can_load_xs;
+  
+  Returns true if we have the ability to load XS.
+  
+  This is important because miniperl, used to build XS modules in the
+  core, can not load XS.
+  
+  =cut
+  
+  sub can_load_xs {
+      return defined &DynaLoader::boot_DynaLoader ? 1 : 0;
+  }
+  
+  
+  =head3 can_run
+  
+    use ExtUtils::MM;
+    my $runnable = MM->can_run($Config{make});
+  
+  If called in a scalar context it will return the full path to the binary
+  you asked for if it was found, or C<undef> if it was not.
+  
+  If called in a list context, it will return a list of the full paths to instances
+  of the binary where found in C<PATH>, or an empty list if it was not found.
+  
+  Copied from L<IPC::Cmd|IPC::Cmd/"$path = can_run( PROGRAM );">, but modified into
+  a method (and removed C<$INSTANCES> capability).
+  
+  =cut
+  
+  sub can_run {
+      my ($self, $command) = @_;
+  
+      # a lot of VMS executables have a symbol defined
+      # check those first
+      if ( $^O eq 'VMS' ) {
+          require VMS::DCLsym;
+          my $syms = VMS::DCLsym->new;
+          return $command if scalar $syms->getsym( uc $command );
+      }
+  
+      my @possibles;
+  
+      if( File::Spec->file_name_is_absolute($command) ) {
+          return $self->maybe_command($command);
+  
+      } else {
+          for my $dir (
+              File::Spec->path,
+              File::Spec->curdir
+          ) {
+              next if ! $dir || ! -d $dir;
+              my $abs = File::Spec->catfile($self->os_flavor_is('Win32') ? Win32::GetShortPathName( $dir ) : $dir, $command);
+              push @possibles, $abs if $abs = $self->maybe_command($abs);
+          }
+      }
+      return @possibles if wantarray;
+      return shift @possibles;
+  }
+  
+  
+  =head3 can_redirect_error
+  
+    $useredirect = MM->can_redirect_error;
+  
+  True if on an OS where qx operator (or backticks) can redirect C<STDERR>
+  onto C<STDOUT>.
+  
+  =cut
+  
+  sub can_redirect_error {
+    my $self = shift;
+    $self->os_flavor_is('Unix')
+        or ($self->os_flavor_is('Win32') and !$self->os_flavor_is('Win9x'))
+        or $self->os_flavor_is('OS/2')
+  }
+  
+  
+  =head3 is_make_type
+  
+      my $is_dmake = $self->is_make_type('dmake');
+  
+  Returns true if C<<$self->make>> is the given type; possibilities are:
+  
+    gmake    GNU make
+    dmake
+    nmake
+    bsdmake  BSD pmake-derived
+  
+  =cut
+  
+  sub is_make_type {
+      my($self, $type) = @_;
+      (undef, undef, my $make_basename) = $self->splitpath($self->make);
+      return 1 if $make_basename =~ /\b$type\b/i; # executable's filename
+      return 0 if $make_basename =~ /\b(dmake|nmake)\b/i; # Never fall through for dmake/nmake
+      # now have to run with "-v" and guess
+      my $redirect = $self->can_redirect_error ? '2>&1' : '';
+      my $make = $self->make || $self->{MAKE};
+      my $minus_v = `"$make" -v $redirect`;
+      return 1 if $type eq 'gmake' and $minus_v =~ /GNU make/i;
+      return 1 if $type eq 'bsdmake'
+        and $minus_v =~ /^usage: make \[-BeikNnqrstWwX\]/im;
+      0; # it wasn't whatever you asked
+  }
+  
+  
+  =head3 can_dep_space
+  
+      my $can_dep_space = $self->can_dep_space;
+  
+  Returns true if C<make> can handle (probably by quoting)
+  dependencies that contain a space. Currently known true for GNU make,
+  false for BSD pmake derivative.
+  
+  =cut
+  
+  my $cached_dep_space;
+  sub can_dep_space {
+      my $self = shift;
+      return $cached_dep_space if defined $cached_dep_space;
+      return $cached_dep_space = 1 if $self->is_make_type('gmake');
+      return $cached_dep_space = 0 if $self->is_make_type('dmake'); # only on W32
+      return $cached_dep_space = 0 if $self->is_make_type('bsdmake');
+      return $cached_dep_space = 0; # assume no
+  }
+  
+  
+  =head3 quote_dep
+  
+    $text = $mm->quote_dep($text);
+  
+  Method that protects Makefile single-value constants (mainly filenames),
+  so that make will still treat them as single values even if they
+  inconveniently have spaces in. If the make program being used cannot
+  achieve such protection and the given text would need it, throws an
+  exception.
+  
+  =cut
+  
+  sub quote_dep {
+      my ($self, $arg) = @_;
+      die <<EOF if $arg =~ / / and not $self->can_dep_space;
+  Tried to use make dependency with space for make that can't:
+    '$arg'
+  EOF
+      $arg =~ s/( )/\\$1/g; # how GNU make does it
+      return $arg;
+  }
+  
+  
+  =head3 split_command
+  
+      my @cmds = $MM->split_command($cmd, @args);
+  
+  Most OS have a maximum command length they can execute at once.  Large
+  modules can easily generate commands well past that limit.  Its
+  necessary to split long commands up into a series of shorter commands.
+  
+  C<split_command> will return a series of @cmds each processing part of
+  the args.  Collectively they will process all the arguments.  Each
+  individual line in @cmds will not be longer than the
+  $self->max_exec_len being careful to take into account macro expansion.
+  
+  $cmd should include any switches and repeated initial arguments.
+  
+  If no @args are given, no @cmds will be returned.
+  
+  Pairs of arguments will always be preserved in a single command, this
+  is a heuristic for things like pm_to_blib and pod2man which work on
+  pairs of arguments.  This makes things like this safe:
+  
+      $self->split_command($cmd, %pod2man);
+  
+  
+  =cut
+  
+  sub split_command {
+      my($self, $cmd, @args) = @_;
+  
+      my @cmds = ();
+      return(@cmds) unless @args;
+  
+      # If the command was given as a here-doc, there's probably a trailing
+      # newline.
+      chomp $cmd;
+  
+      # set aside 30% for macro expansion.
+      my $len_left = int($self->max_exec_len * 0.70);
+      $len_left -= length $self->_expand_macros($cmd);
+  
+      do {
+          my $arg_str = '';
+          my @next_args;
+          while( @next_args = splice(@args, 0, 2) ) {
+              # Two at a time to preserve pairs.
+              my $next_arg_str = "\t  ". join ' ', @next_args, "\n";
+  
+              if( !length $arg_str ) {
+                  $arg_str .= $next_arg_str
+              }
+              elsif( length($arg_str) + length($next_arg_str) > $len_left ) {
+                  unshift @args, @next_args;
+                  last;
+              }
+              else {
+                  $arg_str .= $next_arg_str;
+              }
+          }
+          chop $arg_str;
+  
+          push @cmds, $self->escape_newlines("$cmd \n$arg_str");
+      } while @args;
+  
+      return @cmds;
+  }
+  
+  
+  sub _expand_macros {
+      my($self, $cmd) = @_;
+  
+      $cmd =~ s{\$\((\w+)\)}{
+          defined $self->{$1} ? $self->{$1} : "\$($1)"
+      }e;
+      return $cmd;
+  }
+  
+  
+  =head3 echo
+  
+      my @commands = $MM->echo($text);
+      my @commands = $MM->echo($text, $file);
+      my @commands = $MM->echo($text, $file, \%opts);
+  
+  Generates a set of @commands which print the $text to a $file.
+  
+  If $file is not given, output goes to STDOUT.
+  
+  If $opts{append} is true the $file will be appended to rather than
+  overwritten.  Default is to overwrite.
+  
+  If $opts{allow_variables} is true, make variables of the form
+  C<$(...)> will not be escaped.  Other C<$> will.  Default is to escape
+  all C<$>.
+  
+  Example of use:
+  
+      my $make = map "\t$_\n", $MM->echo($text, $file);
+  
+  =cut
+  
+  sub echo {
+      my($self, $text, $file, $opts) = @_;
+  
+      # Compatibility with old options
+      if( !ref $opts ) {
+          my $append = $opts;
+          $opts = { append => $append || 0 };
+      }
+      $opts->{allow_variables} = 0 unless defined $opts->{allow_variables};
+  
+      my $ql_opts = { allow_variables => $opts->{allow_variables} };
+      my @cmds = map { '$(NOECHO) $(ECHO) '.$self->quote_literal($_, $ql_opts) }
+                 split /\n/, $text;
+      if( $file ) {
+          my $redirect = $opts->{append} ? '>>' : '>';
+          $cmds[0] .= " $redirect $file";
+          $_ .= " >> $file" foreach @cmds[1..$#cmds];
+      }
+  
+      return @cmds;
+  }
+  
+  
+  =head3 wraplist
+  
+    my $args = $mm->wraplist(@list);
+  
+  Takes an array of items and turns them into a well-formatted list of
+  arguments.  In most cases this is simply something like:
+  
+      FOO \
+      BAR \
+      BAZ
+  
+  =cut
+  
+  sub wraplist {
+      my $self = shift;
+      return join " \\\n\t", @_;
+  }
+  
+  
+  =head3 maketext_filter
+  
+      my $filter_make_text = $mm->maketext_filter($make_text);
+  
+  The text of the Makefile is run through this method before writing to
+  disk.  It allows systems a chance to make portability fixes to the
+  Makefile.
+  
+  By default it does nothing.
+  
+  This method is protected and not intended to be called outside of
+  MakeMaker.
+  
+  =cut
+  
+  sub maketext_filter { return $_[1] }
+  
+  
+  =head3 cd  I<Abstract>
+  
+    my $subdir_cmd = $MM->cd($subdir, @cmds);
+  
+  This will generate a make fragment which runs the @cmds in the given
+  $dir.  The rough equivalent to this, except cross platform.
+  
+    cd $subdir && $cmd
+  
+  Currently $dir can only go down one level.  "foo" is fine.  "foo/bar" is
+  not.  "../foo" is right out.
+  
+  The resulting $subdir_cmd has no leading tab nor trailing newline.  This
+  makes it easier to embed in a make string.  For example.
+  
+        my $make = sprintf <<'CODE', $subdir_cmd;
+    foo :
+        $(ECHO) what
+        %s
+        $(ECHO) mouche
+    CODE
+  
+  
+  =head3 oneliner  I<Abstract>
+  
+    my $oneliner = $MM->oneliner($perl_code);
+    my $oneliner = $MM->oneliner($perl_code, \@switches);
+  
+  This will generate a perl one-liner safe for the particular platform
+  you're on based on the given $perl_code and @switches (a -e is
+  assumed) suitable for using in a make target.  It will use the proper
+  shell quoting and escapes.
+  
+  $(PERLRUN) will be used as perl.
+  
+  Any newlines in $perl_code will be escaped.  Leading and trailing
+  newlines will be stripped.  Makes this idiom much easier:
+  
+      my $code = $MM->oneliner(<<'CODE', [...switches...]);
+  some code here
+  another line here
+  CODE
+  
+  Usage might be something like:
+  
+      # an echo emulation
+      $oneliner = $MM->oneliner('print "Foo\n"');
+      $make = '$oneliner > somefile';
+  
+  All dollar signs must be doubled in the $perl_code if you expect them
+  to be interpreted normally, otherwise it will be considered a make
+  macro.  Also remember to quote make macros else it might be used as a
+  bareword.  For example:
+  
+      # Assign the value of the $(VERSION_FROM) make macro to $vf.
+      $oneliner = $MM->oneliner('$$vf = "$(VERSION_FROM)"');
+  
+  Its currently very simple and may be expanded sometime in the figure
+  to include more flexible code and switches.
+  
+  
+  =head3 quote_literal  I<Abstract>
+  
+      my $safe_text = $MM->quote_literal($text);
+      my $safe_text = $MM->quote_literal($text, \%options);
+  
+  This will quote $text so it is interpreted literally in the shell.
+  
+  For example, on Unix this would escape any single-quotes in $text and
+  put single-quotes around the whole thing.
+  
+  If $options{allow_variables} is true it will leave C<'$(FOO)'> make
+  variables untouched.  If false they will be escaped like any other
+  C<$>.  Defaults to true.
+  
+  =head3 escape_dollarsigns
+  
+      my $escaped_text = $MM->escape_dollarsigns($text);
+  
+  Escapes stray C<$> so they are not interpreted as make variables.
+  
+  It lets by C<$(...)>.
+  
+  =cut
+  
+  sub escape_dollarsigns {
+      my($self, $text) = @_;
+  
+      # Escape dollar signs which are not starting a variable
+      $text =~ s{\$ (?!\() }{\$\$}gx;
+  
+      return $text;
+  }
+  
+  
+  =head3 escape_all_dollarsigns
+  
+      my $escaped_text = $MM->escape_all_dollarsigns($text);
+  
+  Escapes all C<$> so they are not interpreted as make variables.
+  
+  =cut
+  
+  sub escape_all_dollarsigns {
+      my($self, $text) = @_;
+  
+      # Escape dollar signs
+      $text =~ s{\$}{\$\$}gx;
+  
+      return $text;
+  }
+  
+  
+  =head3 escape_newlines  I<Abstract>
+  
+      my $escaped_text = $MM->escape_newlines($text);
+  
+  Shell escapes newlines in $text.
+  
+  
+  =head3 max_exec_len  I<Abstract>
+  
+      my $max_exec_len = $MM->max_exec_len;
+  
+  Calculates the maximum command size the OS can exec.  Effectively,
+  this is the max size of a shell command line.
+  
+  =for _private
+  $self->{_MAX_EXEC_LEN} is set by this method, but only for testing purposes.
+  
+  
+  =head3 make
+  
+      my $make = $MM->make;
+  
+  Returns the make variant we're generating the Makefile for.  This attempts
+  to do some normalization on the information from %Config or the user.
+  
+  =cut
+  
+  sub make {
+      my $self = shift;
+  
+      my $make = lc $self->{MAKE};
+  
+      # Truncate anything like foomake6 to just foomake.
+      $make =~ s/^(\w+make).*/$1/;
+  
+      # Turn gnumake into gmake.
+      $make =~ s/^gnu/g/;
+  
+      return $make;
+  }
+  
+  
+  =head2 Targets
+  
+  These are methods which produce make targets.
+  
+  
+  =head3 all_target
+  
+  Generate the default target 'all'.
+  
+  =cut
+  
+  sub all_target {
+      my $self = shift;
+  
+      return <<'MAKE_EXT';
+  all :: pure_all
+  	$(NOECHO) $(NOOP)
+  MAKE_EXT
+  
+  }
+  
+  
+  =head3 blibdirs_target
+  
+      my $make_frag = $mm->blibdirs_target;
+  
+  Creates the blibdirs target which creates all the directories we use
+  in blib/.
+  
+  The blibdirs.ts target is deprecated.  Depend on blibdirs instead.
+  
+  
+  =cut
+  
+  sub blibdirs_target {
+      my $self = shift;
+  
+      my @dirs = map { uc "\$(INST_$_)" } qw(libdir archlib
+                                             autodir archautodir
+                                             bin script
+                                             man1dir man3dir
+                                            );
+  
+      my @exists = map { $_.'$(DFSEP).exists' } @dirs;
+  
+      my $make = sprintf <<'MAKE', join(' ', @exists);
+  blibdirs : %s
+  	$(NOECHO) $(NOOP)
+  
+  # Backwards compat with 6.18 through 6.25
+  blibdirs.ts : blibdirs
+  	$(NOECHO) $(NOOP)
+  
+  MAKE
+  
+      $make .= $self->dir_target(@dirs);
+  
+      return $make;
+  }
+  
+  
+  =head3 clean (o)
+  
+  Defines the clean target.
+  
+  =cut
+  
+  sub clean {
+  # --- Cleanup and Distribution Sections ---
+  
+      my($self, %attribs) = @_;
+      my @m;
+      push(@m, '
+  # Delete temporary files but do not touch installed files. We don\'t delete
+  # the Makefile here so a later make realclean still has a makefile to use.
+  
+  clean :: clean_subdirs
+  ');
+  
+      my @files = sort values %{$self->{XS}}; # .c files from *.xs files
+      my @dirs  = qw(blib);
+  
+      # Normally these are all under blib but they might have been
+      # redefined.
+      # XXX normally this would be a good idea, but the Perl core sets
+      # INST_LIB = ../../lib rather than actually installing the files.
+      # So a "make clean" in an ext/ directory would blow away lib.
+      # Until the core is adjusted let's leave this out.
+  #     push @dirs, qw($(INST_ARCHLIB) $(INST_LIB)
+  #                    $(INST_BIN) $(INST_SCRIPT)
+  #                    $(INST_MAN1DIR) $(INST_MAN3DIR)
+  #                    $(INST_LIBDIR) $(INST_ARCHLIBDIR) $(INST_AUTODIR)
+  #                    $(INST_STATIC) $(INST_DYNAMIC)
+  #                 );
+  
+  
+      if( $attribs{FILES} ) {
+          # Use @dirs because we don't know what's in here.
+          push @dirs, ref $attribs{FILES}                ?
+                          @{$attribs{FILES}}             :
+                          split /\s+/, $attribs{FILES}   ;
+      }
+  
+      push(@files, qw[$(MAKE_APERL_FILE)
+                      MYMETA.json MYMETA.yml perlmain.c tmon.out mon.out so_locations
+                      blibdirs.ts pm_to_blib pm_to_blib.ts
+                      *$(OBJ_EXT) *$(LIB_EXT) perl.exe perl perl$(EXE_EXT)
+                      $(BOOTSTRAP) $(BASEEXT).bso
+                      $(BASEEXT).def lib$(BASEEXT).def
+                      $(BASEEXT).exp $(BASEEXT).x
+                     ]);
+  
+      push(@files, $self->catfile('$(INST_ARCHAUTODIR)','extralibs.all'));
+      push(@files, $self->catfile('$(INST_ARCHAUTODIR)','extralibs.ld'));
+  
+      # core files
+      if ($^O eq 'vos') {
+          push(@files, qw[perl*.kp]);
+      }
+      else {
+          push(@files, qw[core core.*perl.*.? *perl.core]);
+      }
+  
+      push(@files, map { "core." . "[0-9]"x$_ } (1..5));
+  
+      # OS specific things to clean up.  Use @dirs since we don't know
+      # what might be in here.
+      push @dirs, $self->extra_clean_files;
+  
+      # Occasionally files are repeated several times from different sources
+      { my(%f) = map { ($_ => 1) } @files; @files = sort keys %f; }
+      { my(%d) = map { ($_ => 1) } @dirs;  @dirs  = sort keys %d; }
+  
+      push @m, map "\t$_\n", $self->split_command('- $(RM_F)',  @files);
+      push @m, map "\t$_\n", $self->split_command('- $(RM_RF)', @dirs);
+  
+      # Leave Makefile.old around for realclean
+      push @m, <<'MAKE';
+  	  $(NOECHO) $(RM_F) $(MAKEFILE_OLD)
+  	- $(MV) $(FIRST_MAKEFILE) $(MAKEFILE_OLD) $(DEV_NULL)
+  MAKE
+  
+      push(@m, "\t$attribs{POSTOP}\n")   if $attribs{POSTOP};
+  
+      join("", @m);
+  }
+  
+  
+  =head3 clean_subdirs_target
+  
+    my $make_frag = $MM->clean_subdirs_target;
+  
+  Returns the clean_subdirs target.  This is used by the clean target to
+  call clean on any subdirectories which contain Makefiles.
+  
+  =cut
+  
+  sub clean_subdirs_target {
+      my($self) = shift;
+  
+      # No subdirectories, no cleaning.
+      return <<'NOOP_FRAG' unless @{$self->{DIR}};
+  clean_subdirs :
+  	$(NOECHO) $(NOOP)
+  NOOP_FRAG
+  
+  
+      my $clean = "clean_subdirs :\n";
+  
+      for my $dir (@{$self->{DIR}}) {
+          my $subclean = $self->oneliner(sprintf <<'CODE', $dir);
+  exit 0 unless chdir '%s';  system '$(MAKE) clean' if -f '$(FIRST_MAKEFILE)';
+  CODE
+  
+          $clean .= "\t$subclean\n";
+      }
+  
+      return $clean;
+  }
+  
+  
+  =head3 dir_target
+  
+      my $make_frag = $mm->dir_target(@directories);
+  
+  Generates targets to create the specified directories and set its
+  permission to PERM_DIR.
+  
+  Because depending on a directory to just ensure it exists doesn't work
+  too well (the modified time changes too often) dir_target() creates a
+  .exists file in the created directory.  It is this you should depend on.
+  For portability purposes you should use the $(DIRFILESEP) macro rather
+  than a '/' to separate the directory from the file.
+  
+      yourdirectory$(DIRFILESEP).exists
+  
+  =cut
+  
+  sub dir_target {
+      my($self, @dirs) = @_;
+  
+      my $make = '';
+      foreach my $dir (@dirs) {
+          $make .= sprintf <<'MAKE', ($dir) x 4;
+  %s$(DFSEP).exists :: Makefile.PL
+  	$(NOECHO) $(MKPATH) %s
+  	$(NOECHO) $(CHMOD) $(PERM_DIR) %s
+  	$(NOECHO) $(TOUCH) %s$(DFSEP).exists
+  
+  MAKE
+  
+      }
+  
+      return $make;
+  }
+  
+  
+  =head3 distdir
+  
+  Defines the scratch directory target that will hold the distribution
+  before tar-ing (or shar-ing).
+  
+  =cut
+  
+  # For backwards compatibility.
+  *dist_dir = *distdir;
+  
+  sub distdir {
+      my($self) = shift;
+  
+      my $meta_target = $self->{NO_META} ? '' : 'distmeta';
+      my $sign_target = !$self->{SIGN}   ? '' : 'distsignature';
+  
+      return sprintf <<'MAKE_FRAG', $meta_target, $sign_target;
+  create_distdir :
+  	$(RM_RF) $(DISTVNAME)
+  	$(PERLRUN) "-MExtUtils::Manifest=manicopy,maniread" \
+  		-e "manicopy(maniread(),'$(DISTVNAME)', '$(DIST_CP)');"
+  
+  distdir : create_distdir %s %s
+  	$(NOECHO) $(NOOP)
+  
+  MAKE_FRAG
+  
+  }
+  
+  
+  =head3 dist_test
+  
+  Defines a target that produces the distribution in the
+  scratch directory, and runs 'perl Makefile.PL; make ;make test' in that
+  subdirectory.
+  
+  =cut
+  
+  sub dist_test {
+      my($self) = shift;
+  
+      my $mpl_args = join " ", map qq["$_"], @ARGV;
+  
+      my $test = $self->cd('$(DISTVNAME)',
+                           '$(ABSPERLRUN) Makefile.PL '.$mpl_args,
+                           '$(MAKE) $(PASTHRU)',
+                           '$(MAKE) test $(PASTHRU)'
+                          );
+  
+      return sprintf <<'MAKE_FRAG', $test;
+  disttest : distdir
+  	%s
+  
+  MAKE_FRAG
+  
+  
+  }
+  
+  
+  =head3 dynamic (o)
+  
+  Defines the dynamic target.
+  
+  =cut
+  
+  sub dynamic {
+  # --- Dynamic Loading Sections ---
+  
+      my($self) = shift;
+      '
+  dynamic :: $(FIRST_MAKEFILE) $(BOOTSTRAP) $(INST_DYNAMIC)
+  	$(NOECHO) $(NOOP)
+  ';
+  }
+  
+  
+  =head3 makemakerdflt_target
+  
+    my $make_frag = $mm->makemakerdflt_target
+  
+  Returns a make fragment with the makemakerdeflt_target specified.
+  This target is the first target in the Makefile, is the default target
+  and simply points off to 'all' just in case any make variant gets
+  confused or something gets snuck in before the real 'all' target.
+  
+  =cut
+  
+  sub makemakerdflt_target {
+      return <<'MAKE_FRAG';
+  makemakerdflt : all
+  	$(NOECHO) $(NOOP)
+  MAKE_FRAG
+  
+  }
+  
+  
+  =head3 manifypods_target
+  
+    my $manifypods_target = $self->manifypods_target;
+  
+  Generates the manifypods target.  This target generates man pages from
+  all POD files in MAN1PODS and MAN3PODS.
+  
+  =cut
+  
+  sub manifypods_target {
+      my($self) = shift;
+  
+      my $man1pods      = '';
+      my $man3pods      = '';
+      my $dependencies  = '';
+  
+      # populate manXpods & dependencies:
+      foreach my $name (sort keys %{$self->{MAN1PODS}}, sort keys %{$self->{MAN3PODS}}) {
+          $dependencies .= " \\\n\t$name";
+      }
+  
+      my $manify = <<END;
+  manifypods : pure_all $dependencies
+  END
+  
+      my @man_cmds;
+      foreach my $section (qw(1 3)) {
+          my $pods = $self->{"MAN${section}PODS"};
+          my $p2m = sprintf <<CMD, $] > 5.008 ? " -u" : "";
+  	\$(NOECHO) \$(POD2MAN) --section=$section --perm_rw=\$(PERM_RW)%s
+  CMD
+          push @man_cmds, $self->split_command($p2m, map {($_,$pods->{$_})} sort keys %$pods);
+      }
+  
+      $manify .= "\t\$(NOECHO) \$(NOOP)\n" unless @man_cmds;
+      $manify .= join '', map { "$_\n" } @man_cmds;
+  
+      return $manify;
+  }
+  
+  sub _has_cpan_meta {
+      return eval {
+        require CPAN::Meta;
+        CPAN::Meta->VERSION(2.112150);
+        1;
+      };
+  }
+  
+  =head3 metafile_target
+  
+      my $target = $mm->metafile_target;
+  
+  Generate the metafile target.
+  
+  Writes the file META.yml (YAML encoded meta-data) and META.json
+  (JSON encoded meta-data) about the module in the distdir.
+  The format follows Module::Build's as closely as possible.
+  
+  =cut
+  
+  sub metafile_target {
+      my $self = shift;
+      return <<'MAKE_FRAG' if $self->{NO_META} or ! _has_cpan_meta();
+  metafile :
+  	$(NOECHO) $(NOOP)
+  MAKE_FRAG
+  
+      my %metadata   = $self->metafile_data(
+          $self->{META_ADD}   || {},
+          $self->{META_MERGE} || {},
+      );
+  
+      _fix_metadata_before_conversion( \%metadata );
+  
+      # paper over validation issues, but still complain, necessary because
+      # there's no guarantee that the above will fix ALL errors
+      my $meta = eval { CPAN::Meta->create( \%metadata, { lazy_validation => 1 } ) };
+      warn $@ if $@ and
+                 $@ !~ /encountered CODE.*, but JSON can only represent references to arrays or hashes/;
+  
+      # use the original metadata straight if the conversion failed
+      # or if it can't be stringified.
+      if( !$meta                                                  ||
+          !eval { $meta->as_string( { version => "1.4" } ) }      ||
+          !eval { $meta->as_string }
+      )
+      {
+          $meta = bless \%metadata, 'CPAN::Meta';
+      }
+  
+      my @write_metayml = $self->echo(
+        $meta->as_string({version => "1.4"}), 'META_new.yml'
+      );
+      my @write_metajson = $self->echo(
+        $meta->as_string(), 'META_new.json'
+      );
+  
+      my $metayml = join("\n\t", @write_metayml);
+      my $metajson = join("\n\t", @write_metajson);
+      return sprintf <<'MAKE_FRAG', $metayml, $metajson;
+  metafile : create_distdir
+  	$(NOECHO) $(ECHO) Generating META.yml
+  	%s
+  	-$(NOECHO) $(MV) META_new.yml $(DISTVNAME)/META.yml
+  	$(NOECHO) $(ECHO) Generating META.json
+  	%s
+  	-$(NOECHO) $(MV) META_new.json $(DISTVNAME)/META.json
+  MAKE_FRAG
+  
+  }
+  
+  =begin private
+  
+  =head3 _fix_metadata_before_conversion
+  
+      _fix_metadata_before_conversion( \%metadata );
+  
+  Fixes errors in the metadata before it's handed off to CPAN::Meta for
+  conversion. This hopefully results in something that can be used further
+  on, no guarantee is made though.
+  
+  =end private
+  
+  =cut
+  
+  sub _fix_metadata_before_conversion {
+      my ( $metadata ) = @_;
+  
+      # we should never be called unless this already passed but
+      # prefer to be defensive in case somebody else calls this
+  
+      return unless _has_cpan_meta;
+  
+      my $bad_version = $metadata->{version} &&
+                        !CPAN::Meta::Validator->new->version( 'version', $metadata->{version} );
+  
+      # just delete all invalid versions
+      if( $bad_version ) {
+          warn "Can't parse version '$metadata->{version}'\n";
+          $metadata->{version} = '';
+      }
+  
+      my $validator = CPAN::Meta::Validator->new( $metadata );
+      return if $validator->is_valid;
+  
+      # fix non-camelcase custom resource keys (only other trick we know)
+      for my $error ( $validator->errors ) {
+          my ( $key ) = ( $error =~ /Custom resource '(.*)' must be in CamelCase./ );
+          next if !$key;
+  
+          # first try to remove all non-alphabetic chars
+          ( my $new_key = $key ) =~ s/[^_a-zA-Z]//g;
+  
+          # if that doesn't work, uppercase first one
+          $new_key = ucfirst $new_key if !$validator->custom_1( $new_key );
+  
+          # copy to new key if that worked
+          $metadata->{resources}{$new_key} = $metadata->{resources}{$key}
+            if $validator->custom_1( $new_key );
+  
+          # and delete old one in any case
+          delete $metadata->{resources}{$key};
+      }
+  
+      return;
+  }
+  
+  
+  =begin private
+  
+  =head3 _sort_pairs
+  
+      my @pairs = _sort_pairs($sort_sub, \%hash);
+  
+  Sorts the pairs of a hash based on keys ordered according
+  to C<$sort_sub>.
+  
+  =end private
+  
+  =cut
+  
+  sub _sort_pairs {
+      my $sort  = shift;
+      my $pairs = shift;
+      return map  { $_ => $pairs->{$_} }
+             sort $sort
+             keys %$pairs;
+  }
+  
+  
+  # Taken from Module::Build::Base
+  sub _hash_merge {
+      my ($self, $h, $k, $v) = @_;
+      if (ref $h->{$k} eq 'ARRAY') {
+          push @{$h->{$k}}, ref $v ? @$v : $v;
+      } elsif (ref $h->{$k} eq 'HASH') {
+          $self->_hash_merge($h->{$k}, $_, $v->{$_}) foreach keys %$v;
+      } else {
+          $h->{$k} = $v;
+      }
+  }
+  
+  
+  =head3 metafile_data
+  
+      my @metadata_pairs = $mm->metafile_data(\%meta_add, \%meta_merge);
+  
+  Returns the data which MakeMaker turns into the META.yml file 
+  and the META.json file.
+  
+  Values of %meta_add will overwrite any existing metadata in those
+  keys.  %meta_merge will be merged with them.
+  
+  =cut
+  
+  sub metafile_data {
+      my $self = shift;
+      my($meta_add, $meta_merge) = @_;
+  
+      my %meta = (
+          # required
+          name         => $self->{DISTNAME},
+          version      => _normalize_version($self->{VERSION}),
+          abstract     => $self->{ABSTRACT} || 'unknown',
+          license      => $self->{LICENSE} || 'unknown',
+          dynamic_config => 1,
+  
+          # optional
+          distribution_type => $self->{PM} ? 'module' : 'script',
+  
+          no_index     => {
+              directory   => [qw(t inc)]
+          },
+  
+          generated_by => "ExtUtils::MakeMaker version $ExtUtils::MakeMaker::VERSION",
+          'meta-spec'  => {
+              url         => 'http://module-build.sourceforge.net/META-spec-v1.4.html',
+              version     => 1.4
+          },
+      );
+  
+      # The author key is required and it takes a list.
+      $meta{author}   = defined $self->{AUTHOR}    ? $self->{AUTHOR} : [];
+  
+      {
+        my $vers = _metaspec_version( $meta_add, $meta_merge );
+        my $method = $vers =~ m!^2!
+                 ? '_add_requirements_to_meta_v2'
+                 : '_add_requirements_to_meta_v1_4';
+        %meta = $self->$method( %meta );
+      }
+  
+      while( my($key, $val) = each %$meta_add ) {
+          $meta{$key} = $val;
+      }
+  
+      while( my($key, $val) = each %$meta_merge ) {
+          $self->_hash_merge(\%meta, $key, $val);
+      }
+  
+      return %meta;
+  }
+  
+  
+  =begin private
+  
+  =cut
+  
+  sub _metaspec_version {
+    my ( $meta_add, $meta_merge ) = @_;
+    return $meta_add->{'meta-spec'}->{version}
+      if defined $meta_add->{'meta-spec'}
+         and defined $meta_add->{'meta-spec'}->{version};
+    return $meta_merge->{'meta-spec'}->{version}
+      if defined $meta_merge->{'meta-spec'}
+         and  defined $meta_merge->{'meta-spec'}->{version};
+    return '1.4';
+  }
+  
+  sub _add_requirements_to_meta_v1_4 {
+      my ( $self, %meta ) = @_;
+  
+      # Check the original args so we can tell between the user setting it
+      # to an empty hash and it just being initialized.
+      if( $self->{ARGS}{CONFIGURE_REQUIRES} ) {
+          $meta{configure_requires} = $self->{CONFIGURE_REQUIRES};
+      } else {
+          $meta{configure_requires} = {
+              'ExtUtils::MakeMaker'       => 0,
+          };
+      }
+  
+      if( $self->{ARGS}{BUILD_REQUIRES} ) {
+          $meta{build_requires} = $self->{BUILD_REQUIRES};
+      } else {
+          $meta{build_requires} = {
+              'ExtUtils::MakeMaker'       => 0,
+          };
+      }
+  
+      if( $self->{ARGS}{TEST_REQUIRES} ) {
+          $meta{build_requires} = {
+            %{ $meta{build_requires} },
+            %{ $self->{TEST_REQUIRES} },
+          };
+      }
+  
+      $meta{requires} = $self->{PREREQ_PM}
+          if defined $self->{PREREQ_PM};
+      $meta{requires}{perl} = _normalize_version($self->{MIN_PERL_VERSION})
+          if $self->{MIN_PERL_VERSION};
+  
+      return %meta;
+  }
+  
+  sub _add_requirements_to_meta_v2 {
+      my ( $self, %meta ) = @_;
+  
+      # Check the original args so we can tell between the user setting it
+      # to an empty hash and it just being initialized.
+      if( $self->{ARGS}{CONFIGURE_REQUIRES} ) {
+          $meta{prereqs}{configure}{requires} = $self->{CONFIGURE_REQUIRES};
+      } else {
+          $meta{prereqs}{configure}{requires} = {
+              'ExtUtils::MakeMaker'       => 0,
+          };
+      }
+  
+      if( $self->{ARGS}{BUILD_REQUIRES} ) {
+          $meta{prereqs}{build}{requires} = $self->{BUILD_REQUIRES};
+      } else {
+          $meta{prereqs}{build}{requires} = {
+              'ExtUtils::MakeMaker'       => 0,
+          };
+      }
+  
+      if( $self->{ARGS}{TEST_REQUIRES} ) {
+          $meta{prereqs}{test}{requires} = $self->{TEST_REQUIRES};
+      }
+  
+      $meta{prereqs}{runtime}{requires} = $self->{PREREQ_PM}
+          if $self->{ARGS}{PREREQ_PM};
+      $meta{prereqs}{runtime}{requires}{perl} = _normalize_version($self->{MIN_PERL_VERSION})
+          if $self->{MIN_PERL_VERSION};
+  
+      return %meta;
+  }
+  
+  # Adapted from Module::Build::Base
+  sub _normalize_version {
+    my ($version) = @_;
+    $version = 0 unless defined $version;
+  
+    if ( ref $version eq 'version' ) { # version objects
+      $version = $version->is_qv ? $version->normal : $version->stringify;
+    }
+    elsif ( $version =~ /^[^v][^.]*\.[^.]+\./ ) { # no leading v, multiple dots
+      # normalize string tuples without "v": "1.2.3" -> "v1.2.3"
+      $version = "v$version";
+    }
+    else {
+      # leave alone
+    }
+    return $version;
+  }
+  
+  =head3 _dump_hash
+  
+      $yaml = _dump_hash(\%options, %hash);
+  
+  Implements a fake YAML dumper for a hash given
+  as a list of pairs. No quoting/escaping is done. Keys
+  are supposed to be strings. Values are undef, strings,
+  hash refs or array refs of strings.
+  
+  Supported options are:
+  
+      delta => STR - indentation delta
+      use_header => BOOL - whether to include a YAML header
+      indent => STR - a string of spaces
+            default: ''
+  
+      max_key_length => INT - maximum key length used to align
+          keys and values of the same hash
+          default: 20
+      key_sort => CODE - a sort sub
+              It may be undef, which means no sorting by keys
+          default: sub { lc $a cmp lc $b }
+  
+      customs => HASH - special options for certain keys
+             (whose values are hashes themselves)
+          may contain: max_key_length, key_sort, customs
+  
+  =end private
+  
+  =cut
+  
+  sub _dump_hash {
+      croak "first argument should be a hash ref" unless ref $_[0] eq 'HASH';
+      my $options = shift;
+      my %hash = @_;
+  
+      # Use a list to preserve order.
+      my @pairs;
+  
+      my $k_sort
+          = exists $options->{key_sort} ? $options->{key_sort}
+                                        : sub { lc $a cmp lc $b };
+      if ($k_sort) {
+          croak "'key_sort' should be a coderef" unless ref $k_sort eq 'CODE';
+          @pairs = _sort_pairs($k_sort, \%hash);
+      } else { # list of pairs, no sorting
+          @pairs = @_;
+      }
+  
+      my $yaml     = $options->{use_header} ? "--- #YAML:1.0\n" : '';
+      my $indent   = $options->{indent} || '';
+      my $k_length = min(
+          ($options->{max_key_length} || 20),
+          max(map { length($_) + 1 } grep { !ref $hash{$_} } keys %hash)
+      );
+      my $customs  = $options->{customs} || {};
+  
+      # printf format for key
+      my $k_format = "%-${k_length}s";
+  
+      while( @pairs ) {
+          my($key, $val) = splice @pairs, 0, 2;
+          $val = '~' unless defined $val;
+          if(ref $val eq 'HASH') {
+              if ( keys %$val ) {
+                  my %k_options = ( # options for recursive call
+                      delta => $options->{delta},
+                      use_header => 0,
+                      indent => $indent . $options->{delta},
+                  );
+                  if (exists $customs->{$key}) {
+                      my %k_custom = %{$customs->{$key}};
+                      foreach my $k (qw(key_sort max_key_length customs)) {
+                          $k_options{$k} = $k_custom{$k} if exists $k_custom{$k};
+                      }
+                  }
+                  $yaml .= $indent . "$key:\n"
+                    . _dump_hash(\%k_options, %$val);
+              }
+              else {
+                  $yaml .= $indent . "$key:  {}\n";
+              }
+          }
+          elsif (ref $val eq 'ARRAY') {
+              if( @$val ) {
+                  $yaml .= $indent . "$key:\n";
+  
+                  for (@$val) {
+                      croak "only nested arrays of non-refs are supported" if ref $_;
+                      $yaml .= $indent . $options->{delta} . "- $_\n";
+                  }
+              }
+              else {
+                  $yaml .= $indent . "$key:  []\n";
+              }
+          }
+          elsif( ref $val and !blessed($val) ) {
+              croak "only nested hashes, arrays and objects are supported";
+          }
+          else {  # if it's an object, just stringify it
+              $yaml .= $indent . sprintf "$k_format  %s\n", "$key:", $val;
+          }
+      };
+  
+      return $yaml;
+  
+  }
+  
+  sub blessed {
+      return eval { $_[0]->isa("UNIVERSAL"); };
+  }
+  
+  sub max {
+      return (sort { $b <=> $a } @_)[0];
+  }
+  
+  sub min {
+      return (sort { $a <=> $b } @_)[0];
+  }
+  
+  =head3 metafile_file
+  
+      my $meta_yml = $mm->metafile_file(@metadata_pairs);
+  
+  Turns the @metadata_pairs into YAML.
+  
+  This method does not implement a complete YAML dumper, being limited
+  to dump a hash with values which are strings, undef's or nested hashes
+  and arrays of strings. No quoting/escaping is done.
+  
+  =cut
+  
+  sub metafile_file {
+      my $self = shift;
+  
+      my %dump_options = (
+          use_header => 1,
+          delta      => ' ' x 4,
+          key_sort   => undef,
+      );
+      return _dump_hash(\%dump_options, @_);
+  
+  }
+  
+  
+  =head3 distmeta_target
+  
+      my $make_frag = $mm->distmeta_target;
+  
+  Generates the distmeta target to add META.yml and META.json to the MANIFEST
+  in the distdir.
+  
+  =cut
+  
+  sub distmeta_target {
+      my $self = shift;
+  
+      my @add_meta = (
+        $self->oneliner(<<'CODE', ['-MExtUtils::Manifest=maniadd']),
+  exit unless -e q{META.yml};
+  eval { maniadd({q{META.yml} => q{Module YAML meta-data (added by MakeMaker)}}) }
+      or print "Could not add META.yml to MANIFEST: $${'@'}\n"
+  CODE
+        $self->oneliner(<<'CODE', ['-MExtUtils::Manifest=maniadd'])
+  exit unless -f q{META.json};
+  eval { maniadd({q{META.json} => q{Module JSON meta-data (added by MakeMaker)}}) }
+      or print "Could not add META.json to MANIFEST: $${'@'}\n"
+  CODE
+      );
+  
+      my @add_meta_to_distdir = map { $self->cd('$(DISTVNAME)', $_) } @add_meta;
+  
+      return sprintf <<'MAKE', @add_meta_to_distdir;
+  distmeta : create_distdir metafile
+  	$(NOECHO) %s
+  	$(NOECHO) %s
+  
+  MAKE
+  
+  }
+  
+  
+  =head3 mymeta
+  
+      my $mymeta = $mm->mymeta;
+  
+  Generate MYMETA information as a hash either from an existing CPAN Meta file
+  (META.json or META.yml) or from internal data.
+  
+  =cut
+  
+  sub mymeta {
+      my $self = shift;
+      my $file = shift || ''; # for testing
+  
+      my $mymeta = $self->_mymeta_from_meta($file);
+      my $v2 = 1;
+  
+      unless ( $mymeta ) {
+          my @metadata = $self->metafile_data(
+              $self->{META_ADD}   || {},
+              $self->{META_MERGE} || {},
+          );
+          $mymeta = {@metadata};
+          $v2 = 0;
+      }
+  
+      # Overwrite the non-configure dependency hashes
+  
+      my $method = $v2
+                 ? '_add_requirements_to_meta_v2'
+                 : '_add_requirements_to_meta_v1_4';
+  
+      $mymeta = { $self->$method( %$mymeta ) };
+  
+      $mymeta->{dynamic_config} = 0;
+  
+      return $mymeta;
+  }
+  
+  
+  sub _mymeta_from_meta {
+      my $self = shift;
+      my $metafile = shift || ''; # for testing
+  
+      return unless _has_cpan_meta();
+  
+      my $meta;
+      for my $file ( $metafile, "META.json", "META.yml" ) {
+        next unless -e $file;
+        eval {
+            $meta = CPAN::Meta->load_file($file)->as_struct( { version => 2 } );
+        };
+        last if $meta;
+      }
+      return unless $meta;
+  
+      # META.yml before 6.25_01 cannot be trusted.  META.yml lived in the source directory.
+      # There was a good chance the author accidentally uploaded a stale META.yml if they
+      # rolled their own tarball rather than using "make dist".
+      if ($meta->{generated_by} &&
+          $meta->{generated_by} =~ /ExtUtils::MakeMaker version ([\d\._]+)/) {
+          my $eummv = do { local $^W = 0; $1+0; };
+          if ($eummv < 6.2501) {
+              return;
+          }
+      }
+  
+      return $meta;
+  }
+  
+  =head3 write_mymeta
+  
+      $self->write_mymeta( $mymeta );
+  
+  Write MYMETA information to MYMETA.json and MYMETA.yml.
+  
+  =cut
+  
+  sub write_mymeta {
+      my $self = shift;
+      my $mymeta = shift;
+  
+      return unless _has_cpan_meta();
+  
+      _fix_metadata_before_conversion( $mymeta );
+  
+      # this can still blow up
+      # not sure if i should just eval this and skip file creation if it
+      # blows up
+      my $meta_obj = CPAN::Meta->new( $mymeta, { lazy_validation => 1 } );
+      $meta_obj->save( 'MYMETA.json' );
+      $meta_obj->save( 'MYMETA.yml', { version => "1.4" } );
+      return 1;
+  }
+  
+  =head3 realclean (o)
+  
+  Defines the realclean target.
+  
+  =cut
+  
+  sub realclean {
+      my($self, %attribs) = @_;
+  
+      my @dirs  = qw($(DISTVNAME));
+      my @files = qw($(FIRST_MAKEFILE) $(MAKEFILE_OLD));
+  
+      # Special exception for the perl core where INST_* is not in blib.
+      # This cleans up the files built from the ext/ directory (all XS).
+      if( $self->{PERL_CORE} ) {
+          push @dirs, qw($(INST_AUTODIR) $(INST_ARCHAUTODIR));
+          push @files, values %{$self->{PM}};
+      }
+  
+      if( $self->has_link_code ){
+          push @files, qw($(OBJECT));
+      }
+  
+      if( $attribs{FILES} ) {
+          if( ref $attribs{FILES} ) {
+              push @dirs, @{ $attribs{FILES} };
+          }
+          else {
+              push @dirs, split /\s+/, $attribs{FILES};
+          }
+      }
+  
+      # Occasionally files are repeated several times from different sources
+      { my(%f) = map { ($_ => 1) } @files;  @files = keys %f; }
+      { my(%d) = map { ($_ => 1) } @dirs;   @dirs  = keys %d; }
+  
+      my $rm_cmd  = join "\n\t", map { "$_" }
+                      $self->split_command('- $(RM_F)',  @files);
+      my $rmf_cmd = join "\n\t", map { "$_" }
+                      $self->split_command('- $(RM_RF)', @dirs);
+  
+      my $m = sprintf <<'MAKE', $rm_cmd, $rmf_cmd;
+  # Delete temporary files (via clean) and also delete dist files
+  realclean purge ::  clean realclean_subdirs
+  	%s
+  	%s
+  MAKE
+  
+      $m .= "\t$attribs{POSTOP}\n" if $attribs{POSTOP};
+  
+      return $m;
+  }
+  
+  
+  =head3 realclean_subdirs_target
+  
+    my $make_frag = $MM->realclean_subdirs_target;
+  
+  Returns the realclean_subdirs target.  This is used by the realclean
+  target to call realclean on any subdirectories which contain Makefiles.
+  
+  =cut
+  
+  sub realclean_subdirs_target {
+      my $self = shift;
+  
+      return <<'NOOP_FRAG' unless @{$self->{DIR}};
+  realclean_subdirs :
+  	$(NOECHO) $(NOOP)
+  NOOP_FRAG
+  
+      my $rclean = "realclean_subdirs :\n";
+  
+      foreach my $dir (@{$self->{DIR}}) {
+          foreach my $makefile ('$(MAKEFILE_OLD)', '$(FIRST_MAKEFILE)' ) {
+              my $subrclean .= $self->oneliner(sprintf <<'CODE', $dir, ($makefile) x 2);
+  chdir '%s';  system '$(MAKE) $(USEMAKEFILE) %s realclean' if -f '%s';
+  CODE
+  
+              $rclean .= sprintf <<'RCLEAN', $subrclean;
+  	- %s
+  RCLEAN
+  
+          }
+      }
+  
+      return $rclean;
+  }
+  
+  
+  =head3 signature_target
+  
+      my $target = $mm->signature_target;
+  
+  Generate the signature target.
+  
+  Writes the file SIGNATURE with "cpansign -s".
+  
+  =cut
+  
+  sub signature_target {
+      my $self = shift;
+  
+      return <<'MAKE_FRAG';
+  signature :
+  	cpansign -s
+  MAKE_FRAG
+  
+  }
+  
+  
+  =head3 distsignature_target
+  
+      my $make_frag = $mm->distsignature_target;
+  
+  Generates the distsignature target to add SIGNATURE to the MANIFEST in the
+  distdir.
+  
+  =cut
+  
+  sub distsignature_target {
+      my $self = shift;
+  
+      my $add_sign = $self->oneliner(<<'CODE', ['-MExtUtils::Manifest=maniadd']);
+  eval { maniadd({q{SIGNATURE} => q{Public-key signature (added by MakeMaker)}}) }
+      or print "Could not add SIGNATURE to MANIFEST: $${'@'}\n"
+  CODE
+  
+      my $sign_dist        = $self->cd('$(DISTVNAME)' => 'cpansign -s');
+  
+      # cpansign -s complains if SIGNATURE is in the MANIFEST yet does not
+      # exist
+      my $touch_sig        = $self->cd('$(DISTVNAME)' => '$(TOUCH) SIGNATURE');
+      my $add_sign_to_dist = $self->cd('$(DISTVNAME)' => $add_sign );
+  
+      return sprintf <<'MAKE', $add_sign_to_dist, $touch_sig, $sign_dist
+  distsignature : create_distdir
+  	$(NOECHO) %s
+  	$(NOECHO) %s
+  	%s
+  
+  MAKE
+  
+  }
+  
+  
+  =head3 special_targets
+  
+    my $make_frag = $mm->special_targets
+  
+  Returns a make fragment containing any targets which have special
+  meaning to make.  For example, .SUFFIXES and .PHONY.
+  
+  =cut
+  
+  sub special_targets {
+      my $make_frag = <<'MAKE_FRAG';
+  .SUFFIXES : .xs .c .C .cpp .i .s .cxx .cc $(OBJ_EXT)
+  
+  .PHONY: all config static dynamic test linkext manifest blibdirs clean realclean disttest distdir
+  
+  MAKE_FRAG
+  
+      $make_frag .= <<'MAKE_FRAG' if $ENV{CLEARCASE_ROOT};
+  .NO_CONFIG_REC: Makefile
+  
+  MAKE_FRAG
+  
+      return $make_frag;
+  }
+  
+  
+  
+  
+  =head2 Init methods
+  
+  Methods which help initialize the MakeMaker object and macros.
+  
+  
+  =head3 init_ABSTRACT
+  
+      $mm->init_ABSTRACT
+  
+  =cut
+  
+  sub init_ABSTRACT {
+      my $self = shift;
+  
+      if( $self->{ABSTRACT_FROM} and $self->{ABSTRACT} ) {
+          warn "Both ABSTRACT_FROM and ABSTRACT are set.  ".
+               "Ignoring ABSTRACT_FROM.\n";
+          return;
+      }
+  
+      if ($self->{ABSTRACT_FROM}){
+          $self->{ABSTRACT} = $self->parse_abstract($self->{ABSTRACT_FROM}) or
+              carp "WARNING: Setting ABSTRACT via file ".
+                   "'$self->{ABSTRACT_FROM}' failed\n";
+      }
+  
+      if ($self->{ABSTRACT} && $self->{ABSTRACT} =~ m![[:cntrl:]]+!) {
+              warn "WARNING: ABSTRACT contains control character(s),".
+                   " they will be removed\n";
+              $self->{ABSTRACT} =~ s![[:cntrl:]]+!!g;
+              return;
+      }
+  }
+  
+  =head3 init_INST
+  
+      $mm->init_INST;
+  
+  Called by init_main.  Sets up all INST_* variables except those related
+  to XS code.  Those are handled in init_xs.
+  
+  =cut
+  
+  sub init_INST {
+      my($self) = shift;
+  
+      $self->{INST_ARCHLIB} ||= $self->catdir($Curdir,"blib","arch");
+      $self->{INST_BIN}     ||= $self->catdir($Curdir,'blib','bin');
+  
+      # INST_LIB typically pre-set if building an extension after
+      # perl has been built and installed. Setting INST_LIB allows
+      # you to build directly into, say $Config{privlibexp}.
+      unless ($self->{INST_LIB}){
+          if ($self->{PERL_CORE}) {
+              $self->{INST_LIB} = $self->{INST_ARCHLIB} = $self->{PERL_LIB};
+          } else {
+              $self->{INST_LIB} = $self->catdir($Curdir,"blib","lib");
+          }
+      }
+  
+      my @parentdir = split(/::/, $self->{PARENT_NAME});
+      $self->{INST_LIBDIR}      = $self->catdir('$(INST_LIB)',     @parentdir);
+      $self->{INST_ARCHLIBDIR}  = $self->catdir('$(INST_ARCHLIB)', @parentdir);
+      $self->{INST_AUTODIR}     = $self->catdir('$(INST_LIB)', 'auto',
+                                                '$(FULLEXT)');
+      $self->{INST_ARCHAUTODIR} = $self->catdir('$(INST_ARCHLIB)', 'auto',
+                                                '$(FULLEXT)');
+  
+      $self->{INST_SCRIPT}  ||= $self->catdir($Curdir,'blib','script');
+  
+      $self->{INST_MAN1DIR} ||= $self->catdir($Curdir,'blib','man1');
+      $self->{INST_MAN3DIR} ||= $self->catdir($Curdir,'blib','man3');
+  
+      return 1;
+  }
+  
+  
+  =head3 init_INSTALL
+  
+      $mm->init_INSTALL;
+  
+  Called by init_main.  Sets up all INSTALL_* variables (except
+  INSTALLDIRS) and *PREFIX.
+  
+  =cut
+  
+  sub init_INSTALL {
+      my($self) = shift;
+  
+      if( $self->{ARGS}{INSTALL_BASE} and $self->{ARGS}{PREFIX} ) {
+          die "Only one of PREFIX or INSTALL_BASE can be given.  Not both.\n";
+      }
+  
+      if( $self->{ARGS}{INSTALL_BASE} ) {
+          $self->init_INSTALL_from_INSTALL_BASE;
+      }
+      else {
+          $self->init_INSTALL_from_PREFIX;
+      }
+  }
+  
+  
+  =head3 init_INSTALL_from_PREFIX
+  
+    $mm->init_INSTALL_from_PREFIX;
+  
+  =cut
+  
+  sub init_INSTALL_from_PREFIX {
+      my $self = shift;
+  
+      $self->init_lib2arch;
+  
+      # There are often no Config.pm defaults for these new man variables so
+      # we fall back to the old behavior which is to use installman*dir
+      foreach my $num (1, 3) {
+          my $k = 'installsiteman'.$num.'dir';
+  
+          $self->{uc $k} ||= uc "\$(installman${num}dir)"
+            unless $Config{$k};
+      }
+  
+      foreach my $num (1, 3) {
+          my $k = 'installvendorman'.$num.'dir';
+  
+          unless( $Config{$k} ) {
+              $self->{uc $k}  ||= $Config{usevendorprefix}
+                                ? uc "\$(installman${num}dir)"
+                                : '';
+          }
+      }
+  
+      $self->{INSTALLSITEBIN} ||= '$(INSTALLBIN)'
+        unless $Config{installsitebin};
+      $self->{INSTALLSITESCRIPT} ||= '$(INSTALLSCRIPT)'
+        unless $Config{installsitescript};
+  
+      unless( $Config{installvendorbin} ) {
+          $self->{INSTALLVENDORBIN} ||= $Config{usevendorprefix}
+                                      ? $Config{installbin}
+                                      : '';
+      }
+      unless( $Config{installvendorscript} ) {
+          $self->{INSTALLVENDORSCRIPT} ||= $Config{usevendorprefix}
+                                         ? $Config{installscript}
+                                         : '';
+      }
+  
+  
+      my $iprefix = $Config{installprefixexp} || $Config{installprefix} ||
+                    $Config{prefixexp}        || $Config{prefix} || '';
+      my $vprefix = $Config{usevendorprefix}  ? $Config{vendorprefixexp} : '';
+      my $sprefix = $Config{siteprefixexp}    || '';
+  
+      # 5.005_03 doesn't have a siteprefix.
+      $sprefix = $iprefix unless $sprefix;
+  
+  
+      $self->{PREFIX}       ||= '';
+  
+      if( $self->{PREFIX} ) {
+          @{$self}{qw(PERLPREFIX SITEPREFIX VENDORPREFIX)} =
+            ('$(PREFIX)') x 3;
+      }
+      else {
+          $self->{PERLPREFIX}   ||= $iprefix;
+          $self->{SITEPREFIX}   ||= $sprefix;
+          $self->{VENDORPREFIX} ||= $vprefix;
+  
+          # Lots of MM extension authors like to use $(PREFIX) so we
+          # put something sensible in there no matter what.
+          $self->{PREFIX} = '$('.uc $self->{INSTALLDIRS}.'PREFIX)';
+      }
+  
+      my $arch    = $Config{archname};
+      my $version = $Config{version};
+  
+      # default style
+      my $libstyle = $Config{installstyle} || 'lib/perl5';
+      my $manstyle = '';
+  
+      if( $self->{LIBSTYLE} ) {
+          $libstyle = $self->{LIBSTYLE};
+          $manstyle = $self->{LIBSTYLE} eq 'lib/perl5' ? 'lib/perl5' : '';
+      }
+  
+      # Some systems, like VOS, set installman*dir to '' if they can't
+      # read man pages.
+      for my $num (1, 3) {
+          $self->{'INSTALLMAN'.$num.'DIR'} ||= 'none'
+            unless $Config{'installman'.$num.'dir'};
+      }
+  
+      my %bin_layouts =
+      (
+          bin         => { s => $iprefix,
+                           t => 'perl',
+                           d => 'bin' },
+          vendorbin   => { s => $vprefix,
+                           t => 'vendor',
+                           d => 'bin' },
+          sitebin     => { s => $sprefix,
+                           t => 'site',
+                           d => 'bin' },
+          script      => { s => $iprefix,
+                           t => 'perl',
+                           d => 'bin' },
+          vendorscript=> { s => $vprefix,
+                           t => 'vendor',
+                           d => 'bin' },
+          sitescript  => { s => $sprefix,
+                           t => 'site',
+                           d => 'bin' },
+      );
+  
+      my %man_layouts =
+      (
+          man1dir         => { s => $iprefix,
+                               t => 'perl',
+                               d => 'man/man1',
+                               style => $manstyle, },
+          siteman1dir     => { s => $sprefix,
+                               t => 'site',
+                               d => 'man/man1',
+                               style => $manstyle, },
+          vendorman1dir   => { s => $vprefix,
+                               t => 'vendor',
+                               d => 'man/man1',
+                               style => $manstyle, },
+  
+          man3dir         => { s => $iprefix,
+                               t => 'perl',
+                               d => 'man/man3',
+                               style => $manstyle, },
+          siteman3dir     => { s => $sprefix,
+                               t => 'site',
+                               d => 'man/man3',
+                               style => $manstyle, },
+          vendorman3dir   => { s => $vprefix,
+                               t => 'vendor',
+                               d => 'man/man3',
+                               style => $manstyle, },
+      );
+  
+      my %lib_layouts =
+      (
+          privlib     => { s => $iprefix,
+                           t => 'perl',
+                           d => '',
+                           style => $libstyle, },
+          vendorlib   => { s => $vprefix,
+                           t => 'vendor',
+                           d => '',
+                           style => $libstyle, },
+          sitelib     => { s => $sprefix,
+                           t => 'site',
+                           d => 'site_perl',
+                           style => $libstyle, },
+  
+          archlib     => { s => $iprefix,
+                           t => 'perl',
+                           d => "$version/$arch",
+                           style => $libstyle },
+          vendorarch  => { s => $vprefix,
+                           t => 'vendor',
+                           d => "$version/$arch",
+                           style => $libstyle },
+          sitearch    => { s => $sprefix,
+                           t => 'site',
+                           d => "site_perl/$version/$arch",
+                           style => $libstyle },
+      );
+  
+  
+      # Special case for LIB.
+      if( $self->{LIB} ) {
+          foreach my $var (keys %lib_layouts) {
+              my $Installvar = uc "install$var";
+  
+              if( $var =~ /arch/ ) {
+                  $self->{$Installvar} ||=
+                    $self->catdir($self->{LIB}, $Config{archname});
+              }
+              else {
+                  $self->{$Installvar} ||= $self->{LIB};
+              }
+          }
+      }
+  
+      my %type2prefix = ( perl    => 'PERLPREFIX',
+                          site    => 'SITEPREFIX',
+                          vendor  => 'VENDORPREFIX'
+                        );
+  
+      my %layouts = (%bin_layouts, %man_layouts, %lib_layouts);
+      while( my($var, $layout) = each(%layouts) ) {
+          my($s, $t, $d, $style) = @{$layout}{qw(s t d style)};
+          my $r = '$('.$type2prefix{$t}.')';
+  
+          warn "Prefixing $var\n" if $Verbose >= 2;
+  
+          my $installvar = "install$var";
+          my $Installvar = uc $installvar;
+          next if $self->{$Installvar};
+  
+          $d = "$style/$d" if $style;
+          $self->prefixify($installvar, $s, $r, $d);
+  
+          warn "  $Installvar == $self->{$Installvar}\n"
+            if $Verbose >= 2;
+      }
+  
+      # Generate these if they weren't figured out.
+      $self->{VENDORARCHEXP} ||= $self->{INSTALLVENDORARCH};
+      $self->{VENDORLIBEXP}  ||= $self->{INSTALLVENDORLIB};
+  
+      return 1;
+  }
+  
+  
+  =head3 init_from_INSTALL_BASE
+  
+      $mm->init_from_INSTALL_BASE
+  
+  =cut
+  
+  my %map = (
+             lib      => [qw(lib perl5)],
+             arch     => [('lib', 'perl5', $Config{archname})],
+             bin      => [qw(bin)],
+             man1dir  => [qw(man man1)],
+             man3dir  => [qw(man man3)]
+            );
+  $map{script} = $map{bin};
+  
+  sub init_INSTALL_from_INSTALL_BASE {
+      my $self = shift;
+  
+      @{$self}{qw(PREFIX VENDORPREFIX SITEPREFIX PERLPREFIX)} =
+                                                           '$(INSTALL_BASE)';
+  
+      my %install;
+      foreach my $thing (keys %map) {
+          foreach my $dir (('', 'SITE', 'VENDOR')) {
+              my $uc_thing = uc $thing;
+              my $key = "INSTALL".$dir.$uc_thing;
+  
+              $install{$key} ||=
+                $self->catdir('$(INSTALL_BASE)', @{$map{$thing}});
+          }
+      }
+  
+      # Adjust for variable quirks.
+      $install{INSTALLARCHLIB} ||= delete $install{INSTALLARCH};
+      $install{INSTALLPRIVLIB} ||= delete $install{INSTALLLIB};
+  
+      foreach my $key (keys %install) {
+          $self->{$key} ||= $install{$key};
+      }
+  
+      return 1;
+  }
+  
+  
+  =head3 init_VERSION  I<Abstract>
+  
+      $mm->init_VERSION
+  
+  Initialize macros representing versions of MakeMaker and other tools
+  
+  MAKEMAKER: path to the MakeMaker module.
+  
+  MM_VERSION: ExtUtils::MakeMaker Version
+  
+  MM_REVISION: ExtUtils::MakeMaker version control revision (for backwards
+               compat)
+  
+  VERSION: version of your module
+  
+  VERSION_MACRO: which macro represents the version (usually 'VERSION')
+  
+  VERSION_SYM: like version but safe for use as an RCS revision number
+  
+  DEFINE_VERSION: -D line to set the module version when compiling
+  
+  XS_VERSION: version in your .xs file.  Defaults to $(VERSION)
+  
+  XS_VERSION_MACRO: which macro represents the XS version.
+  
+  XS_DEFINE_VERSION: -D line to set the xs version when compiling.
+  
+  Called by init_main.
+  
+  =cut
+  
+  sub init_VERSION {
+      my($self) = shift;
+  
+      $self->{MAKEMAKER}  = $ExtUtils::MakeMaker::Filename;
+      $self->{MM_VERSION} = $ExtUtils::MakeMaker::VERSION;
+      $self->{MM_REVISION}= $ExtUtils::MakeMaker::Revision;
+      $self->{VERSION_FROM} ||= '';
+  
+      if ($self->{VERSION_FROM}){
+          $self->{VERSION} = $self->parse_version($self->{VERSION_FROM});
+          if( $self->{VERSION} eq 'undef' ) {
+              carp("WARNING: Setting VERSION via file ".
+                   "'$self->{VERSION_FROM}' failed\n");
+          }
+      }
+  
+      if (defined $self->{VERSION}) {
+          if ( $self->{VERSION} !~ /^\s*v?[\d_\.]+\s*$/ ) {
+            require version;
+            my $normal = eval { version->new( $self->{VERSION} ) };
+            $self->{VERSION} = $normal if defined $normal;
+          }
+          $self->{VERSION} =~ s/^\s+//;
+          $self->{VERSION} =~ s/\s+$//;
+      }
+      else {
+          $self->{VERSION} = '';
+      }
+  
+  
+      $self->{VERSION_MACRO}  = 'VERSION';
+      ($self->{VERSION_SYM} = $self->{VERSION}) =~ s/\W/_/g;
+      $self->{DEFINE_VERSION} = '-D$(VERSION_MACRO)=\"$(VERSION)\"';
+  
+  
+      # Graham Barr and Paul Marquess had some ideas how to ensure
+      # version compatibility between the *.pm file and the
+      # corresponding *.xs file. The bottom line was, that we need an
+      # XS_VERSION macro that defaults to VERSION:
+      $self->{XS_VERSION} ||= $self->{VERSION};
+  
+      $self->{XS_VERSION_MACRO}  = 'XS_VERSION';
+      $self->{XS_DEFINE_VERSION} = '-D$(XS_VERSION_MACRO)=\"$(XS_VERSION)\"';
+  
+  }
+  
+  
+  =head3 init_tools
+  
+      $MM->init_tools();
+  
+  Initializes the simple macro definitions used by tools_other() and
+  places them in the $MM object.  These use conservative cross platform
+  versions and should be overridden with platform specific versions for
+  performance.
+  
+  Defines at least these macros.
+  
+    Macro             Description
+  
+    NOOP              Do nothing
+    NOECHO            Tell make not to display the command itself
+  
+    SHELL             Program used to run shell commands
+  
+    ECHO              Print text adding a newline on the end
+    RM_F              Remove a file
+    RM_RF             Remove a directory
+    TOUCH             Update a file's timestamp
+    TEST_F            Test for a file's existence
+    TEST_S            Test the size of a file
+    CP                Copy a file
+    CP_NONEMPTY       Copy a file if it is not empty
+    MV                Move a file
+    CHMOD             Change permissions on a file
+    FALSE             Exit with non-zero
+    TRUE              Exit with zero
+  
+    UMASK_NULL        Nullify umask
+    DEV_NULL          Suppress all command output
+  
+  =cut
+  
+  sub init_tools {
+      my $self = shift;
+  
+      $self->{ECHO}     ||= $self->oneliner('binmode STDOUT, qq{:raw}; print qq{@ARGV}', ['-l']);
+      $self->{ECHO_N}   ||= $self->oneliner('print qq{@ARGV}');
+  
+      $self->{TOUCH}    ||= $self->oneliner('touch', ["-MExtUtils::Command"]);
+      $self->{CHMOD}    ||= $self->oneliner('chmod', ["-MExtUtils::Command"]);
+      $self->{RM_F}     ||= $self->oneliner('rm_f',  ["-MExtUtils::Command"]);
+      $self->{RM_RF}    ||= $self->oneliner('rm_rf', ["-MExtUtils::Command"]);
+      $self->{TEST_F}   ||= $self->oneliner('test_f', ["-MExtUtils::Command"]);
+      $self->{TEST_S}   ||= $self->oneliner('test_s', ["-MExtUtils::Command::MM"]);
+      $self->{CP_NONEMPTY} ||= $self->oneliner('cp_nonempty', ["-MExtUtils::Command::MM"]);
+      $self->{FALSE}    ||= $self->oneliner('exit 1');
+      $self->{TRUE}     ||= $self->oneliner('exit 0');
+  
+      $self->{MKPATH}   ||= $self->oneliner('mkpath', ["-MExtUtils::Command"]);
+  
+      $self->{CP}       ||= $self->oneliner('cp', ["-MExtUtils::Command"]);
+      $self->{MV}       ||= $self->oneliner('mv', ["-MExtUtils::Command"]);
+  
+      $self->{MOD_INSTALL} ||=
+        $self->oneliner(<<'CODE', ['-MExtUtils::Install']);
+  install([ from_to => {@ARGV}, verbose => '$(VERBINST)', uninstall_shadows => '$(UNINST)', dir_mode => '$(PERM_DIR)' ]);
+  CODE
+      $self->{DOC_INSTALL} ||= $self->oneliner('perllocal_install', ["-MExtUtils::Command::MM"]);
+      $self->{UNINSTALL}   ||= $self->oneliner('uninstall', ["-MExtUtils::Command::MM"]);
+      $self->{WARN_IF_OLD_PACKLIST} ||=
+        $self->oneliner('warn_if_old_packlist', ["-MExtUtils::Command::MM"]);
+      $self->{FIXIN}       ||= $self->oneliner('MY->fixin(shift)', ["-MExtUtils::MY"]);
+      $self->{EQUALIZE_TIMESTAMP} ||= $self->oneliner('eqtime', ["-MExtUtils::Command"]);
+  
+      $self->{UNINST}     ||= 0;
+      $self->{VERBINST}   ||= 0;
+  
+      $self->{SHELL}              ||= $Config{sh};
+  
+      # UMASK_NULL is not used by MakeMaker but some CPAN modules
+      # make use of it.
+      $self->{UMASK_NULL}         ||= "umask 0";
+  
+      # Not the greatest default, but its something.
+      $self->{DEV_NULL}           ||= "> /dev/null 2>&1";
+  
+      $self->{NOOP}               ||= '$(TRUE)';
+      $self->{NOECHO}             = '@' unless defined $self->{NOECHO};
+  
+      $self->{FIRST_MAKEFILE}     ||= $self->{MAKEFILE} || 'Makefile';
+      $self->{MAKEFILE}           ||= $self->{FIRST_MAKEFILE};
+      $self->{MAKEFILE_OLD}       ||= $self->{MAKEFILE}.'.old';
+      $self->{MAKE_APERL_FILE}    ||= $self->{MAKEFILE}.'.aperl';
+  
+      # Not everybody uses -f to indicate "use this Makefile instead"
+      $self->{USEMAKEFILE}        ||= '-f';
+  
+      # Some makes require a wrapper around macros passed in on the command
+      # line.
+      $self->{MACROSTART}         ||= '';
+      $self->{MACROEND}           ||= '';
+  
+      return;
+  }
+  
+  
+  =head3 init_others
+  
+      $MM->init_others();
+  
+  Initializes the macro definitions having to do with compiling and
+  linking used by tools_other() and places them in the $MM object.
+  
+  If there is no description, its the same as the parameter to
+  WriteMakefile() documented in ExtUtils::MakeMaker.
+  
+  =cut
+  
+  sub init_others {
+      my $self = shift;
+  
+      $self->{LD_RUN_PATH} = "";
+  
+      $self->{LIBS} = $self->_fix_libs($self->{LIBS});
+  
+      # Compute EXTRALIBS, BSLOADLIBS and LDLOADLIBS from $self->{LIBS}
+      foreach my $libs ( @{$self->{LIBS}} ){
+          $libs =~ s/^\s*(.*\S)\s*$/$1/; # remove leading and trailing whitespace
+          my(@libs) = $self->extliblist($libs);
+          if ($libs[0] or $libs[1] or $libs[2]){
+              # LD_RUN_PATH now computed by ExtUtils::Liblist
+              ($self->{EXTRALIBS},  $self->{BSLOADLIBS},
+               $self->{LDLOADLIBS}, $self->{LD_RUN_PATH}) = @libs;
+              last;
+          }
+      }
+  
+      if ( $self->{OBJECT} ) {
+          $self->{OBJECT} = join(" ", @{$self->{OBJECT}}) if ref $self->{OBJECT};
+          $self->{OBJECT} =~ s!\.o(bj)?\b!\$(OBJ_EXT)!g;
+      } elsif ( $self->{MAGICXS} && @{$self->{O_FILES}||[]} ) {
+          $self->{OBJECT} = join(" ", @{$self->{O_FILES}});
+          $self->{OBJECT} =~ s!\.o(bj)?\b!\$(OBJ_EXT)!g;
+      } else {
+          # init_dirscan should have found out, if we have C files
+          $self->{OBJECT} = "";
+          $self->{OBJECT} = '$(BASEEXT)$(OBJ_EXT)' if @{$self->{C}||[]};
+      }
+      $self->{OBJECT} =~ s/\n+/ \\\n\t/g;
+  
+      $self->{BOOTDEP}  = (-f "$self->{BASEEXT}_BS") ? "$self->{BASEEXT}_BS" : "";
+      $self->{PERLMAINCC} ||= '$(CC)';
+      $self->{LDFROM} = '$(OBJECT)' unless $self->{LDFROM};
+  
+      # Sanity check: don't define LINKTYPE = dynamic if we're skipping
+      # the 'dynamic' section of MM.  We don't have this problem with
+      # 'static', since we either must use it (%Config says we can't
+      # use dynamic loading) or the caller asked for it explicitly.
+      if (!$self->{LINKTYPE}) {
+         $self->{LINKTYPE} = $self->{SKIPHASH}{'dynamic'}
+                          ? 'static'
+                          : ($Config{usedl} ? 'dynamic' : 'static');
+      }
+  
+      return;
+  }
+  
+  
+  # Lets look at $self->{LIBS} carefully: It may be an anon array, a string or
+  # undefined. In any case we turn it into an anon array
+  sub _fix_libs {
+      my($self, $libs) = @_;
+  
+      return !defined $libs       ? ['']          :
+             !ref $libs           ? [$libs]       :
+             !defined $libs->[0]  ? ['']          :
+                                    $libs         ;
+  }
+  
+  
+  =head3 tools_other
+  
+      my $make_frag = $MM->tools_other;
+  
+  Returns a make fragment containing definitions for the macros init_others()
+  initializes.
+  
+  =cut
+  
+  sub tools_other {
+      my($self) = shift;
+      my @m;
+  
+      # We set PM_FILTER as late as possible so it can see all the earlier
+      # on macro-order sensitive makes such as nmake.
+      for my $tool (qw{ SHELL CHMOD CP MV NOOP NOECHO RM_F RM_RF TEST_F TOUCH
+                        UMASK_NULL DEV_NULL MKPATH EQUALIZE_TIMESTAMP
+                        FALSE TRUE
+                        ECHO ECHO_N
+                        UNINST VERBINST
+                        MOD_INSTALL DOC_INSTALL UNINSTALL
+                        WARN_IF_OLD_PACKLIST
+                        MACROSTART MACROEND
+                        USEMAKEFILE
+                        PM_FILTER
+                        FIXIN
+                        CP_NONEMPTY
+                      } )
+      {
+          next unless defined $self->{$tool};
+          push @m, "$tool = $self->{$tool}\n";
+      }
+  
+      return join "", @m;
+  }
+  
+  
+  =head3 init_DIRFILESEP  I<Abstract>
+  
+    $MM->init_DIRFILESEP;
+    my $dirfilesep = $MM->{DIRFILESEP};
+  
+  Initializes the DIRFILESEP macro which is the separator between the
+  directory and filename in a filepath.  ie. / on Unix, \ on Win32 and
+  nothing on VMS.
+  
+  For example:
+  
+      # instead of $(INST_ARCHAUTODIR)/extralibs.ld
+      $(INST_ARCHAUTODIR)$(DIRFILESEP)extralibs.ld
+  
+  Something of a hack but it prevents a lot of code duplication between
+  MM_* variants.
+  
+  Do not use this as a separator between directories.  Some operating
+  systems use different separators between subdirectories as between
+  directories and filenames (for example:  VOLUME:[dir1.dir2]file on VMS).
+  
+  =head3 init_linker  I<Abstract>
+  
+      $mm->init_linker;
+  
+  Initialize macros which have to do with linking.
+  
+  PERL_ARCHIVE: path to libperl.a equivalent to be linked to dynamic
+  extensions.
+  
+  PERL_ARCHIVE_AFTER: path to a library which should be put on the
+  linker command line I<after> the external libraries to be linked to
+  dynamic extensions.  This may be needed if the linker is one-pass, and
+  Perl includes some overrides for C RTL functions, such as malloc().
+  
+  EXPORT_LIST: name of a file that is passed to linker to define symbols
+  to be exported.
+  
+  Some OSes do not need these in which case leave it blank.
+  
+  
+  =head3 init_platform
+  
+      $mm->init_platform
+  
+  Initialize any macros which are for platform specific use only.
+  
+  A typical one is the version number of your OS specific module.
+  (ie. MM_Unix_VERSION or MM_VMS_VERSION).
+  
+  =cut
+  
+  sub init_platform {
+      return '';
+  }
+  
+  
+  =head3 init_MAKE
+  
+      $mm->init_MAKE
+  
+  Initialize MAKE from either a MAKE environment variable or $Config{make}.
+  
+  =cut
+  
+  sub init_MAKE {
+      my $self = shift;
+  
+      $self->{MAKE} ||= $ENV{MAKE} || $Config{make};
+  }
+  
+  
+  =head2 Tools
+  
+  A grab bag of methods to generate specific macros and commands.
+  
+  
+  
+  =head3 manifypods
+  
+  Defines targets and routines to translate the pods into manpages and
+  put them into the INST_* directories.
+  
+  =cut
+  
+  sub manifypods {
+      my $self          = shift;
+  
+      my $POD2MAN_macro = $self->POD2MAN_macro();
+      my $manifypods_target = $self->manifypods_target();
+  
+      return <<END_OF_TARGET;
+  
+  $POD2MAN_macro
+  
+  $manifypods_target
+  
+  END_OF_TARGET
+  
+  }
+  
+  
+  =head3 POD2MAN_macro
+  
+    my $pod2man_macro = $self->POD2MAN_macro
+  
+  Returns a definition for the POD2MAN macro.  This is a program
+  which emulates the pod2man utility.  You can add more switches to the
+  command by simply appending them on the macro.
+  
+  Typical usage:
+  
+      $(POD2MAN) --section=3 --perm_rw=$(PERM_RW) podfile1 man_page1 ...
+  
+  =cut
+  
+  sub POD2MAN_macro {
+      my $self = shift;
+  
+  # Need the trailing '--' so perl stops gobbling arguments and - happens
+  # to be an alternative end of line separator on VMS so we quote it
+      return <<'END_OF_DEF';
+  POD2MAN_EXE = $(PERLRUN) "-MExtUtils::Command::MM" -e pod2man "--"
+  POD2MAN = $(POD2MAN_EXE)
+  END_OF_DEF
+  }
+  
+  
+  =head3 test_via_harness
+  
+    my $command = $mm->test_via_harness($perl, $tests);
+  
+  Returns a $command line which runs the given set of $tests with
+  Test::Harness and the given $perl.
+  
+  Used on the t/*.t files.
+  
+  =cut
+  
+  sub test_via_harness {
+      my($self, $perl, $tests) = @_;
+  
+      return qq{\t$perl "-MExtUtils::Command::MM" "-MTest::Harness" }.
+             qq{"-e" "undef *Test::Harness::Switches; test_harness(\$(TEST_VERBOSE), '\$(INST_LIB)', '\$(INST_ARCHLIB)')" $tests\n};
+  }
+  
+  =head3 test_via_script
+  
+    my $command = $mm->test_via_script($perl, $script);
+  
+  Returns a $command line which just runs a single test without
+  Test::Harness.  No checks are done on the results, they're just
+  printed.
+  
+  Used for test.pl, since they don't always follow Test::Harness
+  formatting.
+  
+  =cut
+  
+  sub test_via_script {
+      my($self, $perl, $script) = @_;
+      return qq{\t$perl "-I\$(INST_LIB)" "-I\$(INST_ARCHLIB)" $script\n};
+  }
+  
+  
+  =head3 tool_autosplit
+  
+  Defines a simple perl call that runs autosplit. May be deprecated by
+  pm_to_blib soon.
+  
+  =cut
+  
+  sub tool_autosplit {
+      my($self, %attribs) = @_;
+  
+      my $maxlen = $attribs{MAXLEN} ? '$$AutoSplit::Maxlen=$attribs{MAXLEN};'
+                                    : '';
+  
+      my $asplit = $self->oneliner(sprintf <<'PERL_CODE', $maxlen);
+  use AutoSplit; %s autosplit($$ARGV[0], $$ARGV[1], 0, 1, 1)
+  PERL_CODE
+  
+      return sprintf <<'MAKE_FRAG', $asplit;
+  # Usage: $(AUTOSPLITFILE) FileToSplit AutoDirToSplitInto
+  AUTOSPLITFILE = %s
+  
+  MAKE_FRAG
+  
+  }
+  
+  
+  =head3 arch_check
+  
+      my $arch_ok = $mm->arch_check(
+          $INC{"Config.pm"},
+          File::Spec->catfile($Config{archlibexp}, "Config.pm")
+      );
+  
+  A sanity check that what Perl thinks the architecture is and what
+  Config thinks the architecture is are the same.  If they're not it
+  will return false and show a diagnostic message.
+  
+  When building Perl it will always return true, as nothing is installed
+  yet.
+  
+  The interface is a bit odd because this is the result of a
+  quick refactoring.  Don't rely on it.
+  
+  =cut
+  
+  sub arch_check {
+      my $self = shift;
+      my($pconfig, $cconfig) = @_;
+  
+      return 1 if $self->{PERL_SRC};
+  
+      my($pvol, $pthinks) = $self->splitpath($pconfig);
+      my($cvol, $cthinks) = $self->splitpath($cconfig);
+  
+      $pthinks = $self->canonpath($pthinks);
+      $cthinks = $self->canonpath($cthinks);
+  
+      my $ret = 1;
+      if ($pthinks ne $cthinks) {
+          print "Have $pthinks\n";
+          print "Want $cthinks\n";
+  
+          $ret = 0;
+  
+          my $arch = (grep length, $self->splitdir($pthinks))[-1];
+  
+          print <<END unless $self->{UNINSTALLED_PERL};
+  Your perl and your Config.pm seem to have different ideas about the
+  architecture they are running on.
+  Perl thinks: [$arch]
+  Config says: [$Config{archname}]
+  This may or may not cause problems. Please check your installation of perl
+  if you have problems building this extension.
+  END
+      }
+  
+      return $ret;
+  }
+  
+  
+  
+  =head2 File::Spec wrappers
+  
+  ExtUtils::MM_Any is a subclass of File::Spec.  The methods noted here
+  override File::Spec.
+  
+  
+  
+  =head3 catfile
+  
+  File::Spec <= 0.83 has a bug where the file part of catfile is not
+  canonicalized.  This override fixes that bug.
+  
+  =cut
+  
+  sub catfile {
+      my $self = shift;
+      return $self->canonpath($self->SUPER::catfile(@_));
+  }
+  
+  
+  
+  =head2 Misc
+  
+  Methods I can't really figure out where they should go yet.
+  
+  
+  =head3 find_tests
+  
+    my $test = $mm->find_tests;
+  
+  Returns a string suitable for feeding to the shell to return all
+  tests in t/*.t.
+  
+  =cut
+  
+  sub find_tests {
+      my($self) = shift;
+      return -d 't' ? 't/*.t' : '';
+  }
+  
+  =head3 find_tests_recursive
+  
+    my $tests = $mm->find_tests_recursive;
+  
+  Returns a string suitable for feeding to the shell to return all
+  tests in t/ but recursively.
+  
+  =cut
+  
+  sub find_tests_recursive {
+      my($self) = shift;
+      return '' unless -d 't';
+  
+      require File::Find;
+  
+      my %testfiles;
+  
+      my $wanted = sub {
+          return unless m!\.t$!;
+          my ($volume,$directories,$file) =
+              File::Spec->splitpath( $File::Find::name  );
+          my @dirs = File::Spec->splitdir( $directories );
+          for ( @dirs ) {
+            next if $_ eq 't';
+            unless ( $_ ) {
+              $_ = '*.t';
+              next;
+            }
+            $_ = '*';
+          }
+          my $testfile = join '/', @dirs;
+          $testfiles{ $testfile } = 1;
+      };
+  
+      File::Find::find( $wanted, 't' );
+  
+      return join ' ', sort keys %testfiles;
+  }
+  
+  =head3 extra_clean_files
+  
+      my @files_to_clean = $MM->extra_clean_files;
+  
+  Returns a list of OS specific files to be removed in the clean target in
+  addition to the usual set.
+  
+  =cut
+  
+  # An empty method here tickled a perl 5.8.1 bug and would return its object.
+  sub extra_clean_files {
+      return;
+  }
+  
+  
+  =head3 installvars
+  
+      my @installvars = $mm->installvars;
+  
+  A list of all the INSTALL* variables without the INSTALL prefix.  Useful
+  for iteration or building related variable sets.
+  
+  =cut
+  
+  sub installvars {
+      return qw(PRIVLIB SITELIB  VENDORLIB
+                ARCHLIB SITEARCH VENDORARCH
+                BIN     SITEBIN  VENDORBIN
+                SCRIPT  SITESCRIPT  VENDORSCRIPT
+                MAN1DIR SITEMAN1DIR VENDORMAN1DIR
+                MAN3DIR SITEMAN3DIR VENDORMAN3DIR
+               );
+  }
+  
+  
+  =head3 libscan
+  
+    my $wanted = $self->libscan($path);
+  
+  Takes a path to a file or dir and returns an empty string if we don't
+  want to include this file in the library.  Otherwise it returns the
+  the $path unchanged.
+  
+  Mainly used to exclude version control administrative directories from
+  installation.
+  
+  =cut
+  
+  sub libscan {
+      my($self,$path) = @_;
+      my($dirs,$file) = ($self->splitpath($path))[1,2];
+      return '' if grep /^(?:RCS|CVS|SCCS|\.svn|_darcs)$/,
+                       $self->splitdir($dirs), $file;
+  
+      return $path;
+  }
+  
+  
+  =head3 platform_constants
+  
+      my $make_frag = $mm->platform_constants
+  
+  Returns a make fragment defining all the macros initialized in
+  init_platform() rather than put them in constants().
+  
+  =cut
+  
+  sub platform_constants {
+      return '';
+  }
+  
+  =begin private
+  
+  =head3 _PREREQ_PRINT
+  
+      $self->_PREREQ_PRINT;
+  
+  Implements PREREQ_PRINT.
+  
+  Refactored out of MakeMaker->new().
+  
+  =end private
+  
+  =cut
+  
+  sub _PREREQ_PRINT {
+      my $self = shift;
+  
+      require Data::Dumper;
+      my @what = ('PREREQ_PM');
+      push @what, 'MIN_PERL_VERSION' if $self->{MIN_PERL_VERSION};
+      push @what, 'BUILD_REQUIRES'   if $self->{BUILD_REQUIRES};
+      print Data::Dumper->Dump([@{$self}{@what}], \@what);
+      exit 0;
+  }
+  
+  
+  =begin private
+  
+  =head3 _PRINT_PREREQ
+  
+    $mm->_PRINT_PREREQ;
+  
+  Implements PRINT_PREREQ, a slightly different version of PREREQ_PRINT
+  added by Redhat to, I think, support generating RPMs from Perl modules.
+  
+  Should not include BUILD_REQUIRES as RPMs do not incluide them.
+  
+  Refactored out of MakeMaker->new().
+  
+  =end private
+  
+  =cut
+  
+  sub _PRINT_PREREQ {
+      my $self = shift;
+  
+      my $prereqs= $self->{PREREQ_PM};
+      my @prereq = map { [$_, $prereqs->{$_}] } keys %$prereqs;
+  
+      if ( $self->{MIN_PERL_VERSION} ) {
+          push @prereq, ['perl' => $self->{MIN_PERL_VERSION}];
+      }
+  
+      print join(" ", map { "perl($_->[0])>=$_->[1] " }
+                   sort { $a->[0] cmp $b->[0] } @prereq), "\n";
+      exit 0;
+  }
+  
+  
+  =begin private
+  
+  =head3 _all_prereqs
+  
+    my $prereqs = $self->_all_prereqs;
+  
+  Returns a hash ref of both PREREQ_PM and BUILD_REQUIRES.
+  
+  =end private
+  
+  =cut
+  
+  sub _all_prereqs {
+      my $self = shift;
+  
+      return { %{$self->{PREREQ_PM}}, %{$self->{BUILD_REQUIRES}} };
+  }
+  
+  =begin private
+  
+  =head3 _perl_header_files
+  
+    my $perl_header_files= $self->_perl_header_files;
+  
+  returns a sorted list of header files as found in PERL_SRC or $archlibexp/CORE.
+  
+  Used by perldepend() in MM_Unix and MM_VMS via _perl_header_files_fragment()
+  
+  =end private
+  
+  =cut
+  
+  sub _perl_header_files {
+      my $self = shift;
+  
+      my $header_dir = $self->{PERL_SRC} || $ENV{PERL_SRC} || $self->catdir($Config{archlibexp}, 'CORE');
+      opendir my $dh, $header_dir
+          or die "Failed to opendir '$header_dir' to find header files: $!";
+  
+      # we need to use a temporary here as the sort in scalar context would have undefined results.
+      my @perl_headers= sort grep { /\.h\z/ } readdir($dh);
+  
+      closedir $dh;
+  
+      return @perl_headers;
+  }
+  
+  =begin private
+  
+  =head3 _perl_header_files_fragment ($o, $separator)
+  
+    my $perl_header_files_fragment= $self->_perl_header_files_fragment("/");
+  
+  return a Makefile fragment which holds the list of perl header files which
+  XS code depends on $(PERL_INC), and sets up the dependency for the $(OBJECT) file.
+  
+  The $separator argument defaults to "". MM_VMS will set it to "" and MM_UNIX to "/"
+  in perldepend(). This reason child subclasses need to control this is that in
+  VMS the $(PERL_INC) directory will already have delimiters in it, but in
+  UNIX $(PERL_INC) will need a slash between it an the filename. Hypothetically
+  win32 could use "\\" (but it doesn't need to).
+  
+  =end private
+  
+  =cut
+  
+  sub _perl_header_files_fragment {
+      my ($self, $separator)= @_;
+      $separator ||= "";
+      return join("\\\n",
+                  "PERL_HDRS = ",
+                  map {
+                      sprintf( "        \$(PERL_INCDEP)%s%s            ", $separator, $_ )
+                  } $self->_perl_header_files()
+             ) . "\n\n"
+             . "\$(OBJECT) : \$(PERL_HDRS)\n";
+  }
+  
+  
+  =head1 AUTHOR
+  
+  Michael G Schwern <schwern@pobox.com> and the denizens of
+  makemaker@perl.org with code from ExtUtils::MM_Unix and
+  ExtUtils::MM_Win32.
+  
+  
+  =cut
+  
+  1;
+EXTUTILS_MM_ANY
+
+$fatpacked{"ExtUtils/MM_BeOS.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_MM_BEOS';
+  package ExtUtils::MM_BeOS;
+  
+  use strict;
+  
+  =head1 NAME
+  
+  ExtUtils::MM_BeOS - methods to override UN*X behaviour in ExtUtils::MakeMaker
+  
+  =head1 SYNOPSIS
+  
+   use ExtUtils::MM_BeOS;	# Done internally by ExtUtils::MakeMaker if needed
+  
+  =head1 DESCRIPTION
+  
+  See ExtUtils::MM_Unix for a documentation of the methods provided
+  there. This package overrides the implementation of these methods, not
+  the semantics.
+  
+  =over 4
+  
+  =cut
+  
+  use ExtUtils::MakeMaker::Config;
+  use File::Spec;
+  require ExtUtils::MM_Any;
+  require ExtUtils::MM_Unix;
+  
+  our @ISA = qw( ExtUtils::MM_Any ExtUtils::MM_Unix );
+  our $VERSION = '7.04';
+  
+  
+  =item os_flavor
+  
+  BeOS is BeOS.
+  
+  =cut
+  
+  sub os_flavor {
+      return('BeOS');
+  }
+  
+  =item init_linker
+  
+  libperl.a equivalent to be linked to dynamic extensions.
+  
+  =cut
+  
+  sub init_linker {
+      my($self) = shift;
+  
+      $self->{PERL_ARCHIVE} ||=
+        File::Spec->catdir('$(PERL_INC)',$Config{libperl});
+      $self->{PERL_ARCHIVEDEP} ||= '';
+      $self->{PERL_ARCHIVE_AFTER} ||= '';
+      $self->{EXPORT_LIST}  ||= '';
+  }
+  
+  =back
+  
+  1;
+  __END__
+  
+EXTUTILS_MM_BEOS
+
+$fatpacked{"ExtUtils/MM_Cygwin.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_MM_CYGWIN';
+  package ExtUtils::MM_Cygwin;
+  
+  use strict;
+  
+  use ExtUtils::MakeMaker::Config;
+  use File::Spec;
+  
+  require ExtUtils::MM_Unix;
+  require ExtUtils::MM_Win32;
+  our @ISA = qw( ExtUtils::MM_Unix );
+  
+  our $VERSION = '7.04';
+  
+  
+  =head1 NAME
+  
+  ExtUtils::MM_Cygwin - methods to override UN*X behaviour in ExtUtils::MakeMaker
+  
+  =head1 SYNOPSIS
+  
+   use ExtUtils::MM_Cygwin; # Done internally by ExtUtils::MakeMaker if needed
+  
+  =head1 DESCRIPTION
+  
+  See ExtUtils::MM_Unix for a documentation of the methods provided there.
+  
+  =over 4
+  
+  =item os_flavor
+  
+  We're Unix and Cygwin.
+  
+  =cut
+  
+  sub os_flavor {
+      return('Unix', 'Cygwin');
+  }
+  
+  =item cflags
+  
+  if configured for dynamic loading, triggers #define EXT in EXTERN.h
+  
+  =cut
+  
+  sub cflags {
+      my($self,$libperl)=@_;
+      return $self->{CFLAGS} if $self->{CFLAGS};
+      return '' unless $self->needs_linking();
+  
+      my $base = $self->SUPER::cflags($libperl);
+      foreach (split /\n/, $base) {
+          /^(\S*)\s*=\s*(\S*)$/ and $self->{$1} = $2;
+      };
+      $self->{CCFLAGS} .= " -DUSEIMPORTLIB" if ($Config{useshrplib} eq 'true');
+  
+      return $self->{CFLAGS} = qq{
+  CCFLAGS = $self->{CCFLAGS}
+  OPTIMIZE = $self->{OPTIMIZE}
+  PERLTYPE = $self->{PERLTYPE}
+  };
+  
+  }
+  
+  
+  =item replace_manpage_separator
+  
+  replaces strings '::' with '.' in MAN*POD man page names
+  
+  =cut
+  
+  sub replace_manpage_separator {
+      my($self, $man) = @_;
+      $man =~ s{/+}{.}g;
+      return $man;
+  }
+  
+  =item init_linker
+  
+  points to libperl.a
+  
+  =cut
+  
+  sub init_linker {
+      my $self = shift;
+  
+      if ($Config{useshrplib} eq 'true') {
+          my $libperl = '$(PERL_INC)' .'/'. "$Config{libperl}";
+          if( $] >= 5.006002 ) {
+              $libperl =~ s/a$/dll.a/;
+          }
+          $self->{PERL_ARCHIVE} = $libperl;
+      } else {
+          $self->{PERL_ARCHIVE} =
+            '$(PERL_INC)' .'/'. ("$Config{libperl}" or "libperl.a");
+      }
+  
+      $self->{PERL_ARCHIVEDEP} ||= '';
+      $self->{PERL_ARCHIVE_AFTER} ||= '';
+      $self->{EXPORT_LIST}  ||= '';
+  }
+  
+  =item maybe_command
+  
+  Determine whether a file is native to Cygwin by checking whether it
+  resides inside the Cygwin installation (using Windows paths). If so,
+  use C<ExtUtils::MM_Unix> to determine if it may be a command.
+  Otherwise use the tests from C<ExtUtils::MM_Win32>.
+  
+  =cut
+  
+  sub maybe_command {
+      my ($self, $file) = @_;
+  
+      my $cygpath = Cygwin::posix_to_win_path('/', 1);
+      my $filepath = Cygwin::posix_to_win_path($file, 1);
+  
+      return (substr($filepath,0,length($cygpath)) eq $cygpath)
+      ? $self->SUPER::maybe_command($file) # Unix
+      : ExtUtils::MM_Win32->maybe_command($file); # Win32
+  }
+  
+  =item dynamic_lib
+  
+  Use the default to produce the *.dll's.
+  But for new archdir dll's use the same rebase address if the old exists.
+  
+  =cut
+  
+  sub dynamic_lib {
+      my($self, %attribs) = @_;
+      my $s = ExtUtils::MM_Unix::dynamic_lib($self, %attribs);
+      my $ori = "$self->{INSTALLARCHLIB}/auto/$self->{FULLEXT}/$self->{BASEEXT}.$self->{DLEXT}";
+      if (-e $ori) {
+          my $imagebase = `/bin/objdump -p $ori | /bin/grep ImageBase | /bin/cut -c12-`;
+          chomp $imagebase;
+          if ($imagebase gt "40000000") {
+              my $LDDLFLAGS = $self->{LDDLFLAGS};
+              $LDDLFLAGS =~ s/-Wl,--enable-auto-image-base/-Wl,--image-base=0x$imagebase/;
+              $s =~ s/ \$\(LDDLFLAGS\) / $LDDLFLAGS /m;
+          }
+      }
+      $s;
+  }
+  
+  =item all_target
+  
+  Build man pages, too
+  
+  =cut
+  
+  sub all_target {
+      ExtUtils::MM_Unix::all_target(shift);
+  }
+  
+  =back
+  
+  =cut
+  
+  1;
+EXTUTILS_MM_CYGWIN
+
+$fatpacked{"ExtUtils/MM_DOS.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_MM_DOS';
+  package ExtUtils::MM_DOS;
+  
+  use strict;
+  
+  our $VERSION = '7.04';
+  
+  require ExtUtils::MM_Any;
+  require ExtUtils::MM_Unix;
+  our @ISA = qw( ExtUtils::MM_Any ExtUtils::MM_Unix );
+  
+  
+  =head1 NAME
+  
+  ExtUtils::MM_DOS - DOS specific subclass of ExtUtils::MM_Unix
+  
+  =head1 SYNOPSIS
+  
+    Don't use this module directly.
+    Use ExtUtils::MM and let it choose.
+  
+  =head1 DESCRIPTION
+  
+  This is a subclass of ExtUtils::MM_Unix which contains functionality
+  for DOS.
+  
+  Unless otherwise stated, it works just like ExtUtils::MM_Unix
+  
+  =head2 Overridden methods
+  
+  =over 4
+  
+  =item os_flavor
+  
+  =cut
+  
+  sub os_flavor {
+      return('DOS');
+  }
+  
+  =item B<replace_manpage_separator>
+  
+  Generates Foo__Bar.3 style man page names
+  
+  =cut
+  
+  sub replace_manpage_separator {
+      my($self, $man) = @_;
+  
+      $man =~ s,/+,__,g;
+      return $man;
+  }
+  
+  =back
+  
+  =head1 AUTHOR
+  
+  Michael G Schwern <schwern@pobox.com> with code from ExtUtils::MM_Unix
+  
+  =head1 SEE ALSO
+  
+  L<ExtUtils::MM_Unix>, L<ExtUtils::MakeMaker>
+  
+  =cut
+  
+  1;
+EXTUTILS_MM_DOS
+
+$fatpacked{"ExtUtils/MM_Darwin.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_MM_DARWIN';
+  package ExtUtils::MM_Darwin;
+  
+  use strict;
+  
+  BEGIN {
+      require ExtUtils::MM_Unix;
+      our @ISA = qw( ExtUtils::MM_Unix );
+  }
+  
+  our $VERSION = '7.04';
+  
+  
+  =head1 NAME
+  
+  ExtUtils::MM_Darwin - special behaviors for OS X
+  
+  =head1 SYNOPSIS
+  
+      For internal MakeMaker use only
+  
+  =head1 DESCRIPTION
+  
+  See L<ExtUtils::MM_Unix> for L<ExtUtils::MM_Any> for documentation on the
+  methods overridden here.
+  
+  =head2 Overriden Methods
+  
+  =head3 init_dist
+  
+  Turn off Apple tar's tendency to copy resource forks as "._foo" files.
+  
+  =cut
+  
+  sub init_dist {
+      my $self = shift;
+  
+      # Thank you, Apple, for breaking tar and then breaking the work around.
+      # 10.4 wants COPY_EXTENDED_ATTRIBUTES_DISABLE while 10.5 wants
+      # COPYFILE_DISABLE.  I'm not going to push my luck and instead just
+      # set both.
+      $self->{TAR} ||=
+          'COPY_EXTENDED_ATTRIBUTES_DISABLE=1 COPYFILE_DISABLE=1 tar';
+  
+      $self->SUPER::init_dist(@_);
+  }
+  
+  1;
+EXTUTILS_MM_DARWIN
+
+$fatpacked{"ExtUtils/MM_MacOS.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_MM_MACOS';
+  package ExtUtils::MM_MacOS;
+  
+  use strict;
+  
+  our $VERSION = '7.04';
+  
+  sub new {
+      die 'MacOS Classic (MacPerl) is no longer supported by MakeMaker';
+  }
+  
+  =head1 NAME
+  
+  ExtUtils::MM_MacOS - once produced Makefiles for MacOS Classic
+  
+  =head1 SYNOPSIS
+  
+    # MM_MacOS no longer contains any code.  This is just a stub.
+  
+  =head1 DESCRIPTION
+  
+  Once upon a time, MakeMaker could produce an approximation of a correct
+  Makefile on MacOS Classic (MacPerl).  Due to a lack of maintainers, this
+  fell out of sync with the rest of MakeMaker and hadn't worked in years.
+  Since there's little chance of it being repaired, MacOS Classic is fading
+  away, and the code was icky to begin with, the code has been deleted to
+  make maintenance easier.
+  
+  Anyone interested in resurrecting this file should pull the old version
+  from the MakeMaker CVS repository and contact makemaker@perl.org.
+  
+  =cut
+  
+  1;
+EXTUTILS_MM_MACOS
+
+$fatpacked{"ExtUtils/MM_NW5.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_MM_NW5';
+  package ExtUtils::MM_NW5;
+  
+  =head1 NAME
+  
+  ExtUtils::MM_NW5 - methods to override UN*X behaviour in ExtUtils::MakeMaker
+  
+  =head1 SYNOPSIS
+  
+   use ExtUtils::MM_NW5; # Done internally by ExtUtils::MakeMaker if needed
+  
+  =head1 DESCRIPTION
+  
+  See ExtUtils::MM_Unix for a documentation of the methods provided
+  there. This package overrides the implementation of these methods, not
+  the semantics.
+  
+  =over
+  
+  =cut
+  
+  use strict;
+  use ExtUtils::MakeMaker::Config;
+  use File::Basename;
+  
+  our $VERSION = '7.04';
+  
+  require ExtUtils::MM_Win32;
+  our @ISA = qw(ExtUtils::MM_Win32);
+  
+  use ExtUtils::MakeMaker qw( &neatvalue );
+  
+  $ENV{EMXSHELL} = 'sh'; # to run `commands`
+  
+  my $BORLAND  = $Config{'cc'} =~ /^bcc/i;
+  my $GCC      = $Config{'cc'} =~ /^gcc/i;
+  
+  
+  =item os_flavor
+  
+  We're Netware in addition to being Windows.
+  
+  =cut
+  
+  sub os_flavor {
+      my $self = shift;
+      return ($self->SUPER::os_flavor, 'Netware');
+  }
+  
+  =item init_platform
+  
+  Add Netware macros.
+  
+  LIBPTH, BASE_IMPORT, NLM_VERSION, MPKTOOL, TOOLPATH, BOOT_SYMBOL,
+  NLM_SHORT_NAME, INCLUDE, PATH, MM_NW5_REVISION
+  
+  
+  =item platform_constants
+  
+  Add Netware macros initialized above to the Makefile.
+  
+  =cut
+  
+  sub init_platform {
+      my($self) = shift;
+  
+      # To get Win32's setup.
+      $self->SUPER::init_platform;
+  
+      # incpath is copied to makefile var INCLUDE in constants sub, here just
+      # make it empty
+      my $libpth = $Config{'libpth'};
+      $libpth =~ s( )(;);
+      $self->{'LIBPTH'} = $libpth;
+  
+      $self->{'BASE_IMPORT'} = $Config{'base_import'};
+  
+      # Additional import file specified from Makefile.pl
+      if($self->{'base_import'}) {
+          $self->{'BASE_IMPORT'} .= ', ' . $self->{'base_import'};
+      }
+  
+      $self->{'NLM_VERSION'} = $Config{'nlm_version'};
+      $self->{'MPKTOOL'}	= $Config{'mpktool'};
+      $self->{'TOOLPATH'}	= $Config{'toolpath'};
+  
+      (my $boot = $self->{'NAME'}) =~ s/:/_/g;
+      $self->{'BOOT_SYMBOL'}=$boot;
+  
+      # If the final binary name is greater than 8 chars,
+      # truncate it here.
+      if(length($self->{'BASEEXT'}) > 8) {
+          $self->{'NLM_SHORT_NAME'} = substr($self->{'BASEEXT'},0,8);
+      }
+  
+      # Get the include path and replace the spaces with ;
+      # Copy this to makefile as INCLUDE = d:\...;d:\;
+      ($self->{INCLUDE} = $Config{'incpath'}) =~ s/([ ]*)-I/;/g;
+  
+      # Set the path to CodeWarrior binaries which might not have been set in
+      # any other place
+      $self->{PATH} = '$(PATH);$(TOOLPATH)';
+  
+      $self->{MM_NW5_VERSION} = $VERSION;
+  }
+  
+  sub platform_constants {
+      my($self) = shift;
+      my $make_frag = '';
+  
+      # Setup Win32's constants.
+      $make_frag .= $self->SUPER::platform_constants;
+  
+      foreach my $macro (qw(LIBPTH BASE_IMPORT NLM_VERSION MPKTOOL
+                            TOOLPATH BOOT_SYMBOL NLM_SHORT_NAME INCLUDE PATH
+                            MM_NW5_VERSION
+                        ))
+      {
+          next unless defined $self->{$macro};
+          $make_frag .= "$macro = $self->{$macro}\n";
+      }
+  
+      return $make_frag;
+  }
+  
+  
+  =item const_cccmd
+  
+  =cut
+  
+  sub const_cccmd {
+      my($self,$libperl)=@_;
+      return $self->{CONST_CCCMD} if $self->{CONST_CCCMD};
+      return '' unless $self->needs_linking();
+      return $self->{CONST_CCCMD} = <<'MAKE_FRAG';
+  CCCMD = $(CC) $(CCFLAGS) $(INC) $(OPTIMIZE) \
+  	$(PERLTYPE) $(MPOLLUTE) -o $@ \
+  	-DVERSION=\"$(VERSION)\" -DXS_VERSION=\"$(XS_VERSION)\"
+  MAKE_FRAG
+  
+  }
+  
+  
+  =item static_lib
+  
+  =cut
+  
+  sub static_lib {
+      my($self) = @_;
+  
+      return '' unless $self->has_link_code;
+  
+      my $m = <<'END';
+  $(INST_STATIC): $(OBJECT) $(MYEXTLIB) $(INST_ARCHAUTODIR)$(DFSEP).exists
+  	$(RM_RF) $@
+  END
+  
+      # If this extension has it's own library (eg SDBM_File)
+      # then copy that to $(INST_STATIC) and add $(OBJECT) into it.
+      $m .= <<'END'  if $self->{MYEXTLIB};
+  	$self->{CP} $(MYEXTLIB) $@
+  END
+  
+      my $ar_arg;
+      if( $BORLAND ) {
+          $ar_arg = '$@ $(OBJECT:^"+")';
+      }
+      elsif( $GCC ) {
+          $ar_arg = '-ru $@ $(OBJECT)';
+      }
+      else {
+          $ar_arg = '-type library -o $@ $(OBJECT)';
+      }
+  
+      $m .= sprintf <<'END', $ar_arg;
+  	$(AR) %s
+  	$(NOECHO) $(ECHO) "$(EXTRALIBS)" > $(INST_ARCHAUTODIR)\extralibs.ld
+  	$(CHMOD) 755 $@
+  END
+  
+      $m .= <<'END' if $self->{PERL_SRC};
+  	$(NOECHO) $(ECHO) "$(EXTRALIBS)" >> $(PERL_SRC)\ext.libs
+  
+  
+  END
+      return $m;
+  }
+  
+  =item dynamic_lib
+  
+  Defines how to produce the *.so (or equivalent) files.
+  
+  =cut
+  
+  sub dynamic_lib {
+      my($self, %attribs) = @_;
+      return '' unless $self->needs_linking(); #might be because of a subdir
+  
+      return '' unless $self->has_link_code;
+  
+      my($otherldflags) = $attribs{OTHERLDFLAGS} || ($BORLAND ? 'c0d32.obj': '');
+      my($inst_dynamic_dep) = $attribs{INST_DYNAMIC_DEP} || "";
+      my($ldfrom) = '$(LDFROM)';
+  
+      (my $boot = $self->{NAME}) =~ s/:/_/g;
+  
+      my $m = <<'MAKE_FRAG';
+  # This section creates the dynamically loadable $(INST_DYNAMIC)
+  # from $(OBJECT) and possibly $(MYEXTLIB).
+  OTHERLDFLAGS = '.$otherldflags.'
+  INST_DYNAMIC_DEP = '.$inst_dynamic_dep.'
+  
+  # Create xdc data for an MT safe NLM in case of mpk build
+  $(INST_DYNAMIC): $(OBJECT) $(MYEXTLIB) $(BOOTSTRAP) $(INST_ARCHAUTODIR)$(DFSEP).exists
+  	$(NOECHO) $(ECHO) Export boot_$(BOOT_SYMBOL) > $(BASEEXT).def
+  	$(NOECHO) $(ECHO) $(BASE_IMPORT) >> $(BASEEXT).def
+  	$(NOECHO) $(ECHO) Import @$(PERL_INC)\perl.imp >> $(BASEEXT).def
+  MAKE_FRAG
+  
+  
+      if ( $self->{CCFLAGS} =~ m/ -DMPK_ON /) {
+          $m .= <<'MAKE_FRAG';
+  	$(MPKTOOL) $(XDCFLAGS) $(BASEEXT).xdc
+  	$(NOECHO) $(ECHO) xdcdata $(BASEEXT).xdc >> $(BASEEXT).def
+  MAKE_FRAG
+      }
+  
+      # Reconstruct the X.Y.Z version.
+      my $version = join '.', map { sprintf "%d", $_ }
+                                $] =~ /(\d)\.(\d{3})(\d{2})/;
+      $m .= sprintf '	$(LD) $(LDFLAGS) $(OBJECT:.obj=.obj) -desc "Perl %s Extension ($(BASEEXT))  XS_VERSION: $(XS_VERSION)" -nlmversion $(NLM_VERSION)', $version;
+  
+      # Taking care of long names like FileHandle, ByteLoader, SDBM_File etc
+      if($self->{NLM_SHORT_NAME}) {
+          # In case of nlms with names exceeding 8 chars, build nlm in the
+          # current dir, rename and move to auto\lib.
+          $m .= q{ -o $(NLM_SHORT_NAME).$(DLEXT)}
+      } else {
+          $m .= q{ -o $(INST_AUTODIR)\\$(BASEEXT).$(DLEXT)}
+      }
+  
+      # Add additional lib files if any (SDBM_File)
+      $m .= q{ $(MYEXTLIB) } if $self->{MYEXTLIB};
+  
+      $m .= q{ $(PERL_INC)\Main.lib -commandfile $(BASEEXT).def}."\n";
+  
+      if($self->{NLM_SHORT_NAME}) {
+          $m .= <<'MAKE_FRAG';
+  	if exist $(INST_AUTODIR)\$(NLM_SHORT_NAME).$(DLEXT) del $(INST_AUTODIR)\$(NLM_SHORT_NAME).$(DLEXT)
+  	move $(NLM_SHORT_NAME).$(DLEXT) $(INST_AUTODIR)
+  MAKE_FRAG
+      }
+  
+      $m .= <<'MAKE_FRAG';
+  
+  	$(CHMOD) 755 $@
+  MAKE_FRAG
+  
+      return $m;
+  }
+  
+  
+  1;
+  __END__
+  
+  =back
+  
+  =cut
+  
+  
+EXTUTILS_MM_NW5
+
+$fatpacked{"ExtUtils/MM_OS2.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_MM_OS2';
+  package ExtUtils::MM_OS2;
+  
+  use strict;
+  
+  use ExtUtils::MakeMaker qw(neatvalue);
+  use File::Spec;
+  
+  our $VERSION = '7.04';
+  
+  require ExtUtils::MM_Any;
+  require ExtUtils::MM_Unix;
+  our @ISA = qw(ExtUtils::MM_Any ExtUtils::MM_Unix);
+  
+  =pod
+  
+  =head1 NAME
+  
+  ExtUtils::MM_OS2 - methods to override UN*X behaviour in ExtUtils::MakeMaker
+  
+  =head1 SYNOPSIS
+  
+   use ExtUtils::MM_OS2; # Done internally by ExtUtils::MakeMaker if needed
+  
+  =head1 DESCRIPTION
+  
+  See ExtUtils::MM_Unix for a documentation of the methods provided
+  there. This package overrides the implementation of these methods, not
+  the semantics.
+  
+  =head1 METHODS
+  
+  =over 4
+  
+  =item init_dist
+  
+  Define TO_UNIX to convert OS2 linefeeds to Unix style.
+  
+  =cut
+  
+  sub init_dist {
+      my($self) = @_;
+  
+      $self->{TO_UNIX} ||= <<'MAKE_TEXT';
+  $(NOECHO) $(TEST_F) tmp.zip && $(RM_F) tmp.zip; $(ZIP) -ll -mr tmp.zip $(DISTVNAME) && unzip -o tmp.zip && $(RM_F) tmp.zip
+  MAKE_TEXT
+  
+      $self->SUPER::init_dist;
+  }
+  
+  sub dlsyms {
+      my($self,%attribs) = @_;
+  
+      my($funcs) = $attribs{DL_FUNCS} || $self->{DL_FUNCS} || {};
+      my($vars)  = $attribs{DL_VARS} || $self->{DL_VARS} || [];
+      my($funclist) = $attribs{FUNCLIST} || $self->{FUNCLIST} || [];
+      my($imports)  = $attribs{IMPORTS} || $self->{IMPORTS} || {};
+      my(@m);
+      (my $boot = $self->{NAME}) =~ s/:/_/g;
+  
+      if (not $self->{SKIPHASH}{'dynamic'}) {
+  	push(@m,"
+  $self->{BASEEXT}.def: Makefile.PL
+  ",
+       '	$(PERL) "-I$(PERL_ARCHLIB)" "-I$(PERL_LIB)" -e \'use ExtUtils::Mksymlists; \\
+       Mksymlists("NAME" => "$(NAME)", "DLBASE" => "$(DLBASE)", ',
+       '"VERSION" => "$(VERSION)", "DISTNAME" => "$(DISTNAME)", ',
+       '"INSTALLDIRS" => "$(INSTALLDIRS)", ',
+       '"DL_FUNCS" => ',neatvalue($funcs),
+       ', "FUNCLIST" => ',neatvalue($funclist),
+       ', "IMPORTS" => ',neatvalue($imports),
+       ', "DL_VARS" => ', neatvalue($vars), ');\'
+  ');
+      }
+      if ($self->{IMPORTS} && %{$self->{IMPORTS}}) {
+  	# Make import files (needed for static build)
+  	-d 'tmp_imp' or mkdir 'tmp_imp', 0777 or die "Can't mkdir tmp_imp";
+  	open my $imp, '>', 'tmpimp.imp' or die "Can't open tmpimp.imp";
+  	while (my($name, $exp) = each %{$self->{IMPORTS}}) {
+  	    my ($lib, $id) = ($exp =~ /(.*)\.(.*)/) or die "Malformed IMPORT `$exp'";
+  	    print $imp "$name $lib $id ?\n";
+  	}
+  	close $imp or die "Can't close tmpimp.imp";
+  	# print "emximp -o tmpimp$Config::Config{lib_ext} tmpimp.imp\n";
+  	system "emximp -o tmpimp$Config::Config{lib_ext} tmpimp.imp"
+  	    and die "Cannot make import library: $!, \$?=$?";
+  	# May be running under miniperl, so have no glob...
+  	eval { unlink <tmp_imp/*>; 1 } or system "rm tmp_imp/*";
+  	system "cd tmp_imp; $Config::Config{ar} x ../tmpimp$Config::Config{lib_ext}"
+  	    and die "Cannot extract import objects: $!, \$?=$?";
+      }
+      join('',@m);
+  }
+  
+  sub static_lib {
+      my($self) = @_;
+      my $old = $self->ExtUtils::MM_Unix::static_lib();
+      return $old unless $self->{IMPORTS} && %{$self->{IMPORTS}};
+  
+      my @chunks = split /\n{2,}/, $old;
+      shift @chunks unless length $chunks[0]; # Empty lines at the start
+      $chunks[0] .= <<'EOC';
+  
+  	$(AR) $(AR_STATIC_ARGS) $@ tmp_imp/* && $(RANLIB) $@
+  EOC
+      return join "\n\n". '', @chunks;
+  }
+  
+  sub replace_manpage_separator {
+      my($self,$man) = @_;
+      $man =~ s,/+,.,g;
+      $man;
+  }
+  
+  sub maybe_command {
+      my($self,$file) = @_;
+      $file =~ s,[/\\]+,/,g;
+      return $file if -x $file && ! -d _;
+      return "$file.exe" if -x "$file.exe" && ! -d _;
+      return "$file.cmd" if -x "$file.cmd" && ! -d _;
+      return;
+  }
+  
+  =item init_linker
+  
+  =cut
+  
+  sub init_linker {
+      my $self = shift;
+  
+      $self->{PERL_ARCHIVE} = "\$(PERL_INC)/libperl\$(LIB_EXT)";
+  
+      $self->{PERL_ARCHIVEDEP} ||= '';
+      $self->{PERL_ARCHIVE_AFTER} = $OS2::is_aout
+        ? ''
+        : '$(PERL_INC)/libperl_override$(LIB_EXT)';
+      $self->{EXPORT_LIST} = '$(BASEEXT).def';
+  }
+  
+  =item os_flavor
+  
+  OS/2 is OS/2
+  
+  =cut
+  
+  sub os_flavor {
+      return('OS/2');
+  }
+  
+  =back
+  
+  =cut
+  
+  1;
+EXTUTILS_MM_OS2
+
+$fatpacked{"ExtUtils/MM_QNX.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_MM_QNX';
+  package ExtUtils::MM_QNX;
+  
+  use strict;
+  our $VERSION = '7.04';
+  
+  require ExtUtils::MM_Unix;
+  our @ISA = qw(ExtUtils::MM_Unix);
+  
+  
+  =head1 NAME
+  
+  ExtUtils::MM_QNX - QNX specific subclass of ExtUtils::MM_Unix
+  
+  =head1 SYNOPSIS
+  
+    Don't use this module directly.
+    Use ExtUtils::MM and let it choose.
+  
+  =head1 DESCRIPTION
+  
+  This is a subclass of ExtUtils::MM_Unix which contains functionality for
+  QNX.
+  
+  Unless otherwise stated it works just like ExtUtils::MM_Unix
+  
+  =head2 Overridden methods
+  
+  =head3 extra_clean_files
+  
+  Add .err files corresponding to each .c file.
+  
+  =cut
+  
+  sub extra_clean_files {
+      my $self = shift;
+  
+      my @errfiles = @{$self->{C}};
+      for ( @errfiles ) {
+  	s/.c$/.err/;
+      }
+  
+      return( @errfiles, 'perlmain.err' );
+  }
+  
+  
+  =head1 AUTHOR
+  
+  Michael G Schwern <schwern@pobox.com> with code from ExtUtils::MM_Unix
+  
+  =head1 SEE ALSO
+  
+  L<ExtUtils::MakeMaker>
+  
+  =cut
+  
+  
+  1;
+EXTUTILS_MM_QNX
+
+$fatpacked{"ExtUtils/MM_UWIN.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_MM_UWIN';
+  package ExtUtils::MM_UWIN;
+  
+  use strict;
+  our $VERSION = '7.04';
+  
+  require ExtUtils::MM_Unix;
+  our @ISA = qw(ExtUtils::MM_Unix);
+  
+  
+  =head1 NAME
+  
+  ExtUtils::MM_UWIN - U/WIN specific subclass of ExtUtils::MM_Unix
+  
+  =head1 SYNOPSIS
+  
+    Don't use this module directly.
+    Use ExtUtils::MM and let it choose.
+  
+  =head1 DESCRIPTION
+  
+  This is a subclass of ExtUtils::MM_Unix which contains functionality for
+  the AT&T U/WIN UNIX on Windows environment.
+  
+  Unless otherwise stated it works just like ExtUtils::MM_Unix
+  
+  =head2 Overridden methods
+  
+  =over 4
+  
+  =item os_flavor
+  
+  In addition to being Unix, we're U/WIN.
+  
+  =cut
+  
+  sub os_flavor {
+      return('Unix', 'U/WIN');
+  }
+  
+  
+  =item B<replace_manpage_separator>
+  
+  =cut
+  
+  sub replace_manpage_separator {
+      my($self, $man) = @_;
+  
+      $man =~ s,/+,.,g;
+      return $man;
+  }
+  
+  =back
+  
+  =head1 AUTHOR
+  
+  Michael G Schwern <schwern@pobox.com> with code from ExtUtils::MM_Unix
+  
+  =head1 SEE ALSO
+  
+  L<ExtUtils::MM_Win32>, L<ExtUtils::MakeMaker>
+  
+  =cut
+  
+  1;
+EXTUTILS_MM_UWIN
+
+$fatpacked{"ExtUtils/MM_Unix.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_MM_UNIX';
+  package ExtUtils::MM_Unix;
+  
+  require 5.006;
+  
+  use strict;
+  
+  use Carp;
+  use ExtUtils::MakeMaker::Config;
+  use File::Basename qw(basename dirname);
+  use DirHandle;
+  
+  our %Config_Override;
+  
+  use ExtUtils::MakeMaker qw($Verbose neatvalue);
+  
+  # If we make $VERSION an our variable parse_version() breaks
+  use vars qw($VERSION);
+  $VERSION = '7.04';
+  $VERSION = eval $VERSION;  ## no critic [BuiltinFunctions::ProhibitStringyEval]
+  
+  require ExtUtils::MM_Any;
+  our @ISA = qw(ExtUtils::MM_Any);
+  
+  my %Is;
+  BEGIN {
+      $Is{OS2}     = $^O eq 'os2';
+      $Is{Win32}   = $^O eq 'MSWin32' || $Config{osname} eq 'NetWare';
+      $Is{Dos}     = $^O eq 'dos';
+      $Is{VMS}     = $^O eq 'VMS';
+      $Is{OSF}     = $^O eq 'dec_osf';
+      $Is{IRIX}    = $^O eq 'irix';
+      $Is{NetBSD}  = $^O eq 'netbsd';
+      $Is{Interix} = $^O eq 'interix';
+      $Is{SunOS4}  = $^O eq 'sunos';
+      $Is{Solaris} = $^O eq 'solaris';
+      $Is{SunOS}   = $Is{SunOS4} || $Is{Solaris};
+      $Is{BSD}     = ($^O =~ /^(?:free|net|open)bsd$/ or
+                     grep( $^O eq $_, qw(bsdos interix dragonfly) )
+                    );
+      $Is{Android} = $^O =~ /android/;
+  }
+  
+  BEGIN {
+      if( $Is{VMS} ) {
+          # For things like vmsify()
+          require VMS::Filespec;
+          VMS::Filespec->import;
+      }
+  }
+  
+  
+  =head1 NAME
+  
+  ExtUtils::MM_Unix - methods used by ExtUtils::MakeMaker
+  
+  =head1 SYNOPSIS
+  
+  C<require ExtUtils::MM_Unix;>
+  
+  =head1 DESCRIPTION
+  
+  The methods provided by this package are designed to be used in
+  conjunction with ExtUtils::MakeMaker. When MakeMaker writes a
+  Makefile, it creates one or more objects that inherit their methods
+  from a package C<MM>. MM itself doesn't provide any methods, but it
+  ISA ExtUtils::MM_Unix class. The inheritance tree of MM lets operating
+  specific packages take the responsibility for all the methods provided
+  by MM_Unix. We are trying to reduce the number of the necessary
+  overrides by defining rather primitive operations within
+  ExtUtils::MM_Unix.
+  
+  If you are going to write a platform specific MM package, please try
+  to limit the necessary overrides to primitive methods, and if it is not
+  possible to do so, let's work out how to achieve that gain.
+  
+  If you are overriding any of these methods in your Makefile.PL (in the
+  MY class), please report that to the makemaker mailing list. We are
+  trying to minimize the necessary method overrides and switch to data
+  driven Makefile.PLs wherever possible. In the long run less methods
+  will be overridable via the MY class.
+  
+  =head1 METHODS
+  
+  The following description of methods is still under
+  development. Please refer to the code for not suitably documented
+  sections and complain loudly to the makemaker@perl.org mailing list.
+  Better yet, provide a patch.
+  
+  Not all of the methods below are overridable in a
+  Makefile.PL. Overridable methods are marked as (o). All methods are
+  overridable by a platform specific MM_*.pm file.
+  
+  Cross-platform methods are being moved into MM_Any.  If you can't find
+  something that used to be in here, look in MM_Any.
+  
+  =cut
+  
+  # So we don't have to keep calling the methods over and over again,
+  # we have these globals to cache the values.  Faster and shrtr.
+  my $Curdir  = __PACKAGE__->curdir;
+  my $Rootdir = __PACKAGE__->rootdir;
+  my $Updir   = __PACKAGE__->updir;
+  
+  
+  =head2 Methods
+  
+  =over 4
+  
+  =item os_flavor
+  
+  Simply says that we're Unix.
+  
+  =cut
+  
+  sub os_flavor {
+      return('Unix');
+  }
+  
+  
+  =item c_o (o)
+  
+  Defines the suffix rules to compile different flavors of C files to
+  object files.
+  
+  =cut
+  
+  sub c_o {
+  # --- Translation Sections ---
+  
+      my($self) = shift;
+      return '' unless $self->needs_linking();
+      my(@m);
+  
+      my $command = '$(CCCMD)';
+      my $flags   = '$(CCCDLFLAGS) "-I$(PERL_INC)" $(PASTHRU_DEFINE) $(DEFINE)';
+  
+      if (my $cpp = $Config{cpprun}) {
+          my $cpp_cmd = $self->const_cccmd;
+          $cpp_cmd =~ s/^CCCMD\s*=\s*\$\(CC\)/$cpp/;
+          push @m, qq{
+  .c.i:
+  	$cpp_cmd $flags \$*.c > \$*.i
+  };
+      }
+  
+      push @m, qq{
+  .c.s:
+  	$command -S $flags \$*.c
+  
+  .c\$(OBJ_EXT):
+  	$command $flags \$*.c
+  
+  .cpp\$(OBJ_EXT):
+  	$command $flags \$*.cpp
+  
+  .cxx\$(OBJ_EXT):
+  	$command $flags \$*.cxx
+  
+  .cc\$(OBJ_EXT):
+  	$command $flags \$*.cc
+  };
+  
+      push @m, qq{
+  .C\$(OBJ_EXT):
+  	$command $flags \$*.C
+  } if !$Is{OS2} and !$Is{Win32} and !$Is{Dos}; #Case-specific
+  
+      return join "", @m;
+  }
+  
+  =item cflags (o)
+  
+  Does very much the same as the cflags script in the perl
+  distribution. It doesn't return the whole compiler command line, but
+  initializes all of its parts. The const_cccmd method then actually
+  returns the definition of the CCCMD macro which uses these parts.
+  
+  =cut
+  
+  #'
+  
+  sub cflags {
+      my($self,$libperl)=@_;
+      return $self->{CFLAGS} if $self->{CFLAGS};
+      return '' unless $self->needs_linking();
+  
+      my($prog, $uc, $perltype, %cflags);
+      $libperl ||= $self->{LIBPERL_A} || "libperl$self->{LIB_EXT}" ;
+      $libperl =~ s/\.\$\(A\)$/$self->{LIB_EXT}/;
+  
+      @cflags{qw(cc ccflags optimize shellflags)}
+  	= @Config{qw(cc ccflags optimize shellflags)};
+  
+      # Perl 5.21.4 adds the (gcc) warning (-Wall ...) and std (-std=c89)
+      # flags to the %Config, and the modules in the core should be built
+      # with the warning flags, but NOT the -std=c89 flags (the latter
+      # would break using any system header files that are strict C99).
+      my @ccextraflags = qw(ccwarnflags);
+      if ($ENV{PERL_CORE}) {
+        for my $x (@ccextraflags) {
+          if (exists $Config{$x}) {
+            $cflags{$x} = $Config{$x};
+          }
+        }
+      }
+  
+      my($optdebug) = "";
+  
+      $cflags{shellflags} ||= '';
+  
+      my(%map) =  (
+  		D =>   '-DDEBUGGING',
+  		E =>   '-DEMBED',
+  		DE =>  '-DDEBUGGING -DEMBED',
+  		M =>   '-DEMBED -DMULTIPLICITY',
+  		DM =>  '-DDEBUGGING -DEMBED -DMULTIPLICITY',
+  		);
+  
+      if ($libperl =~ /libperl(\w*)\Q$self->{LIB_EXT}/){
+  	$uc = uc($1);
+      } else {
+  	$uc = ""; # avoid warning
+      }
+      $perltype = $map{$uc} ? $map{$uc} : "";
+  
+      if ($uc =~ /^D/) {
+  	$optdebug = "-g";
+      }
+  
+  
+      my($name);
+      ( $name = $self->{NAME} . "_cflags" ) =~ s/:/_/g ;
+      if ($prog = $Config{$name}) {
+  	# Expand hints for this extension via the shell
+  	print "Processing $name hint:\n" if $Verbose;
+  	my(@o)=`cc=\"$cflags{cc}\"
+  	  ccflags=\"$cflags{ccflags}\"
+  	  optimize=\"$cflags{optimize}\"
+  	  perltype=\"$cflags{perltype}\"
+  	  optdebug=\"$cflags{optdebug}\"
+  	  eval '$prog'
+  	  echo cc=\$cc
+  	  echo ccflags=\$ccflags
+  	  echo optimize=\$optimize
+  	  echo perltype=\$perltype
+  	  echo optdebug=\$optdebug
+  	  `;
+  	foreach my $line (@o){
+  	    chomp $line;
+  	    if ($line =~ /(.*?)=\s*(.*)\s*$/){
+  		$cflags{$1} = $2;
+  		print "	$1 = $2\n" if $Verbose;
+  	    } else {
+  		print "Unrecognised result from hint: '$line'\n";
+  	    }
+  	}
+      }
+  
+      if ($optdebug) {
+  	$cflags{optimize} = $optdebug;
+      }
+  
+      for (qw(ccflags optimize perltype)) {
+          $cflags{$_} ||= '';
+  	$cflags{$_} =~ s/^\s+//;
+  	$cflags{$_} =~ s/\s+/ /g;
+  	$cflags{$_} =~ s/\s+$//;
+  	$self->{uc $_} ||= $cflags{$_};
+      }
+  
+      if ($self->{POLLUTE}) {
+  	$self->{CCFLAGS} .= ' -DPERL_POLLUTE ';
+      }
+  
+      for my $x (@ccextraflags) {
+        next unless exists $cflags{$x};
+        $self->{CCFLAGS} .= $cflags{$x} =~ m!^\s! ? $cflags{$x} : ' ' . $cflags{$x};
+      }
+  
+      my $pollute = '';
+      if ($Config{usemymalloc} and not $Config{bincompat5005}
+  	and not $Config{ccflags} =~ /-DPERL_POLLUTE_MALLOC\b/
+  	and $self->{PERL_MALLOC_OK}) {
+  	$pollute = '$(PERL_MALLOC_DEF)';
+      }
+  
+      $self->{CCFLAGS}  = quote_paren($self->{CCFLAGS});
+      $self->{OPTIMIZE} = quote_paren($self->{OPTIMIZE});
+  
+      return $self->{CFLAGS} = qq{
+  CCFLAGS = $self->{CCFLAGS}
+  OPTIMIZE = $self->{OPTIMIZE}
+  PERLTYPE = $self->{PERLTYPE}
+  MPOLLUTE = $pollute
+  };
+  
+  }
+  
+  
+  =item const_cccmd (o)
+  
+  Returns the full compiler call for C programs and stores the
+  definition in CONST_CCCMD.
+  
+  =cut
+  
+  sub const_cccmd {
+      my($self,$libperl)=@_;
+      return $self->{CONST_CCCMD} if $self->{CONST_CCCMD};
+      return '' unless $self->needs_linking();
+      return $self->{CONST_CCCMD} =
+  	q{CCCMD = $(CC) -c $(PASTHRU_INC) $(INC) \\
+  	$(CCFLAGS) $(OPTIMIZE) \\
+  	$(PERLTYPE) $(MPOLLUTE) $(DEFINE_VERSION) \\
+  	$(XS_DEFINE_VERSION)};
+  }
+  
+  =item const_config (o)
+  
+  Defines a couple of constants in the Makefile that are imported from
+  %Config.
+  
+  =cut
+  
+  sub const_config {
+  # --- Constants Sections ---
+  
+      my($self) = shift;
+      my @m = <<"END";
+  
+  # These definitions are from config.sh (via $INC{'Config.pm'}).
+  # They may have been overridden via Makefile.PL or on the command line.
+  END
+  
+      my(%once_only);
+      foreach my $key (@{$self->{CONFIG}}){
+          # SITE*EXP macros are defined in &constants; avoid duplicates here
+          next if $once_only{$key};
+          $self->{uc $key} = quote_paren($self->{uc $key});
+          push @m, uc($key) , ' = ' , $self->{uc $key}, "\n";
+          $once_only{$key} = 1;
+      }
+      join('', @m);
+  }
+  
+  =item const_loadlibs (o)
+  
+  Defines EXTRALIBS, LDLOADLIBS, BSLOADLIBS, LD_RUN_PATH. See
+  L<ExtUtils::Liblist> for details.
+  
+  =cut
+  
+  sub const_loadlibs {
+      my($self) = shift;
+      return "" unless $self->needs_linking;
+      my @m;
+      push @m, qq{
+  # $self->{NAME} might depend on some other libraries:
+  # See ExtUtils::Liblist for details
+  #
+  };
+      for my $tmp (qw/
+           EXTRALIBS LDLOADLIBS BSLOADLIBS
+           /) {
+          next unless defined $self->{$tmp};
+          push @m, "$tmp = $self->{$tmp}\n";
+      }
+      # don't set LD_RUN_PATH if empty
+      for my $tmp (qw/
+           LD_RUN_PATH
+           /) {
+          next unless $self->{$tmp};
+          push @m, "$tmp = $self->{$tmp}\n";
+      }
+      return join "", @m;
+  }
+  
+  =item constants (o)
+  
+    my $make_frag = $mm->constants;
+  
+  Prints out macros for lots of constants.
+  
+  =cut
+  
+  sub constants {
+      my($self) = @_;
+      my @m = ();
+  
+      $self->{DFSEP} = '$(DIRFILESEP)';  # alias for internal use
+  
+      for my $macro (qw(
+  
+                AR_STATIC_ARGS DIRFILESEP DFSEP
+                NAME NAME_SYM
+                VERSION    VERSION_MACRO    VERSION_SYM DEFINE_VERSION
+                XS_VERSION XS_VERSION_MACRO             XS_DEFINE_VERSION
+                INST_ARCHLIB INST_SCRIPT INST_BIN INST_LIB
+                INST_MAN1DIR INST_MAN3DIR
+                MAN1EXT      MAN3EXT
+                INSTALLDIRS INSTALL_BASE DESTDIR PREFIX
+                PERLPREFIX      SITEPREFIX      VENDORPREFIX
+                     ),
+                     (map { ("INSTALL".$_,
+                            "DESTINSTALL".$_)
+                          } $self->installvars),
+                     qw(
+                PERL_LIB
+                PERL_ARCHLIB PERL_ARCHLIBDEP
+                LIBPERL_A MYEXTLIB
+                FIRST_MAKEFILE MAKEFILE_OLD MAKE_APERL_FILE
+                PERLMAINCC PERL_SRC PERL_INC PERL_INCDEP
+                PERL            FULLPERL          ABSPERL
+                PERLRUN         FULLPERLRUN       ABSPERLRUN
+                PERLRUNINST     FULLPERLRUNINST   ABSPERLRUNINST
+                PERL_CORE
+                PERM_DIR PERM_RW PERM_RWX
+  
+  	      ) )
+      {
+  	next unless defined $self->{$macro};
+  
+          # pathnames can have sharp signs in them; escape them so
+          # make doesn't think it is a comment-start character.
+          $self->{$macro} =~ s/#/\\#/g;
+  	$self->{$macro} = $self->quote_dep($self->{$macro})
+  	  if $ExtUtils::MakeMaker::macro_dep{$macro};
+  	push @m, "$macro = $self->{$macro}\n";
+      }
+  
+      push @m, qq{
+  MAKEMAKER   = $self->{MAKEMAKER}
+  MM_VERSION  = $self->{MM_VERSION}
+  MM_REVISION = $self->{MM_REVISION}
+  };
+  
+      push @m, q{
+  # FULLEXT = Pathname for extension directory (eg Foo/Bar/Oracle).
+  # BASEEXT = Basename part of FULLEXT. May be just equal FULLEXT. (eg Oracle)
+  # PARENT_NAME = NAME without BASEEXT and no trailing :: (eg Foo::Bar)
+  # DLBASE  = Basename part of dynamic library. May be just equal BASEEXT.
+  };
+  
+      for my $macro (qw/
+                MAKE
+  	      FULLEXT BASEEXT PARENT_NAME DLBASE VERSION_FROM INC DEFINE OBJECT
+  	      LDFROM LINKTYPE BOOTDEP
+  	      /	)
+      {
+  	next unless defined $self->{$macro};
+  	push @m, "$macro = $self->{$macro}\n";
+      }
+  
+      push @m, "
+  # Handy lists of source code files:
+  XS_FILES = ".$self->wraplist(sort keys %{$self->{XS}})."
+  C_FILES  = ".$self->wraplist(@{$self->{C}})."
+  O_FILES  = ".$self->wraplist(@{$self->{O_FILES}})."
+  H_FILES  = ".$self->wraplist(@{$self->{H}})."
+  MAN1PODS = ".$self->wraplist(sort keys %{$self->{MAN1PODS}})."
+  MAN3PODS = ".$self->wraplist(sort keys %{$self->{MAN3PODS}})."
+  ";
+  
+  
+      push @m, q{
+  # Where is the Config information that we are using/depend on
+  CONFIGDEP = $(PERL_ARCHLIBDEP)$(DFSEP)Config.pm $(PERL_INCDEP)$(DFSEP)config.h
+  } if -e File::Spec->catfile( $self->{PERL_INC}, 'config.h' );
+  
+  
+      push @m, qq{
+  # Where to build things
+  INST_LIBDIR      = $self->{INST_LIBDIR}
+  INST_ARCHLIBDIR  = $self->{INST_ARCHLIBDIR}
+  
+  INST_AUTODIR     = $self->{INST_AUTODIR}
+  INST_ARCHAUTODIR = $self->{INST_ARCHAUTODIR}
+  
+  INST_STATIC      = $self->{INST_STATIC}
+  INST_DYNAMIC     = $self->{INST_DYNAMIC}
+  INST_BOOT        = $self->{INST_BOOT}
+  };
+  
+      push @m, qq{
+  # Extra linker info
+  EXPORT_LIST        = $self->{EXPORT_LIST}
+  PERL_ARCHIVE       = $self->{PERL_ARCHIVE}
+  PERL_ARCHIVEDEP    = $self->{PERL_ARCHIVEDEP}
+  PERL_ARCHIVE_AFTER = $self->{PERL_ARCHIVE_AFTER}
+  };
+  
+      push @m, "
+  
+  TO_INST_PM = ".$self->wraplist(sort keys %{$self->{PM}})."
+  
+  PM_TO_BLIB = ".$self->wraplist(map { ($_ => $self->{PM}->{$_}) } sort keys %{$self->{PM}})."
+  ";
+  
+      join('',@m);
+  }
+  
+  
+  =item depend (o)
+  
+  Same as macro for the depend attribute.
+  
+  =cut
+  
+  sub depend {
+      my($self,%attribs) = @_;
+      my(@m,$key,$val);
+      while (($key,$val) = each %attribs){
+  	last unless defined $key;
+  	push @m, "$key : $val\n";
+      }
+      join "", @m;
+  }
+  
+  
+  =item init_DEST
+  
+    $mm->init_DEST
+  
+  Defines the DESTDIR and DEST* variables paralleling the INSTALL*.
+  
+  =cut
+  
+  sub init_DEST {
+      my $self = shift;
+  
+      # Initialize DESTDIR
+      $self->{DESTDIR} ||= '';
+  
+      # Make DEST variables.
+      foreach my $var ($self->installvars) {
+          my $destvar = 'DESTINSTALL'.$var;
+          $self->{$destvar} ||= '$(DESTDIR)$(INSTALL'.$var.')';
+      }
+  }
+  
+  
+  =item init_dist
+  
+    $mm->init_dist;
+  
+  Defines a lot of macros for distribution support.
+  
+    macro         description                     default
+  
+    TAR           tar command to use              tar
+    TARFLAGS      flags to pass to TAR            cvf
+  
+    ZIP           zip command to use              zip
+    ZIPFLAGS      flags to pass to ZIP            -r
+  
+    COMPRESS      compression command to          gzip --best
+                  use for tarfiles
+    SUFFIX        suffix to put on                .gz
+                  compressed files
+  
+    SHAR          shar command to use             shar
+  
+    PREOP         extra commands to run before
+                  making the archive
+    POSTOP        extra commands to run after
+                  making the archive
+  
+    TO_UNIX       a command to convert linefeeds
+                  to Unix style in your archive
+  
+    CI            command to checkin your         ci -u
+                  sources to version control
+    RCS_LABEL     command to label your sources   rcs -Nv$(VERSION_SYM): -q
+                  just after CI is run
+  
+    DIST_CP       $how argument to manicopy()     best
+                  when the distdir is created
+  
+    DIST_DEFAULT  default target to use to        tardist
+                  create a distribution
+  
+    DISTVNAME     name of the resulting archive   $(DISTNAME)-$(VERSION)
+                  (minus suffixes)
+  
+  =cut
+  
+  sub init_dist {
+      my $self = shift;
+  
+      $self->{TAR}      ||= 'tar';
+      $self->{TARFLAGS} ||= 'cvf';
+      $self->{ZIP}      ||= 'zip';
+      $self->{ZIPFLAGS} ||= '-r';
+      $self->{COMPRESS} ||= 'gzip --best';
+      $self->{SUFFIX}   ||= '.gz';
+      $self->{SHAR}     ||= 'shar';
+      $self->{PREOP}    ||= '$(NOECHO) $(NOOP)'; # eg update MANIFEST
+      $self->{POSTOP}   ||= '$(NOECHO) $(NOOP)'; # eg remove the distdir
+      $self->{TO_UNIX}  ||= '$(NOECHO) $(NOOP)';
+  
+      $self->{CI}       ||= 'ci -u';
+      $self->{RCS_LABEL}||= 'rcs -Nv$(VERSION_SYM): -q';
+      $self->{DIST_CP}  ||= 'best';
+      $self->{DIST_DEFAULT} ||= 'tardist';
+  
+      ($self->{DISTNAME} = $self->{NAME}) =~ s{::}{-}g unless $self->{DISTNAME};
+      $self->{DISTVNAME} ||= $self->{DISTNAME}.'-'.$self->{VERSION};
+  }
+  
+  =item dist (o)
+  
+    my $dist_macros = $mm->dist(%overrides);
+  
+  Generates a make fragment defining all the macros initialized in
+  init_dist.
+  
+  %overrides can be used to override any of the above.
+  
+  =cut
+  
+  sub dist {
+      my($self, %attribs) = @_;
+  
+      my $make = '';
+      if ( $attribs{SUFFIX} && $attribs{SUFFIX} !~ m!^\.! ) {
+        $attribs{SUFFIX} = '.' . $attribs{SUFFIX};
+      }
+      foreach my $key (qw(
+              TAR TARFLAGS ZIP ZIPFLAGS COMPRESS SUFFIX SHAR
+              PREOP POSTOP TO_UNIX
+              CI RCS_LABEL DIST_CP DIST_DEFAULT
+              DISTNAME DISTVNAME
+             ))
+      {
+          my $value = $attribs{$key} || $self->{$key};
+          $make .= "$key = $value\n";
+      }
+  
+      return $make;
+  }
+  
+  =item dist_basics (o)
+  
+  Defines the targets distclean, distcheck, skipcheck, manifest, veryclean.
+  
+  =cut
+  
+  sub dist_basics {
+      my($self) = shift;
+  
+      return <<'MAKE_FRAG';
+  distclean :: realclean distcheck
+  	$(NOECHO) $(NOOP)
+  
+  distcheck :
+  	$(PERLRUN) "-MExtUtils::Manifest=fullcheck" -e fullcheck
+  
+  skipcheck :
+  	$(PERLRUN) "-MExtUtils::Manifest=skipcheck" -e skipcheck
+  
+  manifest :
+  	$(PERLRUN) "-MExtUtils::Manifest=mkmanifest" -e mkmanifest
+  
+  veryclean : realclean
+  	$(RM_F) *~ */*~ *.orig */*.orig *.bak */*.bak *.old */*.old
+  
+  MAKE_FRAG
+  
+  }
+  
+  =item dist_ci (o)
+  
+  Defines a check in target for RCS.
+  
+  =cut
+  
+  sub dist_ci {
+      my($self) = shift;
+      return q{
+  ci :
+  	$(PERLRUN) "-MExtUtils::Manifest=maniread" \\
+  	  -e "@all = keys %{ maniread() };" \\
+  	  -e "print(qq{Executing $(CI) @all\n}); system(qq{$(CI) @all});" \\
+  	  -e "print(qq{Executing $(RCS_LABEL) ...\n}); system(qq{$(RCS_LABEL) @all});"
+  };
+  }
+  
+  =item dist_core (o)
+  
+    my $dist_make_fragment = $MM->dist_core;
+  
+  Puts the targets necessary for 'make dist' together into one make
+  fragment.
+  
+  =cut
+  
+  sub dist_core {
+      my($self) = shift;
+  
+      my $make_frag = '';
+      foreach my $target (qw(dist tardist uutardist tarfile zipdist zipfile
+                             shdist))
+      {
+          my $method = $target.'_target';
+          $make_frag .= "\n";
+          $make_frag .= $self->$method();
+      }
+  
+      return $make_frag;
+  }
+  
+  
+  =item B<dist_target>
+  
+    my $make_frag = $MM->dist_target;
+  
+  Returns the 'dist' target to make an archive for distribution.  This
+  target simply checks to make sure the Makefile is up-to-date and
+  depends on $(DIST_DEFAULT).
+  
+  =cut
+  
+  sub dist_target {
+      my($self) = shift;
+  
+      my $date_check = $self->oneliner(<<'CODE', ['-l']);
+  print 'Warning: Makefile possibly out of date with $(VERSION_FROM)'
+      if -e '$(VERSION_FROM)' and -M '$(VERSION_FROM)' < -M '$(FIRST_MAKEFILE)';
+  CODE
+  
+      return sprintf <<'MAKE_FRAG', $date_check;
+  dist : $(DIST_DEFAULT) $(FIRST_MAKEFILE)
+  	$(NOECHO) %s
+  MAKE_FRAG
+  }
+  
+  =item B<tardist_target>
+  
+    my $make_frag = $MM->tardist_target;
+  
+  Returns the 'tardist' target which is simply so 'make tardist' works.
+  The real work is done by the dynamically named tardistfile_target()
+  method, tardist should have that as a dependency.
+  
+  =cut
+  
+  sub tardist_target {
+      my($self) = shift;
+  
+      return <<'MAKE_FRAG';
+  tardist : $(DISTVNAME).tar$(SUFFIX)
+  	$(NOECHO) $(NOOP)
+  MAKE_FRAG
+  }
+  
+  =item B<zipdist_target>
+  
+    my $make_frag = $MM->zipdist_target;
+  
+  Returns the 'zipdist' target which is simply so 'make zipdist' works.
+  The real work is done by the dynamically named zipdistfile_target()
+  method, zipdist should have that as a dependency.
+  
+  =cut
+  
+  sub zipdist_target {
+      my($self) = shift;
+  
+      return <<'MAKE_FRAG';
+  zipdist : $(DISTVNAME).zip
+  	$(NOECHO) $(NOOP)
+  MAKE_FRAG
+  }
+  
+  =item B<tarfile_target>
+  
+    my $make_frag = $MM->tarfile_target;
+  
+  The name of this target is the name of the tarball generated by
+  tardist.  This target does the actual work of turning the distdir into
+  a tarball.
+  
+  =cut
+  
+  sub tarfile_target {
+      my($self) = shift;
+  
+      return <<'MAKE_FRAG';
+  $(DISTVNAME).tar$(SUFFIX) : distdir
+  	$(PREOP)
+  	$(TO_UNIX)
+  	$(TAR) $(TARFLAGS) $(DISTVNAME).tar $(DISTVNAME)
+  	$(RM_RF) $(DISTVNAME)
+  	$(COMPRESS) $(DISTVNAME).tar
+  	$(NOECHO) $(ECHO) 'Created $(DISTVNAME).tar$(SUFFIX)'
+  	$(POSTOP)
+  MAKE_FRAG
+  }
+  
+  =item zipfile_target
+  
+    my $make_frag = $MM->zipfile_target;
+  
+  The name of this target is the name of the zip file generated by
+  zipdist.  This target does the actual work of turning the distdir into
+  a zip file.
+  
+  =cut
+  
+  sub zipfile_target {
+      my($self) = shift;
+  
+      return <<'MAKE_FRAG';
+  $(DISTVNAME).zip : distdir
+  	$(PREOP)
+  	$(ZIP) $(ZIPFLAGS) $(DISTVNAME).zip $(DISTVNAME)
+  	$(RM_RF) $(DISTVNAME)
+  	$(NOECHO) $(ECHO) 'Created $(DISTVNAME).zip'
+  	$(POSTOP)
+  MAKE_FRAG
+  }
+  
+  =item uutardist_target
+  
+    my $make_frag = $MM->uutardist_target;
+  
+  Converts the tarfile into a uuencoded file
+  
+  =cut
+  
+  sub uutardist_target {
+      my($self) = shift;
+  
+      return <<'MAKE_FRAG';
+  uutardist : $(DISTVNAME).tar$(SUFFIX)
+  	uuencode $(DISTVNAME).tar$(SUFFIX) $(DISTVNAME).tar$(SUFFIX) > $(DISTVNAME).tar$(SUFFIX)_uu
+  	$(NOECHO) $(ECHO) 'Created $(DISTVNAME).tar$(SUFFIX)_uu'
+  MAKE_FRAG
+  }
+  
+  
+  =item shdist_target
+  
+    my $make_frag = $MM->shdist_target;
+  
+  Converts the distdir into a shell archive.
+  
+  =cut
+  
+  sub shdist_target {
+      my($self) = shift;
+  
+      return <<'MAKE_FRAG';
+  shdist : distdir
+  	$(PREOP)
+  	$(SHAR) $(DISTVNAME) > $(DISTVNAME).shar
+  	$(RM_RF) $(DISTVNAME)
+  	$(NOECHO) $(ECHO) 'Created $(DISTVNAME).shar'
+  	$(POSTOP)
+  MAKE_FRAG
+  }
+  
+  
+  =item dlsyms (o)
+  
+  Used by some OS' to define DL_FUNCS and DL_VARS and write the *.exp files.
+  
+  Normally just returns an empty string.
+  
+  =cut
+  
+  sub dlsyms {
+      return '';
+  }
+  
+  
+  =item dynamic_bs (o)
+  
+  Defines targets for bootstrap files.
+  
+  =cut
+  
+  sub dynamic_bs {
+      my($self, %attribs) = @_;
+      return '
+  BOOTSTRAP =
+  ' unless $self->has_link_code();
+  
+      my $target = $Is{VMS} ? '$(MMS$TARGET)' : '$@';
+  
+      return sprintf <<'MAKE_FRAG', ($target) x 2;
+  BOOTSTRAP = $(BASEEXT).bs
+  
+  # As Mkbootstrap might not write a file (if none is required)
+  # we use touch to prevent make continually trying to remake it.
+  # The DynaLoader only reads a non-empty file.
+  $(BOOTSTRAP) : $(FIRST_MAKEFILE) $(BOOTDEP) $(INST_ARCHAUTODIR)$(DFSEP).exists
+  	$(NOECHO) $(ECHO) "Running Mkbootstrap for $(NAME) ($(BSLOADLIBS))"
+  	$(NOECHO) $(PERLRUN) \
+  		"-MExtUtils::Mkbootstrap" \
+  		-e "Mkbootstrap('$(BASEEXT)','$(BSLOADLIBS)');"
+  	$(NOECHO) $(TOUCH) "%s"
+  	$(CHMOD) $(PERM_RW) "%s"
+  MAKE_FRAG
+  }
+  
+  =item dynamic_lib (o)
+  
+  Defines how to produce the *.so (or equivalent) files.
+  
+  =cut
+  
+  sub dynamic_lib {
+      my($self, %attribs) = @_;
+      return '' unless $self->needs_linking(); #might be because of a subdir
+  
+      return '' unless $self->has_link_code;
+  
+      my($otherldflags) = $attribs{OTHERLDFLAGS} || "";
+      my($inst_dynamic_dep) = $attribs{INST_DYNAMIC_DEP} || "";
+      my($armaybe) = $attribs{ARMAYBE} || $self->{ARMAYBE} || ":";
+      my($ldfrom) = '$(LDFROM)';
+      $armaybe = 'ar' if ($Is{OSF} and $armaybe eq ':');
+      my(@m);
+      my $ld_opt = $Is{OS2} ? '$(OPTIMIZE) ' : '';	# Useful on other systems too?
+      my $ld_fix = $Is{OS2} ? '|| ( $(RM_F) $@ && sh -c false )' : '';
+      push(@m,'
+  # This section creates the dynamically loadable $(INST_DYNAMIC)
+  # from $(OBJECT) and possibly $(MYEXTLIB).
+  ARMAYBE = '.$armaybe.'
+  OTHERLDFLAGS = '.$ld_opt.$otherldflags.'
+  INST_DYNAMIC_DEP = '.$inst_dynamic_dep.'
+  INST_DYNAMIC_FIX = '.$ld_fix.'
+  
+  $(INST_DYNAMIC): $(OBJECT) $(MYEXTLIB) $(INST_ARCHAUTODIR)$(DFSEP).exists $(EXPORT_LIST) $(PERL_ARCHIVEDEP) $(PERL_ARCHIVE_AFTER) $(INST_DYNAMIC_DEP)
+  ');
+      if ($armaybe ne ':'){
+  	$ldfrom = 'tmp$(LIB_EXT)';
+  	push(@m,'	$(ARMAYBE) cr '.$ldfrom.' $(OBJECT)'."\n");
+  	push(@m,'	$(RANLIB) '."$ldfrom\n");
+      }
+      $ldfrom = "-all $ldfrom -none" if $Is{OSF};
+  
+      # The IRIX linker doesn't use LD_RUN_PATH
+      my $ldrun = $Is{IRIX} && $self->{LD_RUN_PATH} ?
+                         qq{-rpath "$self->{LD_RUN_PATH}"} : '';
+  
+      # For example in AIX the shared objects/libraries from previous builds
+      # linger quite a while in the shared dynalinker cache even when nobody
+      # is using them.  This is painful if one for instance tries to restart
+      # a failed build because the link command will fail unnecessarily 'cos
+      # the shared object/library is 'busy'.
+      push(@m,'	$(RM_F) $@
+  ');
+  
+      my $libs = '$(LDLOADLIBS)';
+  
+      if (($Is{NetBSD} || $Is{Interix} || $Is{Android}) && $Config{'useshrplib'} eq 'true') {
+  	# Use nothing on static perl platforms, and to the flags needed
+  	# to link against the shared libperl library on shared perl
+  	# platforms.  We peek at lddlflags to see if we need -Wl,-R
+  	# or -R to add paths to the run-time library search path.
+          if ($Config{'lddlflags'} =~ /-Wl,-R/) {
+              $libs .= ' "-L$(PERL_INC)" "-Wl,-R$(INSTALLARCHLIB)/CORE" "-Wl,-R$(PERL_ARCHLIB)/CORE" -lperl';
+          } elsif ($Config{'lddlflags'} =~ /-R/) {
+              $libs .= ' "-L$(PERL_INC)" "-R$(INSTALLARCHLIB)/CORE" "-R$(PERL_ARCHLIB)/CORE" -lperl';
+          } elsif ( $Is{Android} ) {
+              # The Android linker will not recognize symbols from
+              # libperl unless the module explicitly depends on it.
+              $libs .= ' "-L$(PERL_INC)" -lperl';
+          }
+      }
+  
+      my $ld_run_path_shell = "";
+      if ($self->{LD_RUN_PATH} ne "") {
+  	$ld_run_path_shell = 'LD_RUN_PATH="$(LD_RUN_PATH)" ';
+      }
+  
+      push @m, sprintf <<'MAKE', $ld_run_path_shell, $ldrun, $ldfrom, $libs;
+  	%s$(LD) %s $(LDDLFLAGS) %s $(OTHERLDFLAGS) -o $@ $(MYEXTLIB)	\
+  	  $(PERL_ARCHIVE) %s $(PERL_ARCHIVE_AFTER) $(EXPORT_LIST)	\
+  	  $(INST_DYNAMIC_FIX)
+  MAKE
+  
+      push @m, <<'MAKE';
+  	$(CHMOD) $(PERM_RWX) $@
+  	$(NOECHO) $(RM_RF) $(BOOTSTRAP)
+  	- $(CP_NONEMPTY) $(BOOTSTRAP) $(INST_BOOT) $(PERM_RW)
+  MAKE
+  
+      return join('',@m);
+  }
+  
+  =item exescan
+  
+  Deprecated method. Use libscan instead.
+  
+  =cut
+  
+  sub exescan {
+      my($self,$path) = @_;
+      $path;
+  }
+  
+  =item extliblist
+  
+  Called by init_others, and calls ext ExtUtils::Liblist. See
+  L<ExtUtils::Liblist> for details.
+  
+  =cut
+  
+  sub extliblist {
+      my($self,$libs) = @_;
+      require ExtUtils::Liblist;
+      $self->ext($libs, $Verbose);
+  }
+  
+  =item find_perl
+  
+  Finds the executables PERL and FULLPERL
+  
+  =cut
+  
+  sub find_perl {
+      my($self, $ver, $names, $dirs, $trace) = @_;
+  
+      if ($trace >= 2){
+          print "Looking for perl $ver by these names:
+  @$names
+  in these dirs:
+  @$dirs
+  ";
+      }
+  
+      my $stderr_duped = 0;
+      local *STDERR_COPY;
+  
+      unless ($Is{BSD}) {
+          # >& and lexical filehandles together give 5.6.2 indigestion
+          if( open(STDERR_COPY, '>&STDERR') ) {  ## no critic
+              $stderr_duped = 1;
+          }
+          else {
+              warn <<WARNING;
+  find_perl() can't dup STDERR: $!
+  You might see some garbage while we search for Perl
+  WARNING
+          }
+      }
+  
+      foreach my $name (@$names){
+          foreach my $dir (@$dirs){
+              next unless defined $dir; # $self->{PERL_SRC} may be undefined
+              my ($abs, $val);
+              if ($self->file_name_is_absolute($name)) {     # /foo/bar
+                  $abs = $name;
+              } elsif ($self->canonpath($name) eq
+                       $self->canonpath(basename($name))) {  # foo
+                  $abs = $self->catfile($dir, $name);
+              } else {                                            # foo/bar
+                  $abs = $self->catfile($Curdir, $name);
+              }
+              print "Checking $abs\n" if ($trace >= 2);
+              next unless $self->maybe_command($abs);
+              print "Executing $abs\n" if ($trace >= 2);
+  
+              my $version_check = qq{"$abs" -le "require $ver; print qq{VER_OK}"};
+  
+              # To avoid using the unportable 2>&1 to suppress STDERR,
+              # we close it before running the command.
+              # However, thanks to a thread library bug in many BSDs
+              # ( http://www.freebsd.org/cgi/query-pr.cgi?pr=51535 )
+              # we cannot use the fancier more portable way in here
+              # but instead need to use the traditional 2>&1 construct.
+              if ($Is{BSD}) {
+                  $val = `$version_check 2>&1`;
+              } else {
+                  close STDERR if $stderr_duped;
+                  $val = `$version_check`;
+  
+                  # 5.6.2's 3-arg open doesn't work with >&
+                  open STDERR, ">&STDERR_COPY"  ## no critic
+                          if $stderr_duped;
+              }
+  
+              if ($val =~ /^VER_OK/m) {
+                  print "Using PERL=$abs\n" if $trace;
+                  return $abs;
+              } elsif ($trace >= 2) {
+                  print "Result: '$val' ".($? >> 8)."\n";
+              }
+          }
+      }
+      print "Unable to find a perl $ver (by these names: @$names, in these dirs: @$dirs)\n";
+      0; # false and not empty
+  }
+  
+  
+  =item fixin
+  
+    $mm->fixin(@files);
+  
+  Inserts the sharpbang or equivalent magic number to a set of @files.
+  
+  =cut
+  
+  sub fixin {    # stolen from the pink Camel book, more or less
+      my ( $self, @files ) = @_;
+  
+      for my $file (@files) {
+          my $file_new = "$file.new";
+          my $file_bak = "$file.bak";
+  
+          open( my $fixin, '<', $file ) or croak "Can't process '$file': $!";
+          local $/ = "\n";
+          chomp( my $line = <$fixin> );
+          next unless $line =~ s/^\s*\#!\s*//;    # Not a shebang file.
+  
+          my $shb = $self->_fixin_replace_shebang( $file, $line );
+          next unless defined $shb;
+  
+          open( my $fixout, ">", "$file_new" ) or do {
+              warn "Can't create new $file: $!\n";
+              next;
+          };
+  
+          # Print out the new #! line (or equivalent).
+          local $\;
+          local $/;
+          print $fixout $shb, <$fixin>;
+          close $fixin;
+          close $fixout;
+  
+          chmod 0666, $file_bak;
+          unlink $file_bak;
+          unless ( _rename( $file, $file_bak ) ) {
+              warn "Can't rename $file to $file_bak: $!";
+              next;
+          }
+          unless ( _rename( $file_new, $file ) ) {
+              warn "Can't rename $file_new to $file: $!";
+              unless ( _rename( $file_bak, $file ) ) {
+                  warn "Can't rename $file_bak back to $file either: $!";
+                  warn "Leaving $file renamed as $file_bak\n";
+              }
+              next;
+          }
+          unlink $file_bak;
+      }
+      continue {
+          system("$Config{'eunicefix'} $file") if $Config{'eunicefix'} ne ':';
+      }
+  }
+  
+  
+  sub _rename {
+      my($old, $new) = @_;
+  
+      foreach my $file ($old, $new) {
+          if( $Is{VMS} and basename($file) !~ /\./ ) {
+              # rename() in 5.8.0 on VMS will not rename a file if it
+              # does not contain a dot yet it returns success.
+              $file = "$file.";
+          }
+      }
+  
+      return rename($old, $new);
+  }
+  
+  sub _fixin_replace_shebang {
+      my ( $self, $file, $line ) = @_;
+  
+      # Now figure out the interpreter name.
+      my ( $cmd, $arg ) = split ' ', $line, 2;
+      $cmd =~ s!^.*/!!;
+  
+      # Now look (in reverse) for interpreter in absolute PATH (unless perl).
+      my $interpreter;
+      if ( $cmd =~ m{^perl(?:\z|[^a-z])} ) {
+          if ( $Config{startperl} =~ m,^\#!.*/perl, ) {
+              $interpreter = $Config{startperl};
+              $interpreter =~ s,^\#!,,;
+          }
+          else {
+              $interpreter = $Config{perlpath};
+          }
+      }
+      else {
+          my (@absdirs)
+              = reverse grep { $self->file_name_is_absolute($_) } $self->path;
+          $interpreter = '';
+  
+           foreach my $dir (@absdirs) {
+              if ( $self->maybe_command($cmd) ) {
+                  warn "Ignoring $interpreter in $file\n"
+                      if $Verbose && $interpreter;
+                  $interpreter = $self->catfile( $dir, $cmd );
+              }
+          }
+      }
+  
+      # Figure out how to invoke interpreter on this machine.
+  
+      my ($does_shbang) = $Config{'sharpbang'} =~ /^\s*\#\!/;
+      my ($shb) = "";
+      if ($interpreter) {
+          print "Changing sharpbang in $file to $interpreter"
+              if $Verbose;
+           # this is probably value-free on DOSISH platforms
+          if ($does_shbang) {
+              $shb .= "$Config{'sharpbang'}$interpreter";
+              $shb .= ' ' . $arg if defined $arg;
+              $shb .= "\n";
+          }
+      }
+      else {
+          warn "Can't find $cmd in PATH, $file unchanged"
+              if $Verbose;
+          return;
+      }
+      return $shb
+  }
+  
+  =item force (o)
+  
+  Writes an empty FORCE: target.
+  
+  =cut
+  
+  sub force {
+      my($self) = shift;
+      '# Phony target to force checking subdirectories.
+  FORCE :
+  	$(NOECHO) $(NOOP)
+  ';
+  }
+  
+  =item guess_name
+  
+  Guess the name of this package by examining the working directory's
+  name. MakeMaker calls this only if the developer has not supplied a
+  NAME attribute.
+  
+  =cut
+  
+  # ';
+  
+  sub guess_name {
+      my($self) = @_;
+      use Cwd 'cwd';
+      my $name = basename(cwd());
+      $name =~ s|[\-_][\d\.\-]+\z||;  # this is new with MM 5.00, we
+                                      # strip minus or underline
+                                      # followed by a float or some such
+      print "Warning: Guessing NAME [$name] from current directory name.\n";
+      $name;
+  }
+  
+  =item has_link_code
+  
+  Returns true if C, XS, MYEXTLIB or similar objects exist within this
+  object that need a compiler. Does not descend into subdirectories as
+  needs_linking() does.
+  
+  =cut
+  
+  sub has_link_code {
+      my($self) = shift;
+      return $self->{HAS_LINK_CODE} if defined $self->{HAS_LINK_CODE};
+      if ($self->{OBJECT} or @{$self->{C} || []} or $self->{MYEXTLIB}){
+  	$self->{HAS_LINK_CODE} = 1;
+  	return 1;
+      }
+      return $self->{HAS_LINK_CODE} = 0;
+  }
+  
+  
+  =item init_dirscan
+  
+  Scans the directory structure and initializes DIR, XS, XS_FILES,
+  C, C_FILES, O_FILES, H, H_FILES, PL_FILES, EXE_FILES.
+  
+  Called by init_main.
+  
+  =cut
+  
+  sub init_dirscan {	# --- File and Directory Lists (.xs .pm .pod etc)
+      my($self) = @_;
+      my(%dir, %xs, %c, %o, %h, %pl_files, %pm);
+  
+      my %ignore = map {( $_ => 1 )} qw(Makefile.PL Build.PL test.pl t);
+  
+      # ignore the distdir
+      $Is{VMS} ? $ignore{"$self->{DISTVNAME}.dir"} = 1
+              : $ignore{$self->{DISTVNAME}} = 1;
+  
+      my $distprefix = $Is{VMS} ? qr/^\Q$self->{DISTNAME}\E-v?[\d\.]+\.dir$/i
+                                : qr/^\Q$self->{DISTNAME}\E-v?[\d\.]+$/;
+  
+      @ignore{map lc, keys %ignore} = values %ignore if $Is{VMS};
+  
+      if ( defined $self->{XS} and !defined $self->{C} ) {
+  	my @c_files = grep { m/\.c(pp|xx)?\z/i } values %{$self->{XS}};
+  	my @o_files = grep { m/(?:.(?:o(?:bj)?)|\$\(OBJ_EXT\))\z/i } values %{$self->{XS}};
+  	%c = map { $_ => 1 } @c_files;
+  	%o = map { $_ => 1 } @o_files;
+      }
+  
+      foreach my $name ($self->lsdir($Curdir)){
+  	next if $name =~ /\#/;
+  	next if $name =~ $distprefix && -d $name;
+  	$name = lc($name) if $Is{VMS};
+  	next if $name eq $Curdir or $name eq $Updir or $ignore{$name};
+  	next unless $self->libscan($name);
+  	if (-d $name){
+  	    next if -l $name; # We do not support symlinks at all
+              next if $self->{NORECURS};
+  	    $dir{$name} = $name if (-f $self->catfile($name,"Makefile.PL"));
+  	} elsif ($name =~ /\.xs\z/){
+  	    my($c); ($c = $name) =~ s/\.xs\z/.c/;
+  	    $xs{$name} = $c;
+  	    $c{$c} = 1;
+  	} elsif ($name =~ /\.c(pp|xx|c)?\z/i){  # .c .C .cpp .cxx .cc
+  	    $c{$name} = 1
+  		unless $name =~ m/perlmain\.c/; # See MAP_TARGET
+  	} elsif ($name =~ /\.h\z/i){
+  	    $h{$name} = 1;
+  	} elsif ($name =~ /\.PL\z/) {
+  	    ($pl_files{$name} = $name) =~ s/\.PL\z// ;
+  	} elsif (($Is{VMS} || $Is{Dos}) && $name =~ /[._]pl$/i) {
+  	    # case-insensitive filesystem, one dot per name, so foo.h.PL
+  	    # under Unix appears as foo.h_pl under VMS or fooh.pl on Dos
+  	    local($/); open(my $pl, '<', $name); my $txt = <$pl>; close $pl;
+  	    if ($txt =~ /Extracting \S+ \(with variable substitutions/) {
+  		($pl_files{$name} = $name) =~ s/[._]pl\z//i ;
+  	    }
+  	    else {
+                  $pm{$name} = $self->catfile($self->{INST_LIBDIR},$name);
+              }
+  	} elsif ($name =~ /\.(p[ml]|pod)\z/){
+  	    $pm{$name} = $self->catfile($self->{INST_LIBDIR},$name);
+  	}
+      }
+  
+      $self->{PL_FILES}   ||= \%pl_files;
+      $self->{DIR}        ||= [sort keys %dir];
+      $self->{XS}         ||= \%xs;
+      $self->{C}          ||= [sort keys %c];
+      $self->{H}          ||= [sort keys %h];
+      $self->{PM}         ||= \%pm;
+  
+      my @o_files = @{$self->{C}};
+      %o = (%o, map { $_ => 1 } grep s/\.c(pp|xx|c)?\z/$self->{OBJ_EXT}/i, @o_files);
+      $self->{O_FILES} = [sort keys %o];
+  }
+  
+  
+  =item init_MANPODS
+  
+  Determines if man pages should be generated and initializes MAN1PODS
+  and MAN3PODS as appropriate.
+  
+  =cut
+  
+  sub init_MANPODS {
+      my $self = shift;
+  
+      # Set up names of manual pages to generate from pods
+      foreach my $man (qw(MAN1 MAN3)) {
+          if ( $self->{"${man}PODS"}
+               or $self->{"INSTALL${man}DIR"} =~ /^(none|\s*)$/
+          ) {
+              $self->{"${man}PODS"} ||= {};
+          }
+          else {
+              my $init_method = "init_${man}PODS";
+              $self->$init_method();
+          }
+      }
+  }
+  
+  
+  sub _has_pod {
+      my($self, $file) = @_;
+  
+      my($ispod)=0;
+      if (open( my $fh, '<', $file )) {
+          while (<$fh>) {
+              if (/^=(?:head\d+|item|pod)\b/) {
+                  $ispod=1;
+                  last;
+              }
+          }
+          close $fh;
+      } else {
+          # If it doesn't exist yet, we assume, it has pods in it
+          $ispod = 1;
+      }
+  
+      return $ispod;
+  }
+  
+  
+  =item init_MAN1PODS
+  
+  Initializes MAN1PODS from the list of EXE_FILES.
+  
+  =cut
+  
+  sub init_MAN1PODS {
+      my($self) = @_;
+  
+      if ( exists $self->{EXE_FILES} ) {
+  	foreach my $name (@{$self->{EXE_FILES}}) {
+  	    next unless $self->_has_pod($name);
+  
+  	    $self->{MAN1PODS}->{$name} =
+  		$self->catfile("\$(INST_MAN1DIR)",
+  			       basename($name).".\$(MAN1EXT)");
+  	}
+      }
+  }
+  
+  
+  =item init_MAN3PODS
+  
+  Initializes MAN3PODS from the list of PM files.
+  
+  =cut
+  
+  sub init_MAN3PODS {
+      my $self = shift;
+  
+      my %manifypods = (); # we collect the keys first, i.e. the files
+                           # we have to convert to pod
+  
+      foreach my $name (keys %{$self->{PM}}) {
+  	if ($name =~ /\.pod\z/ ) {
+  	    $manifypods{$name} = $self->{PM}{$name};
+  	} elsif ($name =~ /\.p[ml]\z/ ) {
+  	    if( $self->_has_pod($name) ) {
+  		$manifypods{$name} = $self->{PM}{$name};
+  	    }
+  	}
+      }
+  
+      my $parentlibs_re = join '|', @{$self->{PMLIBPARENTDIRS}};
+  
+      # Remove "Configure.pm" and similar, if it's not the only pod listed
+      # To force inclusion, just name it "Configure.pod", or override
+      # MAN3PODS
+      foreach my $name (keys %manifypods) {
+  	if ($self->{PERL_CORE} and $name =~ /(config|setup).*\.pm/is) {
+  	    delete $manifypods{$name};
+  	    next;
+  	}
+  	my($manpagename) = $name;
+  	$manpagename =~ s/\.p(od|m|l)\z//;
+  	# everything below lib is ok
+  	unless($manpagename =~ s!^\W*($parentlibs_re)\W+!!s) {
+  	    $manpagename = $self->catfile(
+  	        split(/::/,$self->{PARENT_NAME}),$manpagename
+  	    );
+  	}
+  	$manpagename = $self->replace_manpage_separator($manpagename);
+  	$self->{MAN3PODS}->{$name} =
+  	    $self->catfile("\$(INST_MAN3DIR)", "$manpagename.\$(MAN3EXT)");
+      }
+  }
+  
+  
+  =item init_PM
+  
+  Initializes PMLIBDIRS and PM from PMLIBDIRS.
+  
+  =cut
+  
+  sub init_PM {
+      my $self = shift;
+  
+      # Some larger extensions often wish to install a number of *.pm/pl
+      # files into the library in various locations.
+  
+      # The attribute PMLIBDIRS holds an array reference which lists
+      # subdirectories which we should search for library files to
+      # install. PMLIBDIRS defaults to [ 'lib', $self->{BASEEXT} ].  We
+      # recursively search through the named directories (skipping any
+      # which don't exist or contain Makefile.PL files).
+  
+      # For each *.pm or *.pl file found $self->libscan() is called with
+      # the default installation path in $_[1]. The return value of
+      # libscan defines the actual installation location.  The default
+      # libscan function simply returns the path.  The file is skipped
+      # if libscan returns false.
+  
+      # The default installation location passed to libscan in $_[1] is:
+      #
+      #  ./*.pm		=> $(INST_LIBDIR)/*.pm
+      #  ./xyz/...	=> $(INST_LIBDIR)/xyz/...
+      #  ./lib/...	=> $(INST_LIB)/...
+      #
+      # In this way the 'lib' directory is seen as the root of the actual
+      # perl library whereas the others are relative to INST_LIBDIR
+      # (which includes PARENT_NAME). This is a subtle distinction but one
+      # that's important for nested modules.
+  
+      unless( $self->{PMLIBDIRS} ) {
+          if( $Is{VMS} ) {
+              # Avoid logical name vs directory collisions
+              $self->{PMLIBDIRS} = ['./lib', "./$self->{BASEEXT}"];
+          }
+          else {
+              $self->{PMLIBDIRS} = ['lib', $self->{BASEEXT}];
+          }
+      }
+  
+      #only existing directories that aren't in $dir are allowed
+  
+      # Avoid $_ wherever possible:
+      # @{$self->{PMLIBDIRS}} = grep -d && !$dir{$_}, @{$self->{PMLIBDIRS}};
+      my (@pmlibdirs) = @{$self->{PMLIBDIRS}};
+      @{$self->{PMLIBDIRS}} = ();
+      my %dir = map { ($_ => $_) } @{$self->{DIR}};
+      foreach my $pmlibdir (@pmlibdirs) {
+  	-d $pmlibdir && !$dir{$pmlibdir} && push @{$self->{PMLIBDIRS}}, $pmlibdir;
+      }
+  
+      unless( $self->{PMLIBPARENTDIRS} ) {
+  	@{$self->{PMLIBPARENTDIRS}} = ('lib');
+      }
+  
+      return if $self->{PM} and $self->{ARGS}{PM};
+  
+      if (@{$self->{PMLIBDIRS}}){
+  	print "Searching PMLIBDIRS: @{$self->{PMLIBDIRS}}\n"
+  	    if ($Verbose >= 2);
+  	require File::Find;
+          File::Find::find(sub {
+              if (-d $_){
+                  unless ($self->libscan($_)){
+                      $File::Find::prune = 1;
+                  }
+                  return;
+              }
+              return if /\#/;
+              return if /~$/;             # emacs temp files
+              return if /,v$/;            # RCS files
+              return if m{\.swp$};        # vim swap files
+  
+  	    my $path   = $File::Find::name;
+              my $prefix = $self->{INST_LIBDIR};
+              my $striplibpath;
+  
+  	    my $parentlibs_re = join '|', @{$self->{PMLIBPARENTDIRS}};
+  	    $prefix =  $self->{INST_LIB}
+                  if ($striplibpath = $path) =~ s{^(\W*)($parentlibs_re)\W}
+  	                                       {$1}i;
+  
+  	    my($inst) = $self->catfile($prefix,$striplibpath);
+  	    local($_) = $inst; # for backwards compatibility
+  	    $inst = $self->libscan($inst);
+  	    print "libscan($path) => '$inst'\n" if ($Verbose >= 2);
+  	    return unless $inst;
+  	    $self->{PM}{$path} = $inst;
+  	}, @{$self->{PMLIBDIRS}});
+      }
+  }
+  
+  
+  =item init_DIRFILESEP
+  
+  Using / for Unix.  Called by init_main.
+  
+  =cut
+  
+  sub init_DIRFILESEP {
+      my($self) = shift;
+  
+      $self->{DIRFILESEP} = '/';
+  }
+  
+  
+  =item init_main
+  
+  Initializes AR, AR_STATIC_ARGS, BASEEXT, CONFIG, DISTNAME, DLBASE,
+  EXE_EXT, FULLEXT, FULLPERL, FULLPERLRUN, FULLPERLRUNINST, INST_*,
+  INSTALL*, INSTALLDIRS, LIB_EXT, LIBPERL_A, MAP_TARGET, NAME,
+  OBJ_EXT, PARENT_NAME, PERL, PERL_ARCHLIB, PERL_INC, PERL_LIB,
+  PERL_SRC, PERLRUN, PERLRUNINST, PREFIX, VERSION,
+  VERSION_SYM, XS_VERSION.
+  
+  =cut
+  
+  sub init_main {
+      my($self) = @_;
+  
+      # --- Initialize Module Name and Paths
+  
+      # NAME    = Foo::Bar::Oracle
+      # FULLEXT = Foo/Bar/Oracle
+      # BASEEXT = Oracle
+      # PARENT_NAME = Foo::Bar
+  ### Only UNIX:
+  ###    ($self->{FULLEXT} =
+  ###     $self->{NAME}) =~ s!::!/!g ; #eg. BSD/Foo/Socket
+      $self->{FULLEXT} = $self->catdir(split /::/, $self->{NAME});
+  
+  
+      # Copied from DynaLoader:
+  
+      my(@modparts) = split(/::/,$self->{NAME});
+      my($modfname) = $modparts[-1];
+  
+      # Some systems have restrictions on files names for DLL's etc.
+      # mod2fname returns appropriate file base name (typically truncated)
+      # It may also edit @modparts if required.
+      # We require DynaLoader to make sure that mod2fname is loaded
+      eval { require DynaLoader };
+      if (defined &DynaLoader::mod2fname) {
+          $modfname = &DynaLoader::mod2fname(\@modparts);
+      }
+  
+      ($self->{PARENT_NAME}, $self->{BASEEXT}) = $self->{NAME} =~ m!(?:([\w:]+)::)?(\w+)\z! ;
+      $self->{PARENT_NAME} ||= '';
+  
+      if (defined &DynaLoader::mod2fname) {
+  	# As of 5.001m, dl_os2 appends '_'
+  	$self->{DLBASE} = $modfname;
+      } else {
+  	$self->{DLBASE} = '$(BASEEXT)';
+      }
+  
+  
+      # --- Initialize PERL_LIB, PERL_SRC
+  
+      # *Real* information: where did we get these two from? ...
+      my $inc_config_dir = dirname($INC{'Config.pm'});
+      my $inc_carp_dir   = dirname($INC{'Carp.pm'});
+  
+      unless ($self->{PERL_SRC}){
+          foreach my $dir_count (1..8) { # 8 is the VMS limit for nesting
+              my $dir = $self->catdir(($Updir) x $dir_count);
+  
+              if (-f $self->catfile($dir,"config_h.SH")   &&
+                  -f $self->catfile($dir,"perl.h")        &&
+                  -f $self->catfile($dir,"lib","strict.pm")
+              ) {
+                  $self->{PERL_SRC}=$dir ;
+                  last;
+              }
+          }
+      }
+  
+      warn "PERL_CORE is set but I can't find your PERL_SRC!\n" if
+        $self->{PERL_CORE} and !$self->{PERL_SRC};
+  
+      if ($self->{PERL_SRC}){
+  	$self->{PERL_LIB}     ||= $self->catdir("$self->{PERL_SRC}","lib");
+  
+          $self->{PERL_ARCHLIB} = $self->{PERL_LIB};
+          $self->{PERL_INC}     = ($Is{Win32}) ?
+              $self->catdir($self->{PERL_LIB},"CORE") : $self->{PERL_SRC};
+  
+  	# catch a situation that has occurred a few times in the past:
+  	unless (
+  		-s $self->catfile($self->{PERL_SRC},'cflags')
+  		or
+  		$Is{VMS}
+  		&&
+  		-s $self->catfile($self->{PERL_SRC},'vmsish.h')
+  		or
+  		$Is{Win32}
+  	       ){
+  	    warn qq{
+  You cannot build extensions below the perl source tree after executing
+  a 'make clean' in the perl source tree.
+  
+  To rebuild extensions distributed with the perl source you should
+  simply Configure (to include those extensions) and then build perl as
+  normal. After installing perl the source tree can be deleted. It is
+  not needed for building extensions by running 'perl Makefile.PL'
+  usually without extra arguments.
+  
+  It is recommended that you unpack and build additional extensions away
+  from the perl source tree.
+  };
+  	}
+      } else {
+  	# we should also consider $ENV{PERL5LIB} here
+          my $old = $self->{PERL_LIB} || $self->{PERL_ARCHLIB} || $self->{PERL_INC};
+  	$self->{PERL_LIB}     ||= $Config{privlibexp};
+  	$self->{PERL_ARCHLIB} ||= $Config{archlibexp};
+  	$self->{PERL_INC}     = $self->catdir("$self->{PERL_ARCHLIB}","CORE"); # wild guess for now
+  	my $perl_h;
+  
+  	if (not -f ($perl_h = $self->catfile($self->{PERL_INC},"perl.h"))
+  	    and not $old){
+  	    # Maybe somebody tries to build an extension with an
+  	    # uninstalled Perl outside of Perl build tree
+  	    my $lib;
+  	    for my $dir (@INC) {
+  	      $lib = $dir, last if -e $self->catfile($dir, "Config.pm");
+  	    }
+  	    if ($lib) {
+                # Win32 puts its header files in /perl/src/lib/CORE.
+                # Unix leaves them in /perl/src.
+  	      my $inc = $Is{Win32} ? $self->catdir($lib, "CORE" )
+                                    : dirname $lib;
+  	      if (-e $self->catfile($inc, "perl.h")) {
+  		$self->{PERL_LIB}	   = $lib;
+  		$self->{PERL_ARCHLIB}	   = $lib;
+  		$self->{PERL_INC}	   = $inc;
+  		$self->{UNINSTALLED_PERL}  = 1;
+  		print <<EOP;
+  ... Detected uninstalled Perl.  Trying to continue.
+  EOP
+  	      }
+  	    }
+  	}
+      }
+  
+      if ($Is{Android}) {
+      	# Android fun times!
+      	# ../../perl -I../../lib -MFile::Glob -e1 works
+      	# ../../../perl -I../../../lib -MFile::Glob -e1 fails to find
+      	# the .so for File::Glob.
+      	# This always affects core perl, but may also affect an installed
+      	# perl built with -Duserelocatableinc.
+      	$self->{PERL_LIB} = File::Spec->rel2abs($self->{PERL_LIB});
+      	$self->{PERL_ARCHLIB} = File::Spec->rel2abs($self->{PERL_ARCHLIB});
+      }
+      $self->{PERL_INCDEP} = $self->{PERL_INC};
+      $self->{PERL_ARCHLIBDEP} = $self->{PERL_ARCHLIB};
+  
+      # We get SITELIBEXP and SITEARCHEXP directly via
+      # Get_from_Config. When we are running standard modules, these
+      # won't matter, we will set INSTALLDIRS to "perl". Otherwise we
+      # set it to "site". I prefer that INSTALLDIRS be set from outside
+      # MakeMaker.
+      $self->{INSTALLDIRS} ||= "site";
+  
+      $self->{MAN1EXT} ||= $Config{man1ext};
+      $self->{MAN3EXT} ||= $Config{man3ext};
+  
+      # Get some stuff out of %Config if we haven't yet done so
+      print "CONFIG must be an array ref\n"
+          if ($self->{CONFIG} and ref $self->{CONFIG} ne 'ARRAY');
+      $self->{CONFIG} = [] unless (ref $self->{CONFIG});
+      push(@{$self->{CONFIG}}, @ExtUtils::MakeMaker::Get_from_Config);
+      push(@{$self->{CONFIG}}, 'shellflags') if $Config{shellflags};
+      my(%once_only);
+      foreach my $m (@{$self->{CONFIG}}){
+          next if $once_only{$m};
+          print "CONFIG key '$m' does not exist in Config.pm\n"
+                  unless exists $Config{$m};
+          $self->{uc $m} ||= $Config{$m};
+          $once_only{$m} = 1;
+      }
+  
+  # This is too dangerous:
+  #    if ($^O eq "next") {
+  #	$self->{AR} = "libtool";
+  #	$self->{AR_STATIC_ARGS} = "-o";
+  #    }
+  # But I leave it as a placeholder
+  
+      $self->{AR_STATIC_ARGS} ||= "cr";
+  
+      # These should never be needed
+      $self->{OBJ_EXT} ||= '.o';
+      $self->{LIB_EXT} ||= '.a';
+  
+      $self->{MAP_TARGET} ||= "perl";
+  
+      $self->{LIBPERL_A} ||= "libperl$self->{LIB_EXT}";
+  
+      # make a simple check if we find strict
+      warn "Warning: PERL_LIB ($self->{PERL_LIB}) seems not to be a perl library directory
+          (strict.pm not found)"
+          unless -f $self->catfile("$self->{PERL_LIB}","strict.pm") ||
+                 $self->{NAME} eq "ExtUtils::MakeMaker";
+  }
+  
+  =item init_tools
+  
+  Initializes tools to use their common (and faster) Unix commands.
+  
+  =cut
+  
+  sub init_tools {
+      my $self = shift;
+  
+      $self->{ECHO}       ||= 'echo';
+      $self->{ECHO_N}     ||= 'echo -n';
+      $self->{RM_F}       ||= "rm -f";
+      $self->{RM_RF}      ||= "rm -rf";
+      $self->{TOUCH}      ||= "touch";
+      $self->{TEST_F}     ||= "test -f";
+      $self->{TEST_S}     ||= "test -s";
+      $self->{CP}         ||= "cp";
+      $self->{MV}         ||= "mv";
+      $self->{CHMOD}      ||= "chmod";
+      $self->{FALSE}      ||= 'false';
+      $self->{TRUE}       ||= 'true';
+  
+      $self->{LD}         ||= 'ld';
+  
+      return $self->SUPER::init_tools(@_);
+  
+      # After SUPER::init_tools so $Config{shell} has a
+      # chance to get set.
+      $self->{SHELL}      ||= '/bin/sh';
+  
+      return;
+  }
+  
+  
+  =item init_linker
+  
+  Unix has no need of special linker flags.
+  
+  =cut
+  
+  sub init_linker {
+      my($self) = shift;
+      $self->{PERL_ARCHIVE} ||= '';
+      $self->{PERL_ARCHIVEDEP} ||= '';
+      $self->{PERL_ARCHIVE_AFTER} ||= '';
+      $self->{EXPORT_LIST}  ||= '';
+  }
+  
+  
+  =begin _protected
+  
+  =item init_lib2arch
+  
+      $mm->init_lib2arch
+  
+  =end _protected
+  
+  =cut
+  
+  sub init_lib2arch {
+      my($self) = shift;
+  
+      # The user who requests an installation directory explicitly
+      # should not have to tell us an architecture installation directory
+      # as well. We look if a directory exists that is named after the
+      # architecture. If not we take it as a sign that it should be the
+      # same as the requested installation directory. Otherwise we take
+      # the found one.
+      for my $libpair ({l=>"privlib",   a=>"archlib"},
+                       {l=>"sitelib",   a=>"sitearch"},
+                       {l=>"vendorlib", a=>"vendorarch"},
+                      )
+      {
+          my $lib = "install$libpair->{l}";
+          my $Lib = uc $lib;
+          my $Arch = uc "install$libpair->{a}";
+          if( $self->{$Lib} && ! $self->{$Arch} ){
+              my($ilib) = $Config{$lib};
+  
+              $self->prefixify($Arch,$ilib,$self->{$Lib});
+  
+              unless (-d $self->{$Arch}) {
+                  print "Directory $self->{$Arch} not found\n"
+                    if $Verbose;
+                  $self->{$Arch} = $self->{$Lib};
+              }
+              print "Defaulting $Arch to $self->{$Arch}\n" if $Verbose;
+          }
+      }
+  }
+  
+  
+  =item init_PERL
+  
+      $mm->init_PERL;
+  
+  Called by init_main.  Sets up ABSPERL, PERL, FULLPERL and all the
+  *PERLRUN* permutations.
+  
+      PERL is allowed to be miniperl
+      FULLPERL must be a complete perl
+  
+      ABSPERL is PERL converted to an absolute path
+  
+      *PERLRUN contains everything necessary to run perl, find it's
+           libraries, etc...
+  
+      *PERLRUNINST is *PERLRUN + everything necessary to find the
+           modules being built.
+  
+  =cut
+  
+  sub init_PERL {
+      my($self) = shift;
+  
+      my @defpath = ();
+      foreach my $component ($self->{PERL_SRC}, $self->path(),
+                             $Config{binexp})
+      {
+  	push @defpath, $component if defined $component;
+      }
+  
+      # Build up a set of file names (not command names).
+      my $thisperl = $self->canonpath($^X);
+      $thisperl .= $Config{exe_ext} unless
+                  # VMS might have a file version # at the end
+        $Is{VMS} ? $thisperl =~ m/$Config{exe_ext}(;\d+)?$/i
+                : $thisperl =~ m/$Config{exe_ext}$/i;
+  
+      # We need a relative path to perl when in the core.
+      $thisperl = $self->abs2rel($thisperl) if $self->{PERL_CORE};
+  
+      my @perls = ($thisperl);
+      push @perls, map { "$_$Config{exe_ext}" }
+                       ("perl$Config{version}", 'perl5', 'perl');
+  
+      # miniperl has priority over all but the canonical perl when in the
+      # core.  Otherwise its a last resort.
+      my $miniperl = "miniperl$Config{exe_ext}";
+      if( $self->{PERL_CORE} ) {
+          splice @perls, 1, 0, $miniperl;
+      }
+      else {
+          push @perls, $miniperl;
+      }
+  
+      $self->{PERL} ||=
+          $self->find_perl(5.0, \@perls, \@defpath, $Verbose );
+  
+      my $perl = $self->{PERL};
+      $perl =~ s/^"//;
+      my $has_mcr = $perl =~ s/^MCR\s*//;
+      my $perlflags = '';
+      my $stripped_perl;
+      while ($perl) {
+  	($stripped_perl = $perl) =~ s/"$//;
+  	last if -x $stripped_perl;
+  	last unless $perl =~ s/(\s+\S+)$//;
+  	$perlflags = $1.$perlflags;
+      }
+      $self->{PERL} = $stripped_perl;
+      $self->{PERL} = 'MCR '.$self->{PERL} if $has_mcr || $Is{VMS};
+  
+      # When built for debugging, VMS doesn't create perl.exe but ndbgperl.exe.
+      my $perl_name = 'perl';
+      $perl_name = 'ndbgperl' if $Is{VMS} &&
+        defined $Config{usevmsdebug} && $Config{usevmsdebug} eq 'define';
+  
+      # XXX This logic is flawed.  If "miniperl" is anywhere in the path
+      # it will get confused.  It should be fixed to work only on the filename.
+      # Define 'FULLPERL' to be a non-miniperl (used in test: target)
+      unless ($self->{FULLPERL}) {
+        ($self->{FULLPERL} = $self->{PERL}) =~ s/\Q$miniperl\E$/$perl_name$Config{exe_ext}/i;
+        $self->{FULLPERL} = qq{"$self->{FULLPERL}"}.$perlflags;
+      }
+      # Can't have an image name with quotes, and findperl will have
+      # already escaped spaces.
+      $self->{FULLPERL} =~ tr/"//d if $Is{VMS};
+  
+      # Little hack to get around VMS's find_perl putting "MCR" in front
+      # sometimes.
+      $self->{ABSPERL} = $self->{PERL};
+      $has_mcr = $self->{ABSPERL} =~ s/^MCR\s*//;
+      if( $self->file_name_is_absolute($self->{ABSPERL}) ) {
+          $self->{ABSPERL} = '$(PERL)';
+      }
+      else {
+          $self->{ABSPERL} = $self->rel2abs($self->{ABSPERL});
+  
+          # Quote the perl command if it contains whitespace
+          $self->{ABSPERL} = $self->quote_literal($self->{ABSPERL})
+            if $self->{ABSPERL} =~ /\s/;
+  
+          $self->{ABSPERL} = 'MCR '.$self->{ABSPERL} if $has_mcr;
+      }
+      $self->{PERL} = qq{"$self->{PERL}"}.$perlflags;
+  
+      # Can't have an image name with quotes, and findperl will have
+      # already escaped spaces.
+      $self->{PERL} =~ tr/"//d if $Is{VMS};
+  
+      # Are we building the core?
+      $self->{PERL_CORE} = $ENV{PERL_CORE} unless exists $self->{PERL_CORE};
+      $self->{PERL_CORE} = 0               unless defined $self->{PERL_CORE};
+  
+      # How do we run perl?
+      foreach my $perl (qw(PERL FULLPERL ABSPERL)) {
+          my $run  = $perl.'RUN';
+  
+          $self->{$run}  = qq{\$($perl)};
+  
+          # Make sure perl can find itself before it's installed.
+          $self->{$run} .= q{ "-I$(PERL_LIB)" "-I$(PERL_ARCHLIB)"}
+            if $self->{UNINSTALLED_PERL} || $self->{PERL_CORE};
+  
+          $self->{$perl.'RUNINST'} =
+            sprintf q{$(%sRUN)%s "-I$(INST_ARCHLIB)" "-I$(INST_LIB)"},
+  	    $perl, $perlflags;
+      }
+  
+      return 1;
+  }
+  
+  
+  =item init_platform
+  
+  =item platform_constants
+  
+  Add MM_Unix_VERSION.
+  
+  =cut
+  
+  sub init_platform {
+      my($self) = shift;
+  
+      $self->{MM_Unix_VERSION} = $VERSION;
+      $self->{PERL_MALLOC_DEF} = '-DPERL_EXTMALLOC_DEF -Dmalloc=Perl_malloc '.
+                                 '-Dfree=Perl_mfree -Drealloc=Perl_realloc '.
+                                 '-Dcalloc=Perl_calloc';
+  
+  }
+  
+  sub platform_constants {
+      my($self) = shift;
+      my $make_frag = '';
+  
+      foreach my $macro (qw(MM_Unix_VERSION PERL_MALLOC_DEF))
+      {
+          next unless defined $self->{$macro};
+          $make_frag .= "$macro = $self->{$macro}\n";
+      }
+  
+      return $make_frag;
+  }
+  
+  
+  =item init_PERM
+  
+    $mm->init_PERM
+  
+  Called by init_main.  Initializes PERL_*
+  
+  =cut
+  
+  sub init_PERM {
+      my($self) = shift;
+  
+      $self->{PERM_DIR} = 755  unless defined $self->{PERM_DIR};
+      $self->{PERM_RW}  = 644  unless defined $self->{PERM_RW};
+      $self->{PERM_RWX} = 755  unless defined $self->{PERM_RWX};
+  
+      return 1;
+  }
+  
+  
+  =item init_xs
+  
+      $mm->init_xs
+  
+  Sets up macros having to do with XS code.  Currently just INST_STATIC,
+  INST_DYNAMIC and INST_BOOT.
+  
+  =cut
+  
+  sub init_xs {
+      my $self = shift;
+  
+      if ($self->has_link_code()) {
+          $self->{INST_STATIC}  =
+            $self->catfile('$(INST_ARCHAUTODIR)', '$(BASEEXT)$(LIB_EXT)');
+          $self->{INST_DYNAMIC} =
+            $self->catfile('$(INST_ARCHAUTODIR)', '$(DLBASE).$(DLEXT)');
+          $self->{INST_BOOT}    =
+            $self->catfile('$(INST_ARCHAUTODIR)', '$(BASEEXT).bs');
+      } else {
+          $self->{INST_STATIC}  = '';
+          $self->{INST_DYNAMIC} = '';
+          $self->{INST_BOOT}    = '';
+      }
+  }
+  
+  =item install (o)
+  
+  Defines the install target.
+  
+  =cut
+  
+  sub install {
+      my($self, %attribs) = @_;
+      my(@m);
+  
+      push @m, q{
+  install :: pure_install doc_install
+  	$(NOECHO) $(NOOP)
+  
+  install_perl :: pure_perl_install doc_perl_install
+  	$(NOECHO) $(NOOP)
+  
+  install_site :: pure_site_install doc_site_install
+  	$(NOECHO) $(NOOP)
+  
+  install_vendor :: pure_vendor_install doc_vendor_install
+  	$(NOECHO) $(NOOP)
+  
+  pure_install :: pure_$(INSTALLDIRS)_install
+  	$(NOECHO) $(NOOP)
+  
+  doc_install :: doc_$(INSTALLDIRS)_install
+  	$(NOECHO) $(NOOP)
+  
+  pure__install : pure_site_install
+  	$(NOECHO) $(ECHO) INSTALLDIRS not defined, defaulting to INSTALLDIRS=site
+  
+  doc__install : doc_site_install
+  	$(NOECHO) $(ECHO) INSTALLDIRS not defined, defaulting to INSTALLDIRS=site
+  
+  pure_perl_install :: all
+  	$(NOECHO) $(MOD_INSTALL) \
+  };
+  
+      push @m,
+  q{		read "}.$self->catfile('$(PERL_ARCHLIB)','auto','$(FULLEXT)','.packlist').q{" \
+  		write "}.$self->catfile('$(DESTINSTALLARCHLIB)','auto','$(FULLEXT)','.packlist').q{" \
+  } unless $self->{NO_PACKLIST};
+  
+      push @m,
+  q{		"$(INST_LIB)" "$(DESTINSTALLPRIVLIB)" \
+  		"$(INST_ARCHLIB)" "$(DESTINSTALLARCHLIB)" \
+  		"$(INST_BIN)" "$(DESTINSTALLBIN)" \
+  		"$(INST_SCRIPT)" "$(DESTINSTALLSCRIPT)" \
+  		"$(INST_MAN1DIR)" "$(DESTINSTALLMAN1DIR)" \
+  		"$(INST_MAN3DIR)" "$(DESTINSTALLMAN3DIR)"
+  	$(NOECHO) $(WARN_IF_OLD_PACKLIST) \
+  		"}.$self->catdir('$(SITEARCHEXP)','auto','$(FULLEXT)').q{"
+  
+  
+  pure_site_install :: all
+  	$(NOECHO) $(MOD_INSTALL) \
+  };
+      push @m,
+  q{		read "}.$self->catfile('$(SITEARCHEXP)','auto','$(FULLEXT)','.packlist').q{" \
+  		write "}.$self->catfile('$(DESTINSTALLSITEARCH)','auto','$(FULLEXT)','.packlist').q{" \
+  } unless $self->{NO_PACKLIST};
+  
+      push @m,
+  q{		"$(INST_LIB)" "$(DESTINSTALLSITELIB)" \
+  		"$(INST_ARCHLIB)" "$(DESTINSTALLSITEARCH)" \
+  		"$(INST_BIN)" "$(DESTINSTALLSITEBIN)" \
+  		"$(INST_SCRIPT)" "$(DESTINSTALLSITESCRIPT)" \
+  		"$(INST_MAN1DIR)" "$(DESTINSTALLSITEMAN1DIR)" \
+  		"$(INST_MAN3DIR)" "$(DESTINSTALLSITEMAN3DIR)"
+  	$(NOECHO) $(WARN_IF_OLD_PACKLIST) \
+  		"}.$self->catdir('$(PERL_ARCHLIB)','auto','$(FULLEXT)').q{"
+  
+  pure_vendor_install :: all
+  	$(NOECHO) $(MOD_INSTALL) \
+  };
+      push @m,
+  q{		read "}.$self->catfile('$(VENDORARCHEXP)','auto','$(FULLEXT)','.packlist').q{" \
+  		write "}.$self->catfile('$(DESTINSTALLVENDORARCH)','auto','$(FULLEXT)','.packlist').q{" \
+  } unless $self->{NO_PACKLIST};
+  
+      push @m,
+  q{		"$(INST_LIB)" "$(DESTINSTALLVENDORLIB)" \
+  		"$(INST_ARCHLIB)" "$(DESTINSTALLVENDORARCH)" \
+  		"$(INST_BIN)" "$(DESTINSTALLVENDORBIN)" \
+  		"$(INST_SCRIPT)" "$(DESTINSTALLVENDORSCRIPT)" \
+  		"$(INST_MAN1DIR)" "$(DESTINSTALLVENDORMAN1DIR)" \
+  		"$(INST_MAN3DIR)" "$(DESTINSTALLVENDORMAN3DIR)"
+  
+  };
+  
+      push @m, q{
+  doc_perl_install :: all
+  	$(NOECHO) $(NOOP)
+  
+  doc_site_install :: all
+  	$(NOECHO) $(NOOP)
+  
+  doc_vendor_install :: all
+  	$(NOECHO) $(NOOP)
+  
+  } if $self->{NO_PERLLOCAL};
+  
+      push @m, q{
+  doc_perl_install :: all
+  	$(NOECHO) $(ECHO) Appending installation info to "$(DESTINSTALLARCHLIB)/perllocal.pod"
+  	-$(NOECHO) $(MKPATH) "$(DESTINSTALLARCHLIB)"
+  	-$(NOECHO) $(DOC_INSTALL) \
+  		"Module" "$(NAME)" \
+  		"installed into" $(INSTALLPRIVLIB) \
+  		LINKTYPE "$(LINKTYPE)" \
+  		VERSION "$(VERSION)" \
+  		EXE_FILES "$(EXE_FILES)" \
+  		>> "}.$self->catfile('$(DESTINSTALLARCHLIB)','perllocal.pod').q{"
+  
+  doc_site_install :: all
+  	$(NOECHO) $(ECHO) Appending installation info to "$(DESTINSTALLARCHLIB)/perllocal.pod"
+  	-$(NOECHO) $(MKPATH) "$(DESTINSTALLARCHLIB)"
+  	-$(NOECHO) $(DOC_INSTALL) \
+  		"Module" "$(NAME)" \
+  		"installed into" $(INSTALLSITELIB) \
+  		LINKTYPE "$(LINKTYPE)" \
+  		VERSION "$(VERSION)" \
+  		EXE_FILES "$(EXE_FILES)" \
+  		>> "}.$self->catfile('$(DESTINSTALLARCHLIB)','perllocal.pod').q{"
+  
+  doc_vendor_install :: all
+  	$(NOECHO) $(ECHO) Appending installation info to "$(DESTINSTALLARCHLIB)/perllocal.pod"
+  	-$(NOECHO) $(MKPATH) "$(DESTINSTALLARCHLIB)"
+  	-$(NOECHO) $(DOC_INSTALL) \
+  		"Module" "$(NAME)" \
+  		"installed into" $(INSTALLVENDORLIB) \
+  		LINKTYPE "$(LINKTYPE)" \
+  		VERSION "$(VERSION)" \
+  		EXE_FILES "$(EXE_FILES)" \
+  		>> "}.$self->catfile('$(DESTINSTALLARCHLIB)','perllocal.pod').q{"
+  
+  } unless $self->{NO_PERLLOCAL};
+  
+      push @m, q{
+  uninstall :: uninstall_from_$(INSTALLDIRS)dirs
+  	$(NOECHO) $(NOOP)
+  
+  uninstall_from_perldirs ::
+  	$(NOECHO) $(UNINSTALL) "}.$self->catfile('$(PERL_ARCHLIB)','auto','$(FULLEXT)','.packlist').q{"
+  
+  uninstall_from_sitedirs ::
+  	$(NOECHO) $(UNINSTALL) "}.$self->catfile('$(SITEARCHEXP)','auto','$(FULLEXT)','.packlist').q{"
+  
+  uninstall_from_vendordirs ::
+  	$(NOECHO) $(UNINSTALL) "}.$self->catfile('$(VENDORARCHEXP)','auto','$(FULLEXT)','.packlist').q{"
+  };
+  
+      join("",@m);
+  }
+  
+  =item installbin (o)
+  
+  Defines targets to make and to install EXE_FILES.
+  
+  =cut
+  
+  sub installbin {
+      my($self) = shift;
+  
+      return "" unless $self->{EXE_FILES} && ref $self->{EXE_FILES} eq "ARRAY";
+      my @exefiles = @{$self->{EXE_FILES}};
+      return "" unless @exefiles;
+  
+      @exefiles = map vmsify($_), @exefiles if $Is{VMS};
+  
+      my %fromto;
+      for my $from (@exefiles) {
+  	my($path)= $self->catfile('$(INST_SCRIPT)', basename($from));
+  
+  	local($_) = $path; # for backwards compatibility
+  	my $to = $self->libscan($path);
+  	print "libscan($from) => '$to'\n" if ($Verbose >=2);
+  
+          $to = vmsify($to) if $Is{VMS};
+  	$fromto{$from} = $to;
+      }
+      my @to   = values %fromto;
+  
+      my @m;
+      push(@m, qq{
+  EXE_FILES = @exefiles
+  
+  pure_all :: @to
+  	\$(NOECHO) \$(NOOP)
+  
+  realclean ::
+  });
+  
+      # realclean can get rather large.
+      push @m, map "\t$_\n", $self->split_command('$(RM_F)', @to);
+      push @m, "\n";
+  
+  
+      # A target for each exe file.
+      while (my($from,$to) = each %fromto) {
+  	last unless defined $from;
+  
+  	push @m, sprintf <<'MAKE', $to, $from, $to, $from, $to, $to, $to;
+  %s : %s $(FIRST_MAKEFILE) $(INST_SCRIPT)$(DFSEP).exists $(INST_BIN)$(DFSEP).exists
+  	$(NOECHO) $(RM_F) %s
+  	$(CP) %s %s
+  	$(FIXIN) %s
+  	-$(NOECHO) $(CHMOD) $(PERM_RWX) %s
+  
+  MAKE
+  
+      }
+  
+      join "", @m;
+  }
+  
+  
+  =item linkext (o)
+  
+  Defines the linkext target which in turn defines the LINKTYPE.
+  
+  =cut
+  
+  sub linkext {
+      my($self, %attribs) = @_;
+      # LINKTYPE => static or dynamic or ''
+      my($linktype) = defined $attribs{LINKTYPE} ?
+        $attribs{LINKTYPE} : '$(LINKTYPE)';
+      "
+  linkext :: $linktype
+  	\$(NOECHO) \$(NOOP)
+  ";
+  }
+  
+  =item lsdir
+  
+  Takes as arguments a directory name and a regular expression. Returns
+  all entries in the directory that match the regular expression.
+  
+  =cut
+  
+  sub lsdir {
+      my($self) = shift;
+      my($dir, $regex) = @_;
+      my(@ls);
+      my $dh = new DirHandle;
+      $dh->open($dir || ".") or return ();
+      @ls = $dh->read;
+      $dh->close;
+      @ls = grep(/$regex/, @ls) if $regex;
+      @ls;
+  }
+  
+  =item macro (o)
+  
+  Simple subroutine to insert the macros defined by the macro attribute
+  into the Makefile.
+  
+  =cut
+  
+  sub macro {
+      my($self,%attribs) = @_;
+      my(@m,$key,$val);
+      while (($key,$val) = each %attribs){
+  	last unless defined $key;
+  	push @m, "$key = $val\n";
+      }
+      join "", @m;
+  }
+  
+  =item makeaperl (o)
+  
+  Called by staticmake. Defines how to write the Makefile to produce a
+  static new perl.
+  
+  By default the Makefile produced includes all the static extensions in
+  the perl library. (Purified versions of library files, e.g.,
+  DynaLoader_pure_p1_c0_032.a are automatically ignored to avoid link errors.)
+  
+  =cut
+  
+  sub makeaperl {
+      my($self, %attribs) = @_;
+      my($makefilename, $searchdirs, $static, $extra, $perlinc, $target, $tmp, $libperl) =
+  	@attribs{qw(MAKE DIRS STAT EXTRA INCL TARGET TMP LIBPERL)};
+      my(@m);
+      push @m, "
+  # --- MakeMaker makeaperl section ---
+  MAP_TARGET    = $target
+  FULLPERL      = $self->{FULLPERL}
+  ";
+      return join '', @m if $self->{PARENT};
+  
+      my($dir) = join ":", @{$self->{DIR}};
+  
+      unless ($self->{MAKEAPERL}) {
+  	push @m, q{
+  $(MAP_TARGET) :: static $(MAKE_APERL_FILE)
+  	$(MAKE) $(USEMAKEFILE) $(MAKE_APERL_FILE) $@
+  
+  $(MAKE_APERL_FILE) : $(FIRST_MAKEFILE) pm_to_blib
+  	$(NOECHO) $(ECHO) Writing \"$(MAKE_APERL_FILE)\" for this $(MAP_TARGET)
+  	$(NOECHO) $(PERLRUNINST) \
+  		Makefile.PL DIR="}, $dir, q{" \
+  		MAKEFILE=$(MAKE_APERL_FILE) LINKTYPE=static \
+  		MAKEAPERL=1 NORECURS=1 CCCDLFLAGS=};
+  
+  	foreach (@ARGV){
+  		if( /\s/ ){
+  			s/=(.*)/='$1'/;
+  		}
+  		push @m, " \\\n\t\t$_";
+  	}
+  #	push @m, map( " \\\n\t\t$_", @ARGV );
+  	push @m, "\n";
+  
+  	return join '', @m;
+      }
+  
+  
+  
+      my($cccmd, $linkcmd, $lperl);
+  
+  
+      $cccmd = $self->const_cccmd($libperl);
+      $cccmd =~ s/^CCCMD\s*=\s*//;
+      $cccmd =~ s/\$\(INC\)/ "-I$self->{PERL_INC}" /;
+      $cccmd .= " $Config{cccdlflags}"
+  	if ($Config{useshrplib} eq 'true');
+      $cccmd =~ s/\(CC\)/\(PERLMAINCC\)/;
+  
+      # The front matter of the linkcommand...
+      $linkcmd = join ' ', "\$(CC)",
+  	    grep($_, @Config{qw(ldflags ccdlflags)});
+      $linkcmd =~ s/\s+/ /g;
+      $linkcmd =~ s,(perl\.exp),\$(PERL_INC)/$1,;
+  
+      # Which *.a files could we make use of...
+      my %static;
+      require File::Find;
+      File::Find::find(sub {
+  	return unless m/\Q$self->{LIB_EXT}\E$/;
+  
+          # Skip perl's libraries.
+          return if m/^libperl/ or m/^perl\Q$self->{LIB_EXT}\E$/;
+  
+  	# Skip purified versions of libraries
+          # (e.g., DynaLoader_pure_p1_c0_032.a)
+  	return if m/_pure_\w+_\w+_\w+\.\w+$/ and -f "$File::Find::dir/.pure";
+  
+  	if( exists $self->{INCLUDE_EXT} ){
+  		my $found = 0;
+  
+  		(my $xx = $File::Find::name) =~ s,.*?/auto/,,s;
+  		$xx =~ s,/?$_,,;
+  		$xx =~ s,/,::,g;
+  
+  		# Throw away anything not explicitly marked for inclusion.
+  		# DynaLoader is implied.
+  		foreach my $incl ((@{$self->{INCLUDE_EXT}},'DynaLoader')){
+  			if( $xx eq $incl ){
+  				$found++;
+  				last;
+  			}
+  		}
+  		return unless $found;
+  	}
+  	elsif( exists $self->{EXCLUDE_EXT} ){
+  		(my $xx = $File::Find::name) =~ s,.*?/auto/,,s;
+  		$xx =~ s,/?$_,,;
+  		$xx =~ s,/,::,g;
+  
+  		# Throw away anything explicitly marked for exclusion
+  		foreach my $excl (@{$self->{EXCLUDE_EXT}}){
+  			return if( $xx eq $excl );
+  		}
+  	}
+  
+  	# don't include the installed version of this extension. I
+  	# leave this line here, although it is not necessary anymore:
+  	# I patched minimod.PL instead, so that Miniperl.pm won't
+  	# include duplicates
+  
+  	# Once the patch to minimod.PL is in the distribution, I can
+  	# drop it
+  	return if $File::Find::name =~ m:auto/$self->{FULLEXT}/$self->{BASEEXT}$self->{LIB_EXT}\z:;
+  	use Cwd 'cwd';
+  	$static{cwd() . "/" . $_}++;
+      }, grep( -d $_, @{$searchdirs || []}) );
+  
+      # We trust that what has been handed in as argument, will be buildable
+      $static = [] unless $static;
+      @static{@{$static}} = (1) x @{$static};
+  
+      $extra = [] unless $extra && ref $extra eq 'ARRAY';
+      for (sort keys %static) {
+  	next unless /\Q$self->{LIB_EXT}\E\z/;
+  	$_ = dirname($_) . "/extralibs.ld";
+  	push @$extra, $_;
+      }
+  
+      s/^(.*)/"-I$1"/ for @{$perlinc || []};
+  
+      $target ||= "perl";
+      $tmp    ||= ".";
+  
+  # MAP_STATIC doesn't look into subdirs yet. Once "all" is made and we
+  # regenerate the Makefiles, MAP_STATIC and the dependencies for
+  # extralibs.all are computed correctly
+      push @m, "
+  MAP_LINKCMD   = $linkcmd
+  MAP_PERLINC   = @{$perlinc || []}
+  MAP_STATIC    = ",
+  join(" \\\n\t", reverse sort keys %static), "
+  
+  MAP_PRELIBS   = $Config{perllibs} $Config{cryptlib}
+  ";
+  
+      if (defined $libperl) {
+  	($lperl = $libperl) =~ s/\$\(A\)/$self->{LIB_EXT}/;
+      }
+      unless ($libperl && -f $lperl) { # Ilya's code...
+  	my $dir = $self->{PERL_SRC} || "$self->{PERL_ARCHLIB}/CORE";
+  	$dir = "$self->{PERL_ARCHLIB}/.." if $self->{UNINSTALLED_PERL};
+  	$libperl ||= "libperl$self->{LIB_EXT}";
+  	$libperl   = "$dir/$libperl";
+  	$lperl   ||= "libperl$self->{LIB_EXT}";
+  	$lperl     = "$dir/$lperl";
+  
+          if (! -f $libperl and ! -f $lperl) {
+            # We did not find a static libperl. Maybe there is a shared one?
+            if ($Is{SunOS}) {
+              $lperl  = $libperl = "$dir/$Config{libperl}";
+              # SUNOS ld does not take the full path to a shared library
+              $libperl = '' if $Is{SunOS4};
+            }
+          }
+  
+  	print "Warning: $libperl not found
+      If you're going to build a static perl binary, make sure perl is installed
+      otherwise ignore this warning\n"
+  		unless (-f $lperl || defined($self->{PERL_SRC}));
+      }
+  
+      # SUNOS ld does not take the full path to a shared library
+      my $llibperl = $libperl ? '$(MAP_LIBPERL)' : '-lperl';
+  
+      push @m, "
+  MAP_LIBPERL = $libperl
+  LLIBPERL    = $llibperl
+  ";
+  
+      push @m, '
+  $(INST_ARCHAUTODIR)/extralibs.all : $(INST_ARCHAUTODIR)$(DFSEP).exists '.join(" \\\n\t", @$extra).'
+  	$(NOECHO) $(RM_F)  $@
+  	$(NOECHO) $(TOUCH) $@
+  ';
+  
+      foreach my $catfile (@$extra){
+  	push @m, "\tcat $catfile >> \$\@\n";
+      }
+  
+  push @m, "
+  \$(MAP_TARGET) :: $tmp/perlmain\$(OBJ_EXT) \$(MAP_LIBPERL) \$(MAP_STATIC) \$(INST_ARCHAUTODIR)/extralibs.all
+  	\$(MAP_LINKCMD) -o \$\@ \$(OPTIMIZE) $tmp/perlmain\$(OBJ_EXT) \$(LDFROM) \$(MAP_STATIC) \$(LLIBPERL) `cat \$(INST_ARCHAUTODIR)/extralibs.all` \$(MAP_PRELIBS)
+  	\$(NOECHO) \$(ECHO) 'To install the new \"\$(MAP_TARGET)\" binary, call'
+  	\$(NOECHO) \$(ECHO) '    \$(MAKE) \$(USEMAKEFILE) $makefilename inst_perl MAP_TARGET=\$(MAP_TARGET)'
+  	\$(NOECHO) \$(ECHO) 'To remove the intermediate files say'
+  	\$(NOECHO) \$(ECHO) '    \$(MAKE) \$(USEMAKEFILE) $makefilename map_clean'
+  
+  $tmp/perlmain\$(OBJ_EXT): $tmp/perlmain.c
+  ";
+      push @m, "\t".$self->cd($tmp, qq[$cccmd "-I\$(PERL_INC)" perlmain.c])."\n";
+  
+      push @m, qq{
+  $tmp/perlmain.c: $makefilename}, q{
+  	$(NOECHO) $(ECHO) Writing $@
+  	$(NOECHO) $(PERL) $(MAP_PERLINC) "-MExtUtils::Miniperl" \\
+  		-e "writemain(grep s#.*/auto/##s, split(q| |, q|$(MAP_STATIC)|))" > $@t && $(MV) $@t $@
+  
+  };
+      push @m, "\t", q{$(NOECHO) $(PERL) "$(INSTALLSCRIPT)/fixpmain"
+  } if (defined (&Dos::UseLFN) && Dos::UseLFN()==0);
+  
+  
+      push @m, q{
+  doc_inst_perl :
+  	$(NOECHO) $(ECHO) Appending installation info to "$(DESTINSTALLARCHLIB)/perllocal.pod"
+  	-$(NOECHO) $(MKPATH) "$(DESTINSTALLARCHLIB)"
+  	-$(NOECHO) $(DOC_INSTALL) \
+  		"Perl binary" "$(MAP_TARGET)" \
+  		MAP_STATIC "$(MAP_STATIC)" \
+  		MAP_EXTRA "`cat $(INST_ARCHAUTODIR)/extralibs.all`" \
+  		MAP_LIBPERL "$(MAP_LIBPERL)" \
+  		>> "}.$self->catfile('$(DESTINSTALLARCHLIB)','perllocal.pod').q{"
+  
+  };
+  
+      push @m, q{
+  inst_perl : pure_inst_perl doc_inst_perl
+  
+  pure_inst_perl : $(MAP_TARGET)
+  	}.$self->{CP}.q{ $(MAP_TARGET) "}.$self->catfile('$(DESTINSTALLBIN)','$(MAP_TARGET)').q{"
+  
+  clean :: map_clean
+  
+  map_clean :
+  	}.$self->{RM_F}.qq{ $tmp/perlmain\$(OBJ_EXT) $tmp/perlmain.c \$(MAP_TARGET) $makefilename \$(INST_ARCHAUTODIR)/extralibs.all
+  };
+  
+      join '', @m;
+  }
+  
+  =item makefile (o)
+  
+  Defines how to rewrite the Makefile.
+  
+  =cut
+  
+  sub makefile {
+      my($self) = shift;
+      my $m;
+      # We do not know what target was originally specified so we
+      # must force a manual rerun to be sure. But as it should only
+      # happen very rarely it is not a significant problem.
+      $m = '
+  $(OBJECT) : $(FIRST_MAKEFILE)
+  
+  ' if $self->{OBJECT};
+  
+      my $newer_than_target = $Is{VMS} ? '$(MMS$SOURCE_LIST)' : '$?';
+      my $mpl_args = join " ", map qq["$_"], @ARGV;
+      my $cross = '';
+      if (defined $::Cross::platform) {
+          # Inherited from win32/buildext.pl
+          $cross = "-MCross=$::Cross::platform ";
+      }
+      $m .= sprintf <<'MAKE_FRAG', $newer_than_target, $cross, $mpl_args;
+  # We take a very conservative approach here, but it's worth it.
+  # We move Makefile to Makefile.old here to avoid gnu make looping.
+  $(FIRST_MAKEFILE) : Makefile.PL $(CONFIGDEP)
+  	$(NOECHO) $(ECHO) "Makefile out-of-date with respect to %s"
+  	$(NOECHO) $(ECHO) "Cleaning current config before rebuilding Makefile..."
+  	-$(NOECHO) $(RM_F) $(MAKEFILE_OLD)
+  	-$(NOECHO) $(MV)   $(FIRST_MAKEFILE) $(MAKEFILE_OLD)
+  	- $(MAKE) $(USEMAKEFILE) $(MAKEFILE_OLD) clean $(DEV_NULL)
+  	$(PERLRUN) %sMakefile.PL %s
+  	$(NOECHO) $(ECHO) "==> Your Makefile has been rebuilt. <=="
+  	$(NOECHO) $(ECHO) "==> Please rerun the $(MAKE) command.  <=="
+  	$(FALSE)
+  
+  MAKE_FRAG
+  
+      return $m;
+  }
+  
+  
+  =item maybe_command
+  
+  Returns true, if the argument is likely to be a command.
+  
+  =cut
+  
+  sub maybe_command {
+      my($self,$file) = @_;
+      return $file if -x $file && ! -d $file;
+      return;
+  }
+  
+  
+  =item needs_linking (o)
+  
+  Does this module need linking? Looks into subdirectory objects (see
+  also has_link_code())
+  
+  =cut
+  
+  sub needs_linking {
+      my($self) = shift;
+  
+      my $caller = (caller(0))[3];
+      confess("needs_linking called too early") if
+        $caller =~ /^ExtUtils::MakeMaker::/;
+      return $self->{NEEDS_LINKING} if defined $self->{NEEDS_LINKING};
+      if ($self->has_link_code or $self->{MAKEAPERL}){
+  	$self->{NEEDS_LINKING} = 1;
+  	return 1;
+      }
+      foreach my $child (keys %{$self->{CHILDREN}}) {
+  	if ($self->{CHILDREN}->{$child}->needs_linking) {
+  	    $self->{NEEDS_LINKING} = 1;
+  	    return 1;
+  	}
+      }
+      return $self->{NEEDS_LINKING} = 0;
+  }
+  
+  
+  =item parse_abstract
+  
+  parse a file and return what you think is the ABSTRACT
+  
+  =cut
+  
+  sub parse_abstract {
+      my($self,$parsefile) = @_;
+      my $result;
+  
+      local $/ = "\n";
+      open(my $fh, '<', $parsefile) or die "Could not open '$parsefile': $!";
+      my $inpod = 0;
+      my $pod_encoding;
+      my $package = $self->{DISTNAME};
+      $package =~ s/-/::/g;
+      while (<$fh>) {
+          $inpod = /^=(?!cut)/ ? 1 : /^=cut/ ? 0 : $inpod;
+          next if !$inpod;
+          chop;
+  
+          if ( /^=encoding\s*(.*)$/i ) {
+              $pod_encoding = $1;
+          }
+  
+          if ( /^($package(?:\.pm)? \s+ -+ \s+)(.*)/x ) {
+            $result = $2;
+            next;
+          }
+          next unless $result;
+  
+          if ( $result && ( /^\s*$/ || /^\=/ ) ) {
+            last;
+          }
+          $result = join ' ', $result, $_;
+      }
+      close $fh;
+  
+      if ( $pod_encoding and !( $] < 5.008 or !$Config{useperlio} ) ) {
+          # Have to wrap in an eval{} for when running under PERL_CORE
+          # Encode isn't available during build phase and parsing
+          # ABSTRACT isn't important there
+          eval {
+            require Encode;
+            $result = Encode::decode($pod_encoding, $result);
+          }
+      }
+  
+      return $result;
+  }
+  
+  =item parse_version
+  
+      my $version = MM->parse_version($file);
+  
+  Parse a $file and return what $VERSION is set to by the first assignment.
+  It will return the string "undef" if it can't figure out what $VERSION
+  is. $VERSION should be for all to see, so C<our $VERSION> or plain $VERSION
+  are okay, but C<my $VERSION> is not.
+  
+  C<<package Foo VERSION>> is also checked for.  The first version
+  declaration found is used, but this may change as it differs from how
+  Perl does it.
+  
+  parse_version() will try to C<use version> before checking for
+  C<$VERSION> so the following will work.
+  
+      $VERSION = qv(1.2.3);
+  
+  =cut
+  
+  sub parse_version {
+      my($self,$parsefile) = @_;
+      my $result;
+  
+      local $/ = "\n";
+      local $_;
+      open(my $fh, '<', $parsefile) or die "Could not open '$parsefile': $!";
+      my $inpod = 0;
+      while (<$fh>) {
+          $inpod = /^=(?!cut)/ ? 1 : /^=cut/ ? 0 : $inpod;
+          next if $inpod || /^\s*#/;
+          chop;
+          next if /^\s*(if|unless|elsif)/;
+          if ( m{^ \s* package \s+ \w[\w\:\']* \s+ (v?[0-9._]+) \s* ;  }x ) {
+              local $^W = 0;
+              $result = $1;
+          }
+          elsif ( m{(?<!\\) ([\$*]) (([\w\:\']*) \bVERSION)\b .* (?<![<>=!])\=[^=]}x ) {
+  			$result = $self->get_version($parsefile, $1, $2);
+          }
+          else {
+            next;
+          }
+          last if defined $result;
+      }
+      close $fh;
+  
+      if ( defined $result && $result !~ /^v?[\d_\.]+$/ ) {
+        require version;
+        my $normal = eval { version->new( $result ) };
+        $result = $normal if defined $normal;
+      }
+      $result = "undef" unless defined $result;
+      return $result;
+  }
+  
+  sub get_version {
+      my ($self, $parsefile, $sigil, $name) = @_;
+      my $line = $_; # from the while() loop in parse_version
+      {
+          package ExtUtils::MakeMaker::_version;
+          undef *version; # in case of unexpected version() sub
+          eval {
+              require version;
+              version::->import;
+          };
+          no strict;
+          local *{$name};
+          local $^W = 0;
+          $line = $1 if $line =~ m{^(.+)}s;
+          eval($line); ## no critic
+          return ${$name};
+      }
+  }
+  
+  =item pasthru (o)
+  
+  Defines the string that is passed to recursive make calls in
+  subdirectories.
+  
+  =cut
+  
+  sub pasthru {
+      my($self) = shift;
+      my(@m);
+  
+      my(@pasthru);
+      my($sep) = $Is{VMS} ? ',' : '';
+      $sep .= "\\\n\t";
+  
+      foreach my $key (qw(LIB LIBPERL_A LINKTYPE OPTIMIZE
+                       PREFIX INSTALL_BASE)
+                   )
+      {
+          next unless defined $self->{$key};
+  	push @pasthru, "$key=\"\$($key)\"";
+      }
+  
+      foreach my $key (qw(DEFINE INC)) {
+          next unless defined $self->{$key};
+  	push @pasthru, "PASTHRU_$key=\"\$(PASTHRU_$key)\"";
+      }
+  
+      push @m, "\nPASTHRU = ", join ($sep, @pasthru), "\n";
+      join "", @m;
+  }
+  
+  =item perl_script
+  
+  Takes one argument, a file name, and returns the file name, if the
+  argument is likely to be a perl script. On MM_Unix this is true for
+  any ordinary, readable file.
+  
+  =cut
+  
+  sub perl_script {
+      my($self,$file) = @_;
+      return $file if -r $file && -f _;
+      return;
+  }
+  
+  =item perldepend (o)
+  
+  Defines the dependency from all *.h files that come with the perl
+  distribution.
+  
+  =cut
+  
+  sub perldepend {
+      my($self) = shift;
+      my(@m);
+  
+      my $make_config = $self->cd('$(PERL_SRC)', '$(MAKE) lib/Config.pm');
+  
+      push @m, sprintf <<'MAKE_FRAG', $make_config if $self->{PERL_SRC};
+  # Check for unpropogated config.sh changes. Should never happen.
+  # We do NOT just update config.h because that is not sufficient.
+  # An out of date config.h is not fatal but complains loudly!
+  $(PERL_INCDEP)/config.h: $(PERL_SRC)/config.sh
+  	-$(NOECHO) $(ECHO) "Warning: $(PERL_INC)/config.h out of date with $(PERL_SRC)/config.sh"; $(FALSE)
+  
+  $(PERL_ARCHLIB)/Config.pm: $(PERL_SRC)/config.sh
+  	$(NOECHO) $(ECHO) "Warning: $(PERL_ARCHLIB)/Config.pm may be out of date with $(PERL_SRC)/config.sh"
+  	%s
+  MAKE_FRAG
+  
+      return join "", @m unless $self->needs_linking;
+  
+      if ($self->{OBJECT}) {
+          # Need to add an object file dependency on the perl headers.
+          # this is very important for XS modules in perl.git development.
+          push @m, $self->_perl_header_files_fragment("/"); # Directory separator between $(PERL_INC)/header.h
+      }
+  
+      push @m, join(" ", sort values %{$self->{XS}})." : \$(XSUBPPDEPS)\n"  if %{$self->{XS}};
+  
+      return join "\n", @m;
+  }
+  
+  
+  =item pm_to_blib
+  
+  Defines target that copies all files in the hash PM to their
+  destination and autosplits them. See L<ExtUtils::Install/DESCRIPTION>
+  
+  =cut
+  
+  sub pm_to_blib {
+      my $self = shift;
+      my($autodir) = $self->catdir('$(INST_LIB)','auto');
+      my $r = q{
+  pm_to_blib : $(FIRST_MAKEFILE) $(TO_INST_PM)
+  };
+  
+      # VMS will swallow '' and PM_FILTER is often empty.  So use q[]
+      my $pm_to_blib = $self->oneliner(<<CODE, ['-MExtUtils::Install']);
+  pm_to_blib({\@ARGV}, '$autodir', q[\$(PM_FILTER)], '\$(PERM_DIR)')
+  CODE
+  
+      my @cmds = $self->split_command($pm_to_blib,
+                    map { ($_, $self->{PM}->{$_}) } sort keys %{$self->{PM}});
+  
+      $r .= join '', map { "\t\$(NOECHO) $_\n" } @cmds;
+      $r .= qq{\t\$(NOECHO) \$(TOUCH) pm_to_blib\n};
+  
+      return $r;
+  }
+  
+  =item post_constants (o)
+  
+  Returns an empty string per default. Dedicated to overrides from
+  within Makefile.PL after all constants have been defined.
+  
+  =cut
+  
+  sub post_constants{
+      "";
+  }
+  
+  =item post_initialize (o)
+  
+  Returns an empty string per default. Used in Makefile.PLs to add some
+  chunk of text to the Makefile after the object is initialized.
+  
+  =cut
+  
+  sub post_initialize {
+      "";
+  }
+  
+  =item postamble (o)
+  
+  Returns an empty string. Can be used in Makefile.PLs to write some
+  text to the Makefile at the end.
+  
+  =cut
+  
+  sub postamble {
+      "";
+  }
+  
+  # transform dot-separated version string into comma-separated quadruple
+  # examples:  '1.2.3.4.5' => '1,2,3,4'
+  #            '1.2.3'     => '1,2,3,0'
+  sub _ppd_version {
+      my ($self, $string) = @_;
+      return join ',', ((split /\./, $string), (0) x 4)[0..3];
+  }
+  
+  =item ppd
+  
+  Defines target that creates a PPD (Perl Package Description) file
+  for a binary distribution.
+  
+  =cut
+  
+  sub ppd {
+      my($self) = @_;
+  
+      my $abstract = $self->{ABSTRACT} || '';
+      $abstract =~ s/\n/\\n/sg;
+      $abstract =~ s/</&lt;/g;
+      $abstract =~ s/>/&gt;/g;
+  
+      my $author = join(', ',@{$self->{AUTHOR} || []});
+      $author =~ s/</&lt;/g;
+      $author =~ s/>/&gt;/g;
+  
+      my $ppd_file = '$(DISTNAME).ppd';
+  
+      my @ppd_cmds = $self->echo(<<'PPD_HTML', $ppd_file, { append => 0, allow_variables => 1 });
+  <SOFTPKG NAME="$(DISTNAME)" VERSION="$(VERSION)">
+  PPD_HTML
+  
+      my $ppd_xml = sprintf <<'PPD_HTML', $abstract, $author;
+      <ABSTRACT>%s</ABSTRACT>
+      <AUTHOR>%s</AUTHOR>
+  PPD_HTML
+  
+      $ppd_xml .= "    <IMPLEMENTATION>\n";
+      if ( $self->{MIN_PERL_VERSION} ) {
+          my $min_perl_version = $self->_ppd_version($self->{MIN_PERL_VERSION});
+          $ppd_xml .= sprintf <<'PPD_PERLVERS', $min_perl_version;
+          <PERLCORE VERSION="%s" />
+  PPD_PERLVERS
+  
+      }
+  
+      # Don't add "perl" to requires.  perl dependencies are
+      # handles by ARCHITECTURE.
+      my %prereqs = %{$self->{PREREQ_PM}};
+      delete $prereqs{perl};
+  
+      # Build up REQUIRE
+      foreach my $prereq (sort keys %prereqs) {
+          my $name = $prereq;
+          $name .= '::' unless $name =~ /::/;
+          my $version = $prereqs{$prereq};
+  
+          my %attrs = ( NAME => $name );
+          $attrs{VERSION} = $version if $version;
+          my $attrs = join " ", map { qq[$_="$attrs{$_}"] } sort keys %attrs;
+          $ppd_xml .= qq(        <REQUIRE $attrs />\n);
+      }
+  
+      my $archname = $Config{archname};
+      if ($] >= 5.008) {
+          # archname did not change from 5.6 to 5.8, but those versions may
+          # not be not binary compatible so now we append the part of the
+          # version that changes when binary compatibility may change
+          $archname .= "-$Config{PERL_REVISION}.$Config{PERL_VERSION}";
+      }
+      $ppd_xml .= sprintf <<'PPD_OUT', $archname;
+          <ARCHITECTURE NAME="%s" />
+  PPD_OUT
+  
+      if ($self->{PPM_INSTALL_SCRIPT}) {
+          if ($self->{PPM_INSTALL_EXEC}) {
+              $ppd_xml .= sprintf qq{        <INSTALL EXEC="%s">%s</INSTALL>\n},
+                    $self->{PPM_INSTALL_EXEC}, $self->{PPM_INSTALL_SCRIPT};
+          }
+          else {
+              $ppd_xml .= sprintf qq{        <INSTALL>%s</INSTALL>\n},
+                    $self->{PPM_INSTALL_SCRIPT};
+          }
+      }
+  
+      if ($self->{PPM_UNINSTALL_SCRIPT}) {
+          if ($self->{PPM_UNINSTALL_EXEC}) {
+              $ppd_xml .= sprintf qq{        <UNINSTALL EXEC="%s">%s</UNINSTALL>\n},
+                    $self->{PPM_UNINSTALL_EXEC}, $self->{PPM_UNINSTALL_SCRIPT};
+          }
+          else {
+              $ppd_xml .= sprintf qq{        <UNINSTALL>%s</UNINSTALL>\n},
+                    $self->{PPM_UNINSTALL_SCRIPT};
+          }
+      }
+  
+      my ($bin_location) = $self->{BINARY_LOCATION} || '';
+      $bin_location =~ s/\\/\\\\/g;
+  
+      $ppd_xml .= sprintf <<'PPD_XML', $bin_location;
+          <CODEBASE HREF="%s" />
+      </IMPLEMENTATION>
+  </SOFTPKG>
+  PPD_XML
+  
+      push @ppd_cmds, $self->echo($ppd_xml, $ppd_file, { append => 1 });
+  
+      return sprintf <<'PPD_OUT', join "\n\t", @ppd_cmds;
+  # Creates a PPD (Perl Package Description) for a binary distribution.
+  ppd :
+  	%s
+  PPD_OUT
+  
+  }
+  
+  =item prefixify
+  
+    $MM->prefixify($var, $prefix, $new_prefix, $default);
+  
+  Using either $MM->{uc $var} || $Config{lc $var}, it will attempt to
+  replace it's $prefix with a $new_prefix.
+  
+  Should the $prefix fail to match I<AND> a PREFIX was given as an
+  argument to WriteMakefile() it will set it to the $new_prefix +
+  $default.  This is for systems whose file layouts don't neatly fit into
+  our ideas of prefixes.
+  
+  This is for heuristics which attempt to create directory structures
+  that mirror those of the installed perl.
+  
+  For example:
+  
+      $MM->prefixify('installman1dir', '/usr', '/home/foo', 'man/man1');
+  
+  this will attempt to remove '/usr' from the front of the
+  $MM->{INSTALLMAN1DIR} path (initializing it to $Config{installman1dir}
+  if necessary) and replace it with '/home/foo'.  If this fails it will
+  simply use '/home/foo/man/man1'.
+  
+  =cut
+  
+  sub prefixify {
+      my($self,$var,$sprefix,$rprefix,$default) = @_;
+  
+      my $path = $self->{uc $var} ||
+                 $Config_Override{lc $var} || $Config{lc $var} || '';
+  
+      $rprefix .= '/' if $sprefix =~ m|/$|;
+  
+      warn "  prefixify $var => $path\n" if $Verbose >= 2;
+      warn "    from $sprefix to $rprefix\n" if $Verbose >= 2;
+  
+      if( $self->{ARGS}{PREFIX} &&
+          $path !~ s{^\Q$sprefix\E\b}{$rprefix}s )
+      {
+  
+          warn "    cannot prefix, using default.\n" if $Verbose >= 2;
+          warn "    no default!\n" if !$default && $Verbose >= 2;
+  
+          $path = $self->catdir($rprefix, $default) if $default;
+      }
+  
+      print "    now $path\n" if $Verbose >= 2;
+      return $self->{uc $var} = $path;
+  }
+  
+  
+  =item processPL (o)
+  
+  Defines targets to run *.PL files.
+  
+  =cut
+  
+  sub processPL {
+      my $self = shift;
+      my $pl_files = $self->{PL_FILES};
+  
+      return "" unless $pl_files;
+  
+      my $m = '';
+      foreach my $plfile (sort keys %$pl_files) {
+          my $list = ref($pl_files->{$plfile})
+                       ?  $pl_files->{$plfile}
+  		     : [$pl_files->{$plfile}];
+  
+  	foreach my $target (@$list) {
+              if( $Is{VMS} ) {
+                  $plfile = vmsify($self->eliminate_macros($plfile));
+                  $target = vmsify($self->eliminate_macros($target));
+              }
+  
+  	    # Normally a .PL file runs AFTER pm_to_blib so it can have
+  	    # blib in its @INC and load the just built modules.  BUT if
+  	    # the generated module is something in $(TO_INST_PM) which
+  	    # pm_to_blib depends on then it can't depend on pm_to_blib
+  	    # else we have a dependency loop.
+  	    my $pm_dep;
+  	    my $perlrun;
+  	    if( defined $self->{PM}{$target} ) {
+  		$pm_dep  = '';
+  		$perlrun = 'PERLRUN';
+  	    }
+  	    else {
+  		$pm_dep  = 'pm_to_blib';
+  		$perlrun = 'PERLRUNINST';
+  	    }
+  
+              $m .= <<MAKE_FRAG;
+  
+  all :: $target
+  	\$(NOECHO) \$(NOOP)
+  
+  $target :: $plfile $pm_dep
+  	\$($perlrun) $plfile $target
+  MAKE_FRAG
+  
+  	}
+      }
+  
+      return $m;
+  }
+  
+  =item quote_paren
+  
+  Backslashes parentheses C<()> in command line arguments.
+  Doesn't handle recursive Makefile C<$(...)> constructs,
+  but handles simple ones.
+  
+  =cut
+  
+  sub quote_paren {
+      my $arg = shift;
+      $arg =~ s{\$\((.+?)\)}{\$\\\\($1\\\\)}g;	# protect $(...)
+      $arg =~ s{(?<!\\)([()])}{\\$1}g;		# quote unprotected
+      $arg =~ s{\$\\\\\((.+?)\\\\\)}{\$($1)}g;	# unprotect $(...)
+      return $arg;
+  }
+  
+  =item replace_manpage_separator
+  
+    my $man_name = $MM->replace_manpage_separator($file_path);
+  
+  Takes the name of a package, which may be a nested package, in the
+  form 'Foo/Bar.pm' and replaces the slash with C<::> or something else
+  safe for a man page file name.  Returns the replacement.
+  
+  =cut
+  
+  sub replace_manpage_separator {
+      my($self,$man) = @_;
+  
+      $man =~ s,/+,::,g;
+      return $man;
+  }
+  
+  
+  =item cd
+  
+  =cut
+  
+  sub cd {
+      my($self, $dir, @cmds) = @_;
+  
+      # No leading tab and no trailing newline makes for easier embedding
+      my $make_frag = join "\n\t", map { "cd $dir && $_" } @cmds;
+  
+      return $make_frag;
+  }
+  
+  =item oneliner
+  
+  =cut
+  
+  sub oneliner {
+      my($self, $cmd, $switches) = @_;
+      $switches = [] unless defined $switches;
+  
+      # Strip leading and trailing newlines
+      $cmd =~ s{^\n+}{};
+      $cmd =~ s{\n+$}{};
+  
+      my @cmds = split /\n/, $cmd;
+      $cmd = join " \n\t  -e ", map $self->quote_literal($_), @cmds;
+      $cmd = $self->escape_newlines($cmd);
+  
+      $switches = join ' ', @$switches;
+  
+      return qq{\$(ABSPERLRUN) $switches -e $cmd --};
+  }
+  
+  
+  =item quote_literal
+  
+  Quotes macro literal value suitable for being used on a command line so
+  that when expanded by make, will be received by command as given to
+  this method:
+  
+    my $quoted = $mm->quote_literal(q{it isn't});
+    # returns:
+    #   'it isn'\''t'
+    print MAKEFILE "target:\n\techo $quoted\n";
+    # when run "make target", will output:
+    #   it isn't
+  
+  =cut
+  
+  sub quote_literal {
+      my($self, $text, $opts) = @_;
+      $opts->{allow_variables} = 1 unless defined $opts->{allow_variables};
+  
+      # Quote single quotes
+      $text =~ s{'}{'\\''}g;
+  
+      $text = $opts->{allow_variables}
+        ? $self->escape_dollarsigns($text) : $self->escape_all_dollarsigns($text);
+  
+      return "'$text'";
+  }
+  
+  
+  =item escape_newlines
+  
+  =cut
+  
+  sub escape_newlines {
+      my($self, $text) = @_;
+  
+      $text =~ s{\n}{\\\n}g;
+  
+      return $text;
+  }
+  
+  
+  =item max_exec_len
+  
+  Using POSIX::ARG_MAX.  Otherwise falling back to 4096.
+  
+  =cut
+  
+  sub max_exec_len {
+      my $self = shift;
+  
+      if (!defined $self->{_MAX_EXEC_LEN}) {
+          if (my $arg_max = eval { require POSIX;  &POSIX::ARG_MAX }) {
+              $self->{_MAX_EXEC_LEN} = $arg_max;
+          }
+          else {      # POSIX minimum exec size
+              $self->{_MAX_EXEC_LEN} = 4096;
+          }
+      }
+  
+      return $self->{_MAX_EXEC_LEN};
+  }
+  
+  
+  =item static (o)
+  
+  Defines the static target.
+  
+  =cut
+  
+  sub static {
+  # --- Static Loading Sections ---
+  
+      my($self) = shift;
+      '
+  ## $(INST_PM) has been moved to the all: target.
+  ## It remains here for awhile to allow for old usage: "make static"
+  static :: $(FIRST_MAKEFILE) $(INST_STATIC)
+  	$(NOECHO) $(NOOP)
+  ';
+  }
+  
+  =item static_lib (o)
+  
+  Defines how to produce the *.a (or equivalent) files.
+  
+  =cut
+  
+  sub static_lib {
+      my($self) = @_;
+      return '' unless $self->has_link_code;
+  
+      my(@m);
+      push(@m, <<'END');
+  
+  $(INST_STATIC) : $(OBJECT) $(MYEXTLIB) $(INST_ARCHAUTODIR)$(DFSEP).exists
+  	$(RM_RF) $@
+  END
+  
+      # If this extension has its own library (eg SDBM_File)
+      # then copy that to $(INST_STATIC) and add $(OBJECT) into it.
+      push(@m, <<'MAKE_FRAG') if $self->{MYEXTLIB};
+  	$(CP) $(MYEXTLIB) "$@"
+  MAKE_FRAG
+  
+      my $ar;
+      if (exists $self->{FULL_AR} && -x $self->{FULL_AR}) {
+          # Prefer the absolute pathed ar if available so that PATH
+          # doesn't confuse us.  Perl itself is built with the full_ar.
+          $ar = 'FULL_AR';
+      } else {
+          $ar = 'AR';
+      }
+      push @m, sprintf <<'MAKE_FRAG', $ar;
+  	$(%s) $(AR_STATIC_ARGS) $@ $(OBJECT) && $(RANLIB) $@
+  	$(CHMOD) $(PERM_RWX) $@
+  	$(NOECHO) $(ECHO) "$(EXTRALIBS)" > "$(INST_ARCHAUTODIR)/extralibs.ld"
+  MAKE_FRAG
+  
+      # Old mechanism - still available:
+      push @m, <<'MAKE_FRAG' if $self->{PERL_SRC} && $self->{EXTRALIBS};
+  	$(NOECHO) $(ECHO) "$(EXTRALIBS)" >> "$(PERL_SRC)/ext.libs"
+  MAKE_FRAG
+  
+      join('', @m);
+  }
+  
+  =item staticmake (o)
+  
+  Calls makeaperl.
+  
+  =cut
+  
+  sub staticmake {
+      my($self, %attribs) = @_;
+      my(@static);
+  
+      my(@searchdirs)=($self->{PERL_ARCHLIB}, $self->{SITEARCHEXP},  $self->{INST_ARCHLIB});
+  
+      # And as it's not yet built, we add the current extension
+      # but only if it has some C code (or XS code, which implies C code)
+      if (@{$self->{C}}) {
+  	@static = $self->catfile($self->{INST_ARCHLIB},
+  				 "auto",
+  				 $self->{FULLEXT},
+  				 "$self->{BASEEXT}$self->{LIB_EXT}"
+  				);
+      }
+  
+      # Either we determine now, which libraries we will produce in the
+      # subdirectories or we do it at runtime of the make.
+  
+      # We could ask all subdir objects, but I cannot imagine, why it
+      # would be necessary.
+  
+      # Instead we determine all libraries for the new perl at
+      # runtime.
+      my(@perlinc) = ($self->{INST_ARCHLIB}, $self->{INST_LIB}, $self->{PERL_ARCHLIB}, $self->{PERL_LIB});
+  
+      $self->makeaperl(MAKE	=> $self->{MAKEFILE},
+  		     DIRS	=> \@searchdirs,
+  		     STAT	=> \@static,
+  		     INCL	=> \@perlinc,
+  		     TARGET	=> $self->{MAP_TARGET},
+  		     TMP	=> "",
+  		     LIBPERL	=> $self->{LIBPERL_A}
+  		    );
+  }
+  
+  =item subdir_x (o)
+  
+  Helper subroutine for subdirs
+  
+  =cut
+  
+  sub subdir_x {
+      my($self, $subdir) = @_;
+  
+      my $subdir_cmd = $self->cd($subdir,
+        '$(MAKE) $(USEMAKEFILE) $(FIRST_MAKEFILE) all $(PASTHRU)'
+      );
+      return sprintf <<'EOT', $subdir_cmd;
+  
+  subdirs ::
+  	$(NOECHO) %s
+  EOT
+  
+  }
+  
+  =item subdirs (o)
+  
+  Defines targets to process subdirectories.
+  
+  =cut
+  
+  sub subdirs {
+  # --- Sub-directory Sections ---
+      my($self) = shift;
+      my(@m);
+      # This method provides a mechanism to automatically deal with
+      # subdirectories containing further Makefile.PL scripts.
+      # It calls the subdir_x() method for each subdirectory.
+      foreach my $dir (@{$self->{DIR}}){
+  	push(@m, $self->subdir_x($dir));
+  ####	print "Including $dir subdirectory\n";
+      }
+      if (@m){
+  	unshift(@m, "
+  # The default clean, realclean and test targets in this Makefile
+  # have automatically been given entries for each subdir.
+  
+  ");
+      } else {
+  	push(@m, "\n# none")
+      }
+      join('',@m);
+  }
+  
+  =item test (o)
+  
+  Defines the test targets.
+  
+  =cut
+  
+  sub test {
+  # --- Test and Installation Sections ---
+  
+      my($self, %attribs) = @_;
+      my $tests = $attribs{TESTS} || '';
+      if (!$tests && -d 't' && defined $attribs{RECURSIVE_TEST_FILES}) {
+          $tests = $self->find_tests_recursive;
+      }
+      elsif (!$tests && -d 't') {
+          $tests = $self->find_tests;
+      }
+      # have to do this because nmake is broken
+      $tests =~ s!/!\\!g if $self->is_make_type('nmake');
+      # note: 'test.pl' name is also hardcoded in init_dirscan()
+      my(@m);
+      push(@m,"
+  TEST_VERBOSE=0
+  TEST_TYPE=test_\$(LINKTYPE)
+  TEST_FILE = test.pl
+  TEST_FILES = $tests
+  TESTDB_SW = -d
+  
+  testdb :: testdb_\$(LINKTYPE)
+  
+  test :: \$(TEST_TYPE) subdirs-test
+  
+  subdirs-test ::
+  	\$(NOECHO) \$(NOOP)
+  
+  ");
+  
+      foreach my $dir (@{ $self->{DIR} }) {
+          my $test = $self->cd($dir, '$(MAKE) test $(PASTHRU)');
+  
+          push @m, <<END
+  subdirs-test ::
+  	\$(NOECHO) $test
+  
+  END
+      }
+  
+      push(@m, "\t\$(NOECHO) \$(ECHO) 'No tests defined for \$(NAME) extension.'\n")
+  	unless $tests or -f "test.pl" or @{$self->{DIR}};
+      push(@m, "\n");
+  
+      push(@m, "test_dynamic :: pure_all\n");
+      push(@m, $self->test_via_harness('$(FULLPERLRUN)', '$(TEST_FILES)'))
+        if $tests;
+      push(@m, $self->test_via_script('$(FULLPERLRUN)', '$(TEST_FILE)'))
+        if -f "test.pl";
+      push(@m, "\n");
+  
+      push(@m, "testdb_dynamic :: pure_all\n");
+      push(@m, $self->test_via_script('$(FULLPERLRUN) $(TESTDB_SW)',
+                                      '$(TEST_FILE)'));
+      push(@m, "\n");
+  
+      # Occasionally we may face this degenerate target:
+      push @m, "test_ : test_dynamic\n\n";
+  
+      if ($self->needs_linking()) {
+  	push(@m, "test_static :: pure_all \$(MAP_TARGET)\n");
+  	push(@m, $self->test_via_harness('./$(MAP_TARGET)', '$(TEST_FILES)')) if $tests;
+  	push(@m, $self->test_via_script('./$(MAP_TARGET)', '$(TEST_FILE)')) if -f "test.pl";
+  	push(@m, "\n");
+  	push(@m, "testdb_static :: pure_all \$(MAP_TARGET)\n");
+  	push(@m, $self->test_via_script('./$(MAP_TARGET) $(TESTDB_SW)', '$(TEST_FILE)'));
+  	push(@m, "\n");
+      } else {
+  	push @m, "test_static :: test_dynamic\n";
+  	push @m, "testdb_static :: testdb_dynamic\n";
+      }
+      join("", @m);
+  }
+  
+  =item test_via_harness (override)
+  
+  For some reason which I forget, Unix machines like to have
+  PERL_DL_NONLAZY set for tests.
+  
+  =cut
+  
+  sub test_via_harness {
+      my($self, $perl, $tests) = @_;
+      return $self->SUPER::test_via_harness("PERL_DL_NONLAZY=1 $perl", $tests);
+  }
+  
+  =item test_via_script (override)
+  
+  Again, the PERL_DL_NONLAZY thing.
+  
+  =cut
+  
+  sub test_via_script {
+      my($self, $perl, $script) = @_;
+      return $self->SUPER::test_via_script("PERL_DL_NONLAZY=1 $perl", $script);
+  }
+  
+  
+  =item tool_xsubpp (o)
+  
+  Determines typemaps, xsubpp version, prototype behaviour.
+  
+  =cut
+  
+  sub tool_xsubpp {
+      my($self) = shift;
+      return "" unless $self->needs_linking;
+  
+      my $xsdir;
+      my @xsubpp_dirs = @INC;
+  
+      # Make sure we pick up the new xsubpp if we're building perl.
+      unshift @xsubpp_dirs, $self->{PERL_LIB} if $self->{PERL_CORE};
+  
+      my $foundxsubpp = 0;
+      foreach my $dir (@xsubpp_dirs) {
+          $xsdir = $self->catdir($dir, 'ExtUtils');
+          if( -r $self->catfile($xsdir, "xsubpp") ) {
+              $foundxsubpp = 1;
+              last;
+          }
+      }
+      die "ExtUtils::MM_Unix::tool_xsubpp : Can't find xsubpp" if !$foundxsubpp;
+  
+      my $tmdir   = File::Spec->catdir($self->{PERL_LIB},"ExtUtils");
+      my(@tmdeps) = $self->catfile($tmdir,'typemap');
+      if( $self->{TYPEMAPS} ){
+          foreach my $typemap (@{$self->{TYPEMAPS}}){
+              if( ! -f  $typemap ) {
+                  warn "Typemap $typemap not found.\n";
+              }
+              else {
+                  push(@tmdeps,  $typemap);
+              }
+          }
+      }
+      push(@tmdeps, "typemap") if -f "typemap";
+      my @tmargs = map(qq{-typemap "$_"}, @tmdeps);
+      $_ = $self->quote_dep($_) for @tmdeps;
+      if( exists $self->{XSOPT} ){
+          unshift( @tmargs, $self->{XSOPT} );
+      }
+  
+      if ($Is{VMS}                          &&
+          $Config{'ldflags'}               &&
+          $Config{'ldflags'} =~ m!/Debug!i &&
+          (!exists($self->{XSOPT}) || $self->{XSOPT} !~ /linenumbers/)
+         )
+      {
+          unshift(@tmargs,'-nolinenumbers');
+      }
+  
+  
+      $self->{XSPROTOARG} = "" unless defined $self->{XSPROTOARG};
+      my $xsdirdep = $self->quote_dep($xsdir);
+      # -dep for use when dependency not command
+  
+      return qq{
+  XSUBPPDIR = $xsdir
+  XSUBPP = "\$(XSUBPPDIR)\$(DFSEP)xsubpp"
+  XSUBPPRUN = \$(PERLRUN) \$(XSUBPP)
+  XSPROTOARG = $self->{XSPROTOARG}
+  XSUBPPDEPS = @tmdeps $xsdirdep\$(DFSEP)xsubpp
+  XSUBPPARGS = @tmargs
+  XSUBPP_EXTRA_ARGS =
+  };
+  }
+  
+  
+  =item all_target
+  
+  Build man pages, too
+  
+  =cut
+  
+  sub all_target {
+      my $self = shift;
+  
+      return <<'MAKE_EXT';
+  all :: pure_all manifypods
+  	$(NOECHO) $(NOOP)
+  MAKE_EXT
+  }
+  
+  =item top_targets (o)
+  
+  Defines the targets all, subdirs, config, and O_FILES
+  
+  =cut
+  
+  sub top_targets {
+  # --- Target Sections ---
+  
+      my($self) = shift;
+      my(@m);
+  
+      push @m, $self->all_target, "\n" unless $self->{SKIPHASH}{'all'};
+  
+      push @m, '
+  pure_all :: config pm_to_blib subdirs linkext
+  	$(NOECHO) $(NOOP)
+  
+  subdirs :: $(MYEXTLIB)
+  	$(NOECHO) $(NOOP)
+  
+  config :: $(FIRST_MAKEFILE) blibdirs
+  	$(NOECHO) $(NOOP)
+  ';
+  
+      push @m, '
+  $(O_FILES): $(H_FILES)
+  ' if @{$self->{O_FILES} || []} && @{$self->{H} || []};
+  
+      push @m, q{
+  help :
+  	perldoc ExtUtils::MakeMaker
+  };
+  
+      join('',@m);
+  }
+  
+  =item writedoc
+  
+  Obsolete, deprecated method. Not used since Version 5.21.
+  
+  =cut
+  
+  sub writedoc {
+  # --- perllocal.pod section ---
+      my($self,$what,$name,@attribs)=@_;
+      my $time = localtime;
+      print "=head2 $time: $what C<$name>\n\n=over 4\n\n=item *\n\n";
+      print join "\n\n=item *\n\n", map("C<$_>",@attribs);
+      print "\n\n=back\n\n";
+  }
+  
+  =item xs_c (o)
+  
+  Defines the suffix rules to compile XS files to C.
+  
+  =cut
+  
+  sub xs_c {
+      my($self) = shift;
+      return '' unless $self->needs_linking();
+      '
+  .xs.c:
+  	$(XSUBPPRUN) $(XSPROTOARG) $(XSUBPPARGS) $(XSUBPP_EXTRA_ARGS) $*.xs > $*.xsc && $(MV) $*.xsc $*.c
+  ';
+  }
+  
+  =item xs_cpp (o)
+  
+  Defines the suffix rules to compile XS files to C++.
+  
+  =cut
+  
+  sub xs_cpp {
+      my($self) = shift;
+      return '' unless $self->needs_linking();
+      '
+  .xs.cpp:
+  	$(XSUBPPRUN) $(XSPROTOARG) $(XSUBPPARGS) $*.xs > $*.xsc && $(MV) $*.xsc $*.cpp
+  ';
+  }
+  
+  =item xs_o (o)
+  
+  Defines suffix rules to go from XS to object files directly. This is
+  only intended for broken make implementations.
+  
+  =cut
+  
+  sub xs_o {	# many makes are too dumb to use xs_c then c_o
+      my($self) = shift;
+      return '' unless $self->needs_linking();
+      '
+  .xs$(OBJ_EXT):
+  	$(XSUBPPRUN) $(XSPROTOARG) $(XSUBPPARGS) $*.xs > $*.xsc && $(MV) $*.xsc $*.c
+  	$(CCCMD) $(CCCDLFLAGS) "-I$(PERL_INC)" $(PASTHRU_DEFINE) $(DEFINE) $*.c
+  ';
+  }
+  
+  
+  1;
+  
+  =back
+  
+  =head1 SEE ALSO
+  
+  L<ExtUtils::MakeMaker>
+  
+  =cut
+  
+  __END__
+EXTUTILS_MM_UNIX
+
+$fatpacked{"ExtUtils/MM_VMS.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_MM_VMS';
+  package ExtUtils::MM_VMS;
+  
+  use strict;
+  
+  use ExtUtils::MakeMaker::Config;
+  require Exporter;
+  
+  BEGIN {
+      # so we can compile the thing on non-VMS platforms.
+      if( $^O eq 'VMS' ) {
+          require VMS::Filespec;
+          VMS::Filespec->import;
+      }
+  }
+  
+  use File::Basename;
+  
+  our $VERSION = '7.04';
+  
+  require ExtUtils::MM_Any;
+  require ExtUtils::MM_Unix;
+  our @ISA = qw( ExtUtils::MM_Any ExtUtils::MM_Unix );
+  
+  use ExtUtils::MakeMaker qw($Verbose neatvalue);
+  our $Revision = $ExtUtils::MakeMaker::Revision;
+  
+  
+  =head1 NAME
+  
+  ExtUtils::MM_VMS - methods to override UN*X behaviour in ExtUtils::MakeMaker
+  
+  =head1 SYNOPSIS
+  
+    Do not use this directly.
+    Instead, use ExtUtils::MM and it will figure out which MM_*
+    class to use for you.
+  
+  =head1 DESCRIPTION
+  
+  See ExtUtils::MM_Unix for a documentation of the methods provided
+  there. This package overrides the implementation of these methods, not
+  the semantics.
+  
+  =head2 Methods always loaded
+  
+  =over 4
+  
+  =item wraplist
+  
+  Converts a list into a string wrapped at approximately 80 columns.
+  
+  =cut
+  
+  sub wraplist {
+      my($self) = shift;
+      my($line,$hlen) = ('',0);
+  
+      foreach my $word (@_) {
+        # Perl bug -- seems to occasionally insert extra elements when
+        # traversing array (scalar(@array) doesn't show them, but
+        # foreach(@array) does) (5.00307)
+        next unless $word =~ /\w/;
+        $line .= ' ' if length($line);
+        if ($hlen > 80) { $line .= "\\\n\t"; $hlen = 0; }
+        $line .= $word;
+        $hlen += length($word) + 2;
+      }
+      $line;
+  }
+  
+  
+  # This isn't really an override.  It's just here because ExtUtils::MM_VMS
+  # appears in @MM::ISA before ExtUtils::Liblist::Kid, so if there isn't an ext()
+  # in MM_VMS, then AUTOLOAD is called, and bad things happen.  So, we just
+  # mimic inheritance here and hand off to ExtUtils::Liblist::Kid.
+  # XXX This hackery will die soon. --Schwern
+  sub ext {
+      require ExtUtils::Liblist::Kid;
+      goto &ExtUtils::Liblist::Kid::ext;
+  }
+  
+  =back
+  
+  =head2 Methods
+  
+  Those methods which override default MM_Unix methods are marked
+  "(override)", while methods unique to MM_VMS are marked "(specific)".
+  For overridden methods, documentation is limited to an explanation
+  of why this method overrides the MM_Unix method; see the ExtUtils::MM_Unix
+  documentation for more details.
+  
+  =over 4
+  
+  =item guess_name (override)
+  
+  Try to determine name of extension being built.  We begin with the name
+  of the current directory.  Since VMS filenames are case-insensitive,
+  however, we look for a F<.pm> file whose name matches that of the current
+  directory (presumably the 'main' F<.pm> file for this extension), and try
+  to find a C<package> statement from which to obtain the Mixed::Case
+  package name.
+  
+  =cut
+  
+  sub guess_name {
+      my($self) = @_;
+      my($defname,$defpm,@pm,%xs);
+      local *PM;
+  
+      $defname = basename(fileify($ENV{'DEFAULT'}));
+      $defname =~ s![\d\-_]*\.dir.*$!!;  # Clip off .dir;1 suffix, and package version
+      $defpm = $defname;
+      # Fallback in case for some reason a user has copied the files for an
+      # extension into a working directory whose name doesn't reflect the
+      # extension's name.  We'll use the name of a unique .pm file, or the
+      # first .pm file with a matching .xs file.
+      if (not -e "${defpm}.pm") {
+        @pm = glob('*.pm');
+        s/.pm$// for @pm;
+        if (@pm == 1) { ($defpm = $pm[0]) =~ s/.pm$//; }
+        elsif (@pm) {
+          %xs = map { s/.xs$//; ($_,1) } glob('*.xs');  ## no critic
+          if (keys %xs) {
+              foreach my $pm (@pm) {
+                  $defpm = $pm, last if exists $xs{$pm};
+              }
+          }
+        }
+      }
+      if (open(my $pm, '<', "${defpm}.pm")){
+          while (<$pm>) {
+              if (/^\s*package\s+([^;]+)/i) {
+                  $defname = $1;
+                  last;
+              }
+          }
+          print "Warning (non-fatal): Couldn't find package name in ${defpm}.pm;\n\t",
+                       "defaulting package name to $defname\n"
+              if eof($pm);
+          close $pm;
+      }
+      else {
+          print "Warning (non-fatal): Couldn't find ${defpm}.pm;\n\t",
+                       "defaulting package name to $defname\n";
+      }
+      $defname =~ s#[\d.\-_]+$##;
+      $defname;
+  }
+  
+  =item find_perl (override)
+  
+  Use VMS file specification syntax and CLI commands to find and
+  invoke Perl images.
+  
+  =cut
+  
+  sub find_perl {
+      my($self, $ver, $names, $dirs, $trace) = @_;
+      my($vmsfile,@sdirs,@snames,@cand);
+      my($rslt);
+      my($inabs) = 0;
+      local *TCF;
+  
+      if( $self->{PERL_CORE} ) {
+          # Check in relative directories first, so we pick up the current
+          # version of Perl if we're running MakeMaker as part of the main build.
+          @sdirs = sort { my($absa) = $self->file_name_is_absolute($a);
+                          my($absb) = $self->file_name_is_absolute($b);
+                          if ($absa && $absb) { return $a cmp $b }
+                          else { return $absa ? 1 : ($absb ? -1 : ($a cmp $b)); }
+                        } @$dirs;
+          # Check miniperl before perl, and check names likely to contain
+          # version numbers before "generic" names, so we pick up an
+          # executable that's less likely to be from an old installation.
+          @snames = sort { my($ba) = $a =~ m!([^:>\]/]+)$!;  # basename
+                           my($bb) = $b =~ m!([^:>\]/]+)$!;
+                           my($ahasdir) = (length($a) - length($ba) > 0);
+                           my($bhasdir) = (length($b) - length($bb) > 0);
+                           if    ($ahasdir and not $bhasdir) { return 1; }
+                           elsif ($bhasdir and not $ahasdir) { return -1; }
+                           else { $bb =~ /\d/ <=> $ba =~ /\d/
+                                    or substr($ba,0,1) cmp substr($bb,0,1)
+                                    or length($bb) <=> length($ba) } } @$names;
+      }
+      else {
+          @sdirs  = @$dirs;
+          @snames = @$names;
+      }
+  
+      # Image names containing Perl version use '_' instead of '.' under VMS
+      s/\.(\d+)$/_$1/ for @snames;
+      if ($trace >= 2){
+          print "Looking for perl $ver by these names:\n";
+          print "\t@snames,\n";
+          print "in these dirs:\n";
+          print "\t@sdirs\n";
+      }
+      foreach my $dir (@sdirs){
+          next unless defined $dir; # $self->{PERL_SRC} may be undefined
+          $inabs++ if $self->file_name_is_absolute($dir);
+          if ($inabs == 1) {
+              # We've covered relative dirs; everything else is an absolute
+              # dir (probably an installed location).  First, we'll try
+              # potential command names, to see whether we can avoid a long
+              # MCR expression.
+              foreach my $name (@snames) {
+                  push(@cand,$name) if $name =~ /^[\w\-\$]+$/;
+              }
+              $inabs++; # Should happen above in next $dir, but just in case...
+          }
+          foreach my $name (@snames){
+              push @cand, ($name !~ m![/:>\]]!) ? $self->catfile($dir,$name)
+                                                : $self->fixpath($name,0);
+          }
+      }
+      foreach my $name (@cand) {
+          print "Checking $name\n" if $trace >= 2;
+          # If it looks like a potential command, try it without the MCR
+          if ($name =~ /^[\w\-\$]+$/) {
+              open(my $tcf, ">", "temp_mmvms.com")
+                  or die('unable to open temp file');
+              print $tcf "\$ set message/nofacil/nosever/noident/notext\n";
+              print $tcf "\$ $name -e \"require $ver; print \"\"VER_OK\\n\"\"\"\n";
+              close $tcf;
+              $rslt = `\@temp_mmvms.com` ;
+              unlink('temp_mmvms.com');
+              if ($rslt =~ /VER_OK/) {
+                  print "Using PERL=$name\n" if $trace;
+                  return $name;
+              }
+          }
+          next unless $vmsfile = $self->maybe_command($name);
+          $vmsfile =~ s/;[\d\-]*$//;  # Clip off version number; we can use a newer version as well
+          print "Executing $vmsfile\n" if ($trace >= 2);
+          open(my $tcf, '>', "temp_mmvms.com")
+                  or die('unable to open temp file');
+          print $tcf "\$ set message/nofacil/nosever/noident/notext\n";
+          print $tcf "\$ mcr $vmsfile -e \"require $ver; print \"\"VER_OK\\n\"\"\" \n";
+          close $tcf;
+          $rslt = `\@temp_mmvms.com`;
+          unlink('temp_mmvms.com');
+          if ($rslt =~ /VER_OK/) {
+              print "Using PERL=MCR $vmsfile\n" if $trace;
+              return "MCR $vmsfile";
+          }
+      }
+      print "Unable to find a perl $ver (by these names: @$names, in these dirs: @$dirs)\n";
+      0; # false and not empty
+  }
+  
+  =item _fixin_replace_shebang (override)
+  
+  Helper routine for MM->fixin(), overridden because there's no such thing as an
+  actual shebang line that will be interpreted by the shell, so we just prepend
+  $Config{startperl} and preserve the shebang line argument for any switches it
+  may contain.
+  
+  =cut
+  
+  sub _fixin_replace_shebang {
+      my ( $self, $file, $line ) = @_;
+  
+      my ( undef, $arg ) = split ' ', $line, 2;
+  
+      return $Config{startperl} . "\n" . $Config{sharpbang} . "perl $arg\n";
+  }
+  
+  =item maybe_command (override)
+  
+  Follows VMS naming conventions for executable files.
+  If the name passed in doesn't exactly match an executable file,
+  appends F<.Exe> (or equivalent) to check for executable image, and F<.Com>
+  to check for DCL procedure.  If this fails, checks directories in DCL$PATH
+  and finally F<Sys$System:> for an executable file having the name specified,
+  with or without the F<.Exe>-equivalent suffix.
+  
+  =cut
+  
+  sub maybe_command {
+      my($self,$file) = @_;
+      return $file if -x $file && ! -d _;
+      my(@dirs) = ('');
+      my(@exts) = ('',$Config{'exe_ext'},'.exe','.com');
+  
+      if ($file !~ m![/:>\]]!) {
+          for (my $i = 0; defined $ENV{"DCL\$PATH;$i"}; $i++) {
+              my $dir = $ENV{"DCL\$PATH;$i"};
+              $dir .= ':' unless $dir =~ m%[\]:]$%;
+              push(@dirs,$dir);
+          }
+          push(@dirs,'Sys$System:');
+          foreach my $dir (@dirs) {
+              my $sysfile = "$dir$file";
+              foreach my $ext (@exts) {
+                  return $file if -x "$sysfile$ext" && ! -d _;
+              }
+          }
+      }
+      return 0;
+  }
+  
+  
+  =item pasthru (override)
+  
+  VMS has $(MMSQUALIFIERS) which is a listing of all the original command line
+  options.  This is used in every invocation of make in the VMS Makefile so
+  PASTHRU should not be necessary.  Using PASTHRU tends to blow commands past
+  the 256 character limit.
+  
+  =cut
+  
+  sub pasthru {
+      return "PASTHRU=\n";
+  }
+  
+  
+  =item pm_to_blib (override)
+  
+  VMS wants a dot in every file so we can't have one called 'pm_to_blib',
+  it becomes 'pm_to_blib.' and MMS/K isn't smart enough to know that when
+  you have a target called 'pm_to_blib' it should look for 'pm_to_blib.'.
+  
+  So in VMS its pm_to_blib.ts.
+  
+  =cut
+  
+  sub pm_to_blib {
+      my $self = shift;
+  
+      my $make = $self->SUPER::pm_to_blib;
+  
+      $make =~ s{^pm_to_blib :}{pm_to_blib.ts :}m;
+      $make =~ s{\$\(TOUCH\) pm_to_blib}{\$(TOUCH) pm_to_blib.ts};
+  
+      $make = <<'MAKE' . $make;
+  # Dummy target to match Unix target name; we use pm_to_blib.ts as
+  # timestamp file to avoid repeated invocations under VMS
+  pm_to_blib : pm_to_blib.ts
+  	$(NOECHO) $(NOOP)
+  
+  MAKE
+  
+      return $make;
+  }
+  
+  
+  =item perl_script (override)
+  
+  If name passed in doesn't specify a readable file, appends F<.com> or
+  F<.pl> and tries again, since it's customary to have file types on all files
+  under VMS.
+  
+  =cut
+  
+  sub perl_script {
+      my($self,$file) = @_;
+      return $file if -r $file && ! -d _;
+      return "$file.com" if -r "$file.com";
+      return "$file.pl" if -r "$file.pl";
+      return '';
+  }
+  
+  
+  =item replace_manpage_separator
+  
+  Use as separator a character which is legal in a VMS-syntax file name.
+  
+  =cut
+  
+  sub replace_manpage_separator {
+      my($self,$man) = @_;
+      $man = unixify($man);
+      $man =~ s#/+#__#g;
+      $man;
+  }
+  
+  =item init_DEST
+  
+  (override) Because of the difficulty concatenating VMS filepaths we
+  must pre-expand the DEST* variables.
+  
+  =cut
+  
+  sub init_DEST {
+      my $self = shift;
+  
+      $self->SUPER::init_DEST;
+  
+      # Expand DEST variables.
+      foreach my $var ($self->installvars) {
+          my $destvar = 'DESTINSTALL'.$var;
+          $self->{$destvar} = $self->eliminate_macros($self->{$destvar});
+      }
+  }
+  
+  
+  =item init_DIRFILESEP
+  
+  No separator between a directory path and a filename on VMS.
+  
+  =cut
+  
+  sub init_DIRFILESEP {
+      my($self) = shift;
+  
+      $self->{DIRFILESEP} = '';
+      return 1;
+  }
+  
+  
+  =item init_main (override)
+  
+  
+  =cut
+  
+  sub init_main {
+      my($self) = shift;
+  
+      $self->SUPER::init_main;
+  
+      $self->{DEFINE} ||= '';
+      if ($self->{DEFINE} ne '') {
+          my(@terms) = split(/\s+/,$self->{DEFINE});
+          my(@defs,@udefs);
+          foreach my $def (@terms) {
+              next unless $def;
+              my $targ = \@defs;
+              if ($def =~ s/^-([DU])//) {    # If it was a Unix-style definition
+                  $targ = \@udefs if $1 eq 'U';
+                  $def =~ s/='(.*)'$/=$1/;  # then remove shell-protection ''
+                  $def =~ s/^'(.*)'$/$1/;   # from entire term or argument
+              }
+              if ($def =~ /=/) {
+                  $def =~ s/"/""/g;  # Protect existing " from DCL
+                  $def = qq["$def"]; # and quote to prevent parsing of =
+              }
+              push @$targ, $def;
+          }
+  
+          $self->{DEFINE} = '';
+          if (@defs)  {
+              $self->{DEFINE}  = '/Define=(' . join(',',@defs)  . ')';
+          }
+          if (@udefs) {
+              $self->{DEFINE} .= '/Undef=('  . join(',',@udefs) . ')';
+          }
+      }
+  }
+  
+  =item init_tools (override)
+  
+  Provide VMS-specific forms of various utility commands.
+  
+  Sets DEV_NULL to nothing because I don't know how to do it on VMS.
+  
+  Changes EQUALIZE_TIMESTAMP to set revision date of target file to
+  one second later than source file, since MMK interprets precisely
+  equal revision dates for a source and target file as a sign that the
+  target needs to be updated.
+  
+  =cut
+  
+  sub init_tools {
+      my($self) = @_;
+  
+      $self->{NOOP}               = 'Continue';
+      $self->{NOECHO}             ||= '@ ';
+  
+      $self->{MAKEFILE}           ||= $self->{FIRST_MAKEFILE} || 'Descrip.MMS';
+      $self->{FIRST_MAKEFILE}     ||= $self->{MAKEFILE};
+      $self->{MAKE_APERL_FILE}    ||= 'Makeaperl.MMS';
+      $self->{MAKEFILE_OLD}       ||= $self->eliminate_macros('$(FIRST_MAKEFILE)_old');
+  #
+  #   If an extension is not specified, then MMS/MMK assumes an
+  #   an extension of .MMS.  If there really is no extension,
+  #   then a trailing "." needs to be appended to specify a
+  #   a null extension.
+  #
+      $self->{MAKEFILE} .= '.' unless $self->{MAKEFILE} =~ m/\./;
+      $self->{FIRST_MAKEFILE} .= '.' unless $self->{FIRST_MAKEFILE} =~ m/\./;
+      $self->{MAKE_APERL_FILE} .= '.' unless $self->{MAKE_APERL_FILE} =~ m/\./;
+      $self->{MAKEFILE_OLD} .= '.' unless $self->{MAKEFILE_OLD} =~ m/\./;
+  
+      $self->{MACROSTART}         ||= '/Macro=(';
+      $self->{MACROEND}           ||= ')';
+      $self->{USEMAKEFILE}        ||= '/Descrip=';
+  
+      $self->{EQUALIZE_TIMESTAMP} ||= '$(ABSPERLRUN) -we "open F,qq{>>$ARGV[1]};close F;utime(0,(stat($ARGV[0]))[9]+1,$ARGV[1])"';
+  
+      $self->{MOD_INSTALL} ||=
+        $self->oneliner(<<'CODE', ['-MExtUtils::Install']);
+  install([ from_to => {split('\|', <STDIN>)}, verbose => '$(VERBINST)', uninstall_shadows => '$(UNINST)', dir_mode => '$(PERM_DIR)' ]);
+  CODE
+  
+      $self->{UMASK_NULL} = '! ';
+  
+      $self->SUPER::init_tools;
+  
+      # Use the default shell
+      $self->{SHELL}    ||= 'Posix';
+  
+      # Redirection on VMS goes before the command, not after as on Unix.
+      # $(DEV_NULL) is used once and its not worth going nuts over making
+      # it work.  However, Unix's DEV_NULL is quite wrong for VMS.
+      $self->{DEV_NULL}   = '';
+  
+      return;
+  }
+  
+  =item init_platform (override)
+  
+  Add PERL_VMS, MM_VMS_REVISION and MM_VMS_VERSION.
+  
+  MM_VMS_REVISION is for backwards compatibility before MM_VMS had a
+  $VERSION.
+  
+  =cut
+  
+  sub init_platform {
+      my($self) = shift;
+  
+      $self->{MM_VMS_REVISION} = $Revision;
+      $self->{MM_VMS_VERSION}  = $VERSION;
+      $self->{PERL_VMS} = $self->catdir($self->{PERL_SRC}, 'VMS')
+        if $self->{PERL_SRC};
+  }
+  
+  
+  =item platform_constants
+  
+  =cut
+  
+  sub platform_constants {
+      my($self) = shift;
+      my $make_frag = '';
+  
+      foreach my $macro (qw(PERL_VMS MM_VMS_REVISION MM_VMS_VERSION))
+      {
+          next unless defined $self->{$macro};
+          $make_frag .= "$macro = $self->{$macro}\n";
+      }
+  
+      return $make_frag;
+  }
+  
+  
+  =item init_VERSION (override)
+  
+  Override the *DEFINE_VERSION macros with VMS semantics.  Translate the
+  MAKEMAKER filepath to VMS style.
+  
+  =cut
+  
+  sub init_VERSION {
+      my $self = shift;
+  
+      $self->SUPER::init_VERSION;
+  
+      $self->{DEFINE_VERSION}    = '"$(VERSION_MACRO)=""$(VERSION)"""';
+      $self->{XS_DEFINE_VERSION} = '"$(XS_VERSION_MACRO)=""$(XS_VERSION)"""';
+      $self->{MAKEMAKER} = vmsify($INC{'ExtUtils/MakeMaker.pm'});
+  }
+  
+  
+  =item constants (override)
+  
+  Fixes up numerous file and directory macros to insure VMS syntax
+  regardless of input syntax.  Also makes lists of files
+  comma-separated.
+  
+  =cut
+  
+  sub constants {
+      my($self) = @_;
+  
+      # Be kind about case for pollution
+      for (@ARGV) { $_ = uc($_) if /POLLUTE/i; }
+  
+      # Cleanup paths for directories in MMS macros.
+      foreach my $macro ( qw [
+              INST_BIN INST_SCRIPT INST_LIB INST_ARCHLIB
+              PERL_LIB PERL_ARCHLIB
+              PERL_INC PERL_SRC ],
+                          (map { 'INSTALL'.$_ } $self->installvars)
+                        )
+      {
+          next unless defined $self->{$macro};
+          next if $macro =~ /MAN/ && $self->{$macro} eq 'none';
+          $self->{$macro} = $self->fixpath($self->{$macro},1);
+      }
+  
+      # Cleanup paths for files in MMS macros.
+      foreach my $macro ( qw[LIBPERL_A FIRST_MAKEFILE MAKEFILE_OLD
+                             MAKE_APERL_FILE MYEXTLIB] )
+      {
+          next unless defined $self->{$macro};
+          $self->{$macro} = $self->fixpath($self->{$macro},0);
+      }
+  
+      # Fixup files for MMS macros
+      # XXX is this list complete?
+      for my $macro (qw/
+                     FULLEXT VERSION_FROM
+  	      /	) {
+          next unless defined $self->{$macro};
+          $self->{$macro} = $self->fixpath($self->{$macro},0);
+      }
+  
+  
+      for my $macro (qw/
+                     OBJECT LDFROM
+  	      /	) {
+          next unless defined $self->{$macro};
+  
+          # Must expand macros before splitting on unescaped whitespace.
+          $self->{$macro} = $self->eliminate_macros($self->{$macro});
+          if ($self->{$macro} =~ /(?<!\^)\s/) {
+              $self->{$macro} =~ s/(\\)?\n+\s+/ /g;
+              $self->{$macro} = $self->wraplist(
+                  map $self->fixpath($_,0), split /,?(?<!\^)\s+/, $self->{$macro}
+              );
+          }
+          else {
+              $self->{$macro} = $self->fixpath($self->{$macro},0);
+          }
+      }
+  
+      for my $macro (qw/ XS MAN1PODS MAN3PODS PM /) {
+          # Where is the space coming from? --jhi
+          next unless $self ne " " && defined $self->{$macro};
+          my %tmp = ();
+          for my $key (keys %{$self->{$macro}}) {
+              $tmp{$self->fixpath($key,0)} =
+                                       $self->fixpath($self->{$macro}{$key},0);
+          }
+          $self->{$macro} = \%tmp;
+      }
+  
+      for my $macro (qw/ C O_FILES H /) {
+          next unless defined $self->{$macro};
+          my @tmp = ();
+          for my $val (@{$self->{$macro}}) {
+              push(@tmp,$self->fixpath($val,0));
+          }
+          $self->{$macro} = \@tmp;
+      }
+  
+      # mms/k does not define a $(MAKE) macro.
+      $self->{MAKE} = '$(MMS)$(MMSQUALIFIERS)';
+  
+      return $self->SUPER::constants;
+  }
+  
+  
+  =item special_targets
+  
+  Clear the default .SUFFIXES and put in our own list.
+  
+  =cut
+  
+  sub special_targets {
+      my $self = shift;
+  
+      my $make_frag .= <<'MAKE_FRAG';
+  .SUFFIXES :
+  .SUFFIXES : $(OBJ_EXT) .c .cpp .cxx .xs
+  
+  MAKE_FRAG
+  
+      return $make_frag;
+  }
+  
+  =item cflags (override)
+  
+  Bypass shell script and produce qualifiers for CC directly (but warn
+  user if a shell script for this extension exists).  Fold multiple
+  /Defines into one, since some C compilers pay attention to only one
+  instance of this qualifier on the command line.
+  
+  =cut
+  
+  sub cflags {
+      my($self,$libperl) = @_;
+      my($quals) = $self->{CCFLAGS} || $Config{'ccflags'};
+      my($definestr,$undefstr,$flagoptstr) = ('','','');
+      my($incstr) = '/Include=($(PERL_INC)';
+      my($name,$sys,@m);
+  
+      ( $name = $self->{NAME} . "_cflags" ) =~ s/:/_/g ;
+      print "Unix shell script ".$Config{"$self->{'BASEEXT'}_cflags"}.
+           " required to modify CC command for $self->{'BASEEXT'}\n"
+      if ($Config{$name});
+  
+      if ($quals =~ / -[DIUOg]/) {
+  	while ($quals =~ / -([Og])(\d*)\b/) {
+  	    my($type,$lvl) = ($1,$2);
+  	    $quals =~ s/ -$type$lvl\b\s*//;
+  	    if ($type eq 'g') { $flagoptstr = '/NoOptimize'; }
+  	    else { $flagoptstr = '/Optimize' . (defined($lvl) ? "=$lvl" : ''); }
+  	}
+  	while ($quals =~ / -([DIU])(\S+)/) {
+  	    my($type,$def) = ($1,$2);
+  	    $quals =~ s/ -$type$def\s*//;
+  	    $def =~ s/"/""/g;
+  	    if    ($type eq 'D') { $definestr .= qq["$def",]; }
+  	    elsif ($type eq 'I') { $incstr .= ',' . $self->fixpath($def,1); }
+  	    else                 { $undefstr  .= qq["$def",]; }
+  	}
+      }
+      if (length $quals and $quals !~ m!/!) {
+  	warn "MM_VMS: Ignoring unrecognized CCFLAGS elements \"$quals\"\n";
+  	$quals = '';
+      }
+      $definestr .= q["PERL_POLLUTE",] if $self->{POLLUTE};
+      if (length $definestr) { chop($definestr); $quals .= "/Define=($definestr)"; }
+      if (length $undefstr)  { chop($undefstr);  $quals .= "/Undef=($undefstr)";   }
+      # Deal with $self->{DEFINE} here since some C compilers pay attention
+      # to only one /Define clause on command line, so we have to
+      # conflate the ones from $Config{'ccflags'} and $self->{DEFINE}
+      # ($self->{DEFINE} has already been VMSified in constants() above)
+      if ($self->{DEFINE}) { $quals .= $self->{DEFINE}; }
+      for my $type (qw(Def Undef)) {
+  	my(@terms);
+  	while ($quals =~ m:/${type}i?n?e?=([^/]+):ig) {
+  		my $term = $1;
+  		$term =~ s:^\((.+)\)$:$1:;
+  		push @terms, $term;
+  	    }
+  	if ($type eq 'Def') {
+  	    push @terms, qw[ $(DEFINE_VERSION) $(XS_DEFINE_VERSION) ];
+  	}
+  	if (@terms) {
+  	    $quals =~ s:/${type}i?n?e?=[^/]+::ig;
+  	    $quals .= "/${type}ine=(" . join(',',@terms) . ')';
+  	}
+      }
+  
+      $libperl or $libperl = $self->{LIBPERL_A} || "libperl.olb";
+  
+      # Likewise with $self->{INC} and /Include
+      if ($self->{'INC'}) {
+  	my(@includes) = split(/\s+/,$self->{INC});
+  	foreach (@includes) {
+  	    s/^-I//;
+  	    $incstr .= ','.$self->fixpath($_,1);
+  	}
+      }
+      $quals .= "$incstr)";
+  #    $quals =~ s/,,/,/g; $quals =~ s/\(,/(/g;
+      $self->{CCFLAGS} = $quals;
+  
+      $self->{PERLTYPE} ||= '';
+  
+      $self->{OPTIMIZE} ||= $flagoptstr || $Config{'optimize'};
+      if ($self->{OPTIMIZE} !~ m!/!) {
+  	if    ($self->{OPTIMIZE} =~ m!-g!) { $self->{OPTIMIZE} = '/Debug/NoOptimize' }
+  	elsif ($self->{OPTIMIZE} =~ /-O(\d*)/) {
+  	    $self->{OPTIMIZE} = '/Optimize' . (defined($1) ? "=$1" : '');
+  	}
+  	else {
+  	    warn "MM_VMS: Can't parse OPTIMIZE \"$self->{OPTIMIZE}\"; using default\n" if length $self->{OPTIMIZE};
+  	    $self->{OPTIMIZE} = '/Optimize';
+  	}
+      }
+  
+      return $self->{CFLAGS} = qq{
+  CCFLAGS = $self->{CCFLAGS}
+  OPTIMIZE = $self->{OPTIMIZE}
+  PERLTYPE = $self->{PERLTYPE}
+  };
+  }
+  
+  =item const_cccmd (override)
+  
+  Adds directives to point C preprocessor to the right place when
+  handling #include E<lt>sys/foo.hE<gt> directives.  Also constructs CC
+  command line a bit differently than MM_Unix method.
+  
+  =cut
+  
+  sub const_cccmd {
+      my($self,$libperl) = @_;
+      my(@m);
+  
+      return $self->{CONST_CCCMD} if $self->{CONST_CCCMD};
+      return '' unless $self->needs_linking();
+      if ($Config{'vms_cc_type'} eq 'gcc') {
+          push @m,'
+  .FIRST
+  	',$self->{NOECHO},'If F$TrnLnm("Sys").eqs."" Then Define/NoLog SYS GNU_CC_Include:[VMS]';
+      }
+      elsif ($Config{'vms_cc_type'} eq 'vaxc') {
+          push @m,'
+  .FIRST
+  	',$self->{NOECHO},'If F$TrnLnm("Sys").eqs."" .and. F$TrnLnm("VAXC$Include").eqs."" Then Define/NoLog SYS Sys$Library
+  	',$self->{NOECHO},'If F$TrnLnm("Sys").eqs."" .and. F$TrnLnm("VAXC$Include").nes."" Then Define/NoLog SYS VAXC$Include';
+      }
+      else {
+          push @m,'
+  .FIRST
+  	',$self->{NOECHO},'If F$TrnLnm("Sys").eqs."" .and. F$TrnLnm("DECC$System_Include").eqs."" Then Define/NoLog SYS ',
+  		($Config{'archname'} eq 'VMS_AXP' ? 'Sys$Library' : 'DECC$Library_Include'),'
+  	',$self->{NOECHO},'If F$TrnLnm("Sys").eqs."" .and. F$TrnLnm("DECC$System_Include").nes."" Then Define/NoLog SYS DECC$System_Include';
+      }
+  
+      push(@m, "\n\nCCCMD = $Config{'cc'} \$(CCFLAGS)\$(OPTIMIZE)\n");
+  
+      $self->{CONST_CCCMD} = join('',@m);
+  }
+  
+  
+  =item tools_other (override)
+  
+  Throw in some dubious extra macros for Makefile args.
+  
+  Also keep around the old $(SAY) macro in case somebody's using it.
+  
+  =cut
+  
+  sub tools_other {
+      my($self) = @_;
+  
+      # XXX Are these necessary?  Does anyone override them?  They're longer
+      # than just typing the literal string.
+      my $extra_tools = <<'EXTRA_TOOLS';
+  
+  # Just in case anyone is using the old macro.
+  USEMACROS = $(MACROSTART)
+  SAY = $(ECHO)
+  
+  EXTRA_TOOLS
+  
+      return $self->SUPER::tools_other . $extra_tools;
+  }
+  
+  =item init_dist (override)
+  
+  VMSish defaults for some values.
+  
+    macro         description                     default
+  
+    ZIPFLAGS      flags to pass to ZIP            -Vu
+  
+    COMPRESS      compression command to          gzip
+                  use for tarfiles
+    SUFFIX        suffix to put on                -gz
+                  compressed files
+  
+    SHAR          shar command to use             vms_share
+  
+    DIST_DEFAULT  default target to use to        tardist
+                  create a distribution
+  
+    DISTVNAME     Use VERSION_SYM instead of      $(DISTNAME)-$(VERSION_SYM)
+                  VERSION for the name
+  
+  =cut
+  
+  sub init_dist {
+      my($self) = @_;
+      $self->{ZIPFLAGS}     ||= '-Vu';
+      $self->{COMPRESS}     ||= 'gzip';
+      $self->{SUFFIX}       ||= '-gz';
+      $self->{SHAR}         ||= 'vms_share';
+      $self->{DIST_DEFAULT} ||= 'zipdist';
+  
+      $self->SUPER::init_dist;
+  
+      $self->{DISTVNAME} = "$self->{DISTNAME}-$self->{VERSION_SYM}"
+        unless $self->{ARGS}{DISTVNAME};
+  
+      return;
+  }
+  
+  =item c_o (override)
+  
+  Use VMS syntax on command line.  In particular, $(DEFINE) and
+  $(PERL_INC) have been pulled into $(CCCMD).  Also use MM[SK] macros.
+  
+  =cut
+  
+  sub c_o {
+      my($self) = @_;
+      return '' unless $self->needs_linking();
+      '
+  .c$(OBJ_EXT) :
+  	$(CCCMD) $(CCCDLFLAGS) $(MMS$TARGET_NAME).c
+  
+  .cpp$(OBJ_EXT) :
+  	$(CCCMD) $(CCCDLFLAGS) $(MMS$TARGET_NAME).cpp
+  
+  .cxx$(OBJ_EXT) :
+  	$(CCCMD) $(CCCDLFLAGS) $(MMS$TARGET_NAME).cxx
+  
+  ';
+  }
+  
+  =item xs_c (override)
+  
+  Use MM[SK] macros.
+  
+  =cut
+  
+  sub xs_c {
+      my($self) = @_;
+      return '' unless $self->needs_linking();
+      '
+  .xs.c :
+  	$(XSUBPPRUN) $(XSPROTOARG) $(XSUBPPARGS) $(MMS$TARGET_NAME).xs >$(MMS$TARGET)
+  ';
+  }
+  
+  =item xs_o (override)
+  
+  Use MM[SK] macros, and VMS command line for C compiler.
+  
+  =cut
+  
+  sub xs_o {	# many makes are too dumb to use xs_c then c_o
+      my($self) = @_;
+      return '' unless $self->needs_linking();
+      '
+  .xs$(OBJ_EXT) :
+  	$(XSUBPPRUN) $(XSPROTOARG) $(XSUBPPARGS) $(MMS$TARGET_NAME).xs >$(MMS$TARGET_NAME).c
+  	$(CCCMD) $(CCCDLFLAGS) $(MMS$TARGET_NAME).c
+  ';
+  }
+  
+  
+  =item dlsyms (override)
+  
+  Create VMS linker options files specifying universal symbols for this
+  extension's shareable image, and listing other shareable images or
+  libraries to which it should be linked.
+  
+  =cut
+  
+  sub dlsyms {
+      my($self,%attribs) = @_;
+  
+      return '' unless $self->needs_linking();
+  
+      my($funcs) = $attribs{DL_FUNCS} || $self->{DL_FUNCS} || {};
+      my($vars)  = $attribs{DL_VARS}  || $self->{DL_VARS}  || [];
+      my($funclist)  = $attribs{FUNCLIST}  || $self->{FUNCLIST}  || [];
+      my(@m);
+  
+      unless ($self->{SKIPHASH}{'dynamic'}) {
+  	push(@m,'
+  dynamic :: $(INST_ARCHAUTODIR)$(BASEEXT).opt
+  	$(NOECHO) $(NOOP)
+  ');
+      }
+  
+      push(@m,'
+  static :: $(INST_ARCHAUTODIR)$(BASEEXT).opt
+  	$(NOECHO) $(NOOP)
+  ') unless $self->{SKIPHASH}{'static'};
+  
+      push @m,'
+  $(INST_ARCHAUTODIR)$(BASEEXT).opt : $(BASEEXT).opt
+  	$(CP) $(MMS$SOURCE) $(MMS$TARGET)
+  
+  $(BASEEXT).opt : Makefile.PL
+  	$(PERLRUN) -e "use ExtUtils::Mksymlists;" -
+  	',qq[-e "Mksymlists('NAME' => '$self->{NAME}', 'DL_FUNCS' => ],
+  	neatvalue($funcs),q[, 'DL_VARS' => ],neatvalue($vars),
+  	q[, 'FUNCLIST' => ],neatvalue($funclist),qq[)"\n];
+  
+      push @m, '	$(PERL) -e "print ""$(INST_STATIC)/Include=';
+      if ($self->{OBJECT} =~ /\bBASEEXT\b/ or
+          $self->{OBJECT} =~ /\b$self->{BASEEXT}\b/i) {
+          push @m, ($Config{d_vms_case_sensitive_symbols}
+  	           ? uc($self->{BASEEXT}) :'$(BASEEXT)');
+      }
+      else {  # We don't have a "main" object file, so pull 'em all in
+          # Upcase module names if linker is being case-sensitive
+          my($upcase) = $Config{d_vms_case_sensitive_symbols};
+          my(@omods) = split ' ', $self->eliminate_macros($self->{OBJECT});
+          for (@omods) {
+              s/\.[^.]*$//;         # Trim off file type
+              s[\$\(\w+_EXT\)][];   # even as a macro
+              s/.*[:>\/\]]//;       # Trim off dir spec
+              $_ = uc if $upcase;
+          };
+  
+          my(@lines);
+          my $tmp = shift @omods;
+          foreach my $elt (@omods) {
+              $tmp .= ",$elt";
+              if (length($tmp) > 80) { push @lines, $tmp;  $tmp = ''; }
+          }
+          push @lines, $tmp;
+          push @m, '(', join( qq[, -\\n\\t"";" >>\$(MMS\$TARGET)\n\t\$(PERL) -e "print ""], @lines),')';
+      }
+      push @m, '\n$(INST_STATIC)/Library\n"";" >>$(MMS$TARGET)',"\n";
+  
+      if (length $self->{LDLOADLIBS}) {
+          my($line) = '';
+          foreach my $lib (split ' ', $self->{LDLOADLIBS}) {
+              $lib =~ s%\$%\\\$%g;  # Escape '$' in VMS filespecs
+              if (length($line) + length($lib) > 160) {
+                  push @m, "\t\$(PERL) -e \"print qq{$line}\" >>\$(MMS\$TARGET)\n";
+                  $line = $lib . '\n';
+              }
+              else { $line .= $lib . '\n'; }
+          }
+          push @m, "\t\$(PERL) -e \"print qq{$line}\" >>\$(MMS\$TARGET)\n" if $line;
+      }
+  
+      join('',@m);
+  
+  }
+  
+  =item dynamic_lib (override)
+  
+  Use VMS Link command.
+  
+  =cut
+  
+  sub dynamic_lib {
+      my($self, %attribs) = @_;
+      return '' unless $self->needs_linking(); #might be because of a subdir
+  
+      return '' unless $self->has_link_code();
+  
+      my($otherldflags) = $attribs{OTHERLDFLAGS} || "";
+      my($inst_dynamic_dep) = $attribs{INST_DYNAMIC_DEP} || "";
+      my $shr = $Config{'dbgprefix'} . 'PerlShr';
+      my(@m);
+      push @m,"
+  
+  OTHERLDFLAGS = $otherldflags
+  INST_DYNAMIC_DEP = $inst_dynamic_dep
+  
+  ";
+      push @m, '
+  $(INST_DYNAMIC) : $(INST_STATIC) $(PERL_INC)perlshr_attr.opt $(INST_ARCHAUTODIR)$(DFSEP).exists $(EXPORT_LIST) $(PERL_ARCHIVE) $(INST_DYNAMIC_DEP)
+  	If F$TrnLNm("',$shr,'").eqs."" Then Define/NoLog/User ',"$shr Sys\$Share:$shr.$Config{'dlext'}",'
+  	Link $(LDFLAGS) /Shareable=$(MMS$TARGET)$(OTHERLDFLAGS) $(BASEEXT).opt/Option,$(PERL_INC)perlshr_attr.opt/Option
+  ';
+  
+      join('',@m);
+  }
+  
+  
+  =item static_lib (override)
+  
+  Use VMS commands to manipulate object library.
+  
+  =cut
+  
+  sub static_lib {
+      my($self) = @_;
+      return '' unless $self->needs_linking();
+  
+      return '
+  $(INST_STATIC) :
+  	$(NOECHO) $(NOOP)
+  ' unless ($self->{OBJECT} or @{$self->{C} || []} or $self->{MYEXTLIB});
+  
+      my(@m);
+      push @m,'
+  # Rely on suffix rule for update action
+  $(OBJECT) : $(INST_ARCHAUTODIR)$(DFSEP).exists
+  
+  $(INST_STATIC) : $(OBJECT) $(MYEXTLIB)
+  ';
+      # If this extension has its own library (eg SDBM_File)
+      # then copy that to $(INST_STATIC) and add $(OBJECT) into it.
+      push(@m, "\t",'$(CP) $(MYEXTLIB) $(MMS$TARGET)',"\n") if $self->{MYEXTLIB};
+  
+      push(@m,"\t",'If F$Search("$(MMS$TARGET)").eqs."" Then Library/Object/Create $(MMS$TARGET)',"\n");
+  
+      # if there was a library to copy, then we can't use MMS$SOURCE_LIST,
+      # 'cause it's a library and you can't stick them in other libraries.
+      # In that case, we use $OBJECT instead and hope for the best
+      if ($self->{MYEXTLIB}) {
+        push(@m,"\t",'Library/Object/Replace $(MMS$TARGET) $(OBJECT)',"\n");
+      } else {
+        push(@m,"\t",'Library/Object/Replace $(MMS$TARGET) $(MMS$SOURCE_LIST)',"\n");
+      }
+  
+      push @m, "\t\$(NOECHO) \$(PERL) -e 1 >\$(INST_ARCHAUTODIR)extralibs.ld\n";
+      foreach my $lib (split ' ', $self->{EXTRALIBS}) {
+        push(@m,"\t",'$(NOECHO) $(PERL) -e "print qq{',$lib,'\n}" >>$(INST_ARCHAUTODIR)extralibs.ld',"\n");
+      }
+      join('',@m);
+  }
+  
+  
+  =item extra_clean_files
+  
+  Clean up some OS specific files.  Plus the temp file used to shorten
+  a lot of commands.  And the name mangler database.
+  
+  =cut
+  
+  sub extra_clean_files {
+      return qw(
+                *.Map *.Dmp *.Lis *.cpp *.$(DLEXT) *.Opt $(BASEEXT).bso
+                .MM_Tmp cxx_repository
+               );
+  }
+  
+  
+  =item zipfile_target
+  
+  =item tarfile_target
+  
+  =item shdist_target
+  
+  Syntax for invoking shar, tar and zip differs from that for Unix.
+  
+  =cut
+  
+  sub zipfile_target {
+      my($self) = shift;
+  
+      return <<'MAKE_FRAG';
+  $(DISTVNAME).zip : distdir
+  	$(PREOP)
+  	$(ZIP) "$(ZIPFLAGS)" $(MMS$TARGET) [.$(DISTVNAME)...]*.*;
+  	$(RM_RF) $(DISTVNAME)
+  	$(POSTOP)
+  MAKE_FRAG
+  }
+  
+  sub tarfile_target {
+      my($self) = shift;
+  
+      return <<'MAKE_FRAG';
+  $(DISTVNAME).tar$(SUFFIX) : distdir
+  	$(PREOP)
+  	$(TO_UNIX)
+          $(TAR) "$(TARFLAGS)" $(DISTVNAME).tar [.$(DISTVNAME)...]
+  	$(RM_RF) $(DISTVNAME)
+  	$(COMPRESS) $(DISTVNAME).tar
+  	$(POSTOP)
+  MAKE_FRAG
+  }
+  
+  sub shdist_target {
+      my($self) = shift;
+  
+      return <<'MAKE_FRAG';
+  shdist : distdir
+  	$(PREOP)
+  	$(SHAR) [.$(DISTVNAME)...]*.*; $(DISTVNAME).share
+  	$(RM_RF) $(DISTVNAME)
+  	$(POSTOP)
+  MAKE_FRAG
+  }
+  
+  
+  # --- Test and Installation Sections ---
+  
+  =item install (override)
+  
+  Work around DCL's 255 character limit several times,and use
+  VMS-style command line quoting in a few cases.
+  
+  =cut
+  
+  sub install {
+      my($self, %attribs) = @_;
+      my(@m);
+  
+      push @m, q[
+  install :: all pure_install doc_install
+  	$(NOECHO) $(NOOP)
+  
+  install_perl :: all pure_perl_install doc_perl_install
+  	$(NOECHO) $(NOOP)
+  
+  install_site :: all pure_site_install doc_site_install
+  	$(NOECHO) $(NOOP)
+  
+  install_vendor :: all pure_vendor_install doc_vendor_install
+  	$(NOECHO) $(NOOP)
+  
+  pure_install :: pure_$(INSTALLDIRS)_install
+  	$(NOECHO) $(NOOP)
+  
+  doc_install :: doc_$(INSTALLDIRS)_install
+          $(NOECHO) $(NOOP)
+  
+  pure__install : pure_site_install
+  	$(NOECHO) $(ECHO) "INSTALLDIRS not defined, defaulting to INSTALLDIRS=site"
+  
+  doc__install : doc_site_install
+  	$(NOECHO) $(ECHO) "INSTALLDIRS not defined, defaulting to INSTALLDIRS=site"
+  
+  # This hack brought to you by DCL's 255-character command line limit
+  pure_perl_install ::
+  ];
+      push @m,
+  q[	$(NOECHO) $(PERLRUN) "-MFile::Spec" -e "print 'read|'.File::Spec->catfile('$(PERL_ARCHLIB)','auto','$(FULLEXT)','.packlist').'|'" >.MM_tmp
+  	$(NOECHO) $(PERLRUN) "-MFile::Spec" -e "print 'write|'.File::Spec->catfile('$(DESTINSTALLARCHLIB)','auto','$(FULLEXT)','.packlist').'|'" >>.MM_tmp
+  ] unless $self->{NO_PACKLIST};
+  
+      push @m,
+  q[	$(NOECHO) $(ECHO_N) "$(INST_LIB)|$(DESTINSTALLPRIVLIB)|" >>.MM_tmp
+  	$(NOECHO) $(ECHO_N) "$(INST_ARCHLIB)|$(DESTINSTALLARCHLIB)|" >>.MM_tmp
+  	$(NOECHO) $(ECHO_N) "$(INST_BIN)|$(DESTINSTALLBIN)|" >>.MM_tmp
+  	$(NOECHO) $(ECHO_N) "$(INST_SCRIPT)|$(DESTINSTALLSCRIPT)|" >>.MM_tmp
+  	$(NOECHO) $(ECHO_N) "$(INST_MAN1DIR) $(DESTINSTALLMAN1DIR) " >>.MM_tmp
+  	$(NOECHO) $(ECHO_N) "$(INST_MAN3DIR)|$(DESTINSTALLMAN3DIR)" >>.MM_tmp
+  	$(NOECHO) $(MOD_INSTALL) <.MM_tmp
+  	$(NOECHO) $(RM_F) .MM_tmp
+  	$(NOECHO) $(WARN_IF_OLD_PACKLIST) "].$self->catfile($self->{SITEARCHEXP},'auto',$self->{FULLEXT},'.packlist').q["
+  
+  # Likewise
+  pure_site_install ::
+  ];
+      push @m,
+  q[	$(NOECHO) $(PERLRUN) "-MFile::Spec" -e "print 'read|'.File::Spec->catfile('$(SITEARCHEXP)','auto','$(FULLEXT)','.packlist').'|'" >.MM_tmp
+  	$(NOECHO) $(PERLRUN) "-MFile::Spec" -e "print 'write|'.File::Spec->catfile('$(DESTINSTALLSITEARCH)','auto','$(FULLEXT)','.packlist').'|'" >>.MM_tmp
+  ] unless $self->{NO_PACKLIST};
+  
+      push @m,
+  q[	$(NOECHO) $(ECHO_N) "$(INST_LIB)|$(DESTINSTALLSITELIB)|" >>.MM_tmp
+  	$(NOECHO) $(ECHO_N) "$(INST_ARCHLIB)|$(DESTINSTALLSITEARCH)|" >>.MM_tmp
+  	$(NOECHO) $(ECHO_N) "$(INST_BIN)|$(DESTINSTALLSITEBIN)|" >>.MM_tmp
+  	$(NOECHO) $(ECHO_N) "$(INST_SCRIPT)|$(DESTINSTALLSCRIPT)|" >>.MM_tmp
+  	$(NOECHO) $(ECHO_N) "$(INST_MAN1DIR)|$(DESTINSTALLSITEMAN1DIR)|" >>.MM_tmp
+  	$(NOECHO) $(ECHO_N) "$(INST_MAN3DIR)|$(DESTINSTALLSITEMAN3DIR)" >>.MM_tmp
+  	$(NOECHO) $(MOD_INSTALL) <.MM_tmp
+  	$(NOECHO) $(RM_F) .MM_tmp
+  	$(NOECHO) $(WARN_IF_OLD_PACKLIST) "].$self->catfile($self->{PERL_ARCHLIB},'auto',$self->{FULLEXT},'.packlist').q["
+  
+  pure_vendor_install ::
+  ];
+      push @m,
+  q[	$(NOECHO) $(PERLRUN) "-MFile::Spec" -e "print 'read|'.File::Spec->catfile('$(VENDORARCHEXP)','auto','$(FULLEXT)','.packlist').'|'" >.MM_tmp
+  	$(NOECHO) $(PERLRUN) "-MFile::Spec" -e "print 'write|'.File::Spec->catfile('$(DESTINSTALLVENDORARCH)','auto','$(FULLEXT)','.packlist').'|'" >>.MM_tmp
+  ] unless $self->{NO_PACKLIST};
+  
+      push @m,
+  q[	$(NOECHO) $(ECHO_N) "$(INST_LIB)|$(DESTINSTALLVENDORLIB)|" >>.MM_tmp
+  	$(NOECHO) $(ECHO_N) "$(INST_ARCHLIB)|$(DESTINSTALLVENDORARCH)|" >>.MM_tmp
+  	$(NOECHO) $(ECHO_N) "$(INST_BIN)|$(DESTINSTALLVENDORBIN)|" >>.MM_tmp
+  	$(NOECHO) $(ECHO_N) "$(INST_SCRIPT)|$(DESTINSTALLSCRIPT)|" >>.MM_tmp
+  	$(NOECHO) $(ECHO_N) "$(INST_MAN1DIR)|$(DESTINSTALLVENDORMAN1DIR)|" >>.MM_tmp
+  	$(NOECHO) $(ECHO_N) "$(INST_MAN3DIR)|$(DESTINSTALLVENDORMAN3DIR)" >>.MM_tmp
+  	$(NOECHO) $(MOD_INSTALL) <.MM_tmp
+  	$(NOECHO) $(RM_F) .MM_tmp
+  
+  ];
+  
+      push @m, q[
+  # Ditto
+  doc_perl_install ::
+  	$(NOECHO) $(NOOP)
+  
+  # And again
+  doc_site_install ::
+  	$(NOECHO) $(NOOP)
+  
+  doc_vendor_install ::
+  	$(NOECHO) $(NOOP)
+  
+  ] if $self->{NO_PERLLOCAL};
+  
+      push @m, q[
+  # Ditto
+  doc_perl_install ::
+  	$(NOECHO) $(ECHO) "Appending installation info to ].$self->catfile($self->{DESTINSTALLARCHLIB}, 'perllocal.pod').q["
+  	$(NOECHO) $(MKPATH) $(DESTINSTALLARCHLIB)
+  	$(NOECHO) $(ECHO_N) "installed into|$(INSTALLPRIVLIB)|" >.MM_tmp
+  	$(NOECHO) $(ECHO_N) "LINKTYPE|$(LINKTYPE)|VERSION|$(VERSION)|EXE_FILES|$(EXE_FILES) " >>.MM_tmp
+  	$(NOECHO) $(DOC_INSTALL) "Module" "$(NAME)" <.MM_tmp >>].$self->catfile($self->{DESTINSTALLARCHLIB},'perllocal.pod').q[
+  	$(NOECHO) $(RM_F) .MM_tmp
+  
+  # And again
+  doc_site_install ::
+  	$(NOECHO) $(ECHO) "Appending installation info to ].$self->catfile($self->{DESTINSTALLARCHLIB}, 'perllocal.pod').q["
+  	$(NOECHO) $(MKPATH) $(DESTINSTALLARCHLIB)
+  	$(NOECHO) $(ECHO_N) "installed into|$(INSTALLSITELIB)|" >.MM_tmp
+  	$(NOECHO) $(ECHO_N) "LINKTYPE|$(LINKTYPE)|VERSION|$(VERSION)|EXE_FILES|$(EXE_FILES) " >>.MM_tmp
+  	$(NOECHO) $(DOC_INSTALL) "Module" "$(NAME)" <.MM_tmp >>].$self->catfile($self->{DESTINSTALLARCHLIB},'perllocal.pod').q[
+  	$(NOECHO) $(RM_F) .MM_tmp
+  
+  doc_vendor_install ::
+  	$(NOECHO) $(ECHO) "Appending installation info to ].$self->catfile($self->{DESTINSTALLARCHLIB}, 'perllocal.pod').q["
+  	$(NOECHO) $(MKPATH) $(DESTINSTALLARCHLIB)
+  	$(NOECHO) $(ECHO_N) "installed into|$(INSTALLVENDORLIB)|" >.MM_tmp
+  	$(NOECHO) $(ECHO_N) "LINKTYPE|$(LINKTYPE)|VERSION|$(VERSION)|EXE_FILES|$(EXE_FILES) " >>.MM_tmp
+  	$(NOECHO) $(DOC_INSTALL) "Module" "$(NAME)" <.MM_tmp >>].$self->catfile($self->{DESTINSTALLARCHLIB},'perllocal.pod').q[
+  	$(NOECHO) $(RM_F) .MM_tmp
+  
+  ] unless $self->{NO_PERLLOCAL};
+  
+      push @m, q[
+  uninstall :: uninstall_from_$(INSTALLDIRS)dirs
+  	$(NOECHO) $(NOOP)
+  
+  uninstall_from_perldirs ::
+  	$(NOECHO) $(UNINSTALL) ].$self->catfile($self->{PERL_ARCHLIB},'auto',$self->{FULLEXT},'.packlist').q[
+  
+  uninstall_from_sitedirs ::
+  	$(NOECHO) $(UNINSTALL) ].$self->catfile($self->{SITEARCHEXP},'auto',$self->{FULLEXT},'.packlist').q[
+  
+  uninstall_from_vendordirs ::
+  	$(NOECHO) $(UNINSTALL) ].$self->catfile($self->{VENDORARCHEXP},'auto',$self->{FULLEXT},'.packlist').q[
+  ];
+  
+      join('',@m);
+  }
+  
+  =item perldepend (override)
+  
+  Use VMS-style syntax for files; it's cheaper to just do it directly here
+  than to have the MM_Unix method call C<catfile> repeatedly.  Also, if
+  we have to rebuild Config.pm, use MM[SK] to do it.
+  
+  =cut
+  
+  sub perldepend {
+      my($self) = @_;
+      my(@m);
+  
+      if ($self->{OBJECT}) {
+          # Need to add an object file dependency on the perl headers.
+          # this is very important for XS modules in perl.git development.
+  
+          push @m, $self->_perl_header_files_fragment(""); # empty separator on VMS as its in the $(PERL_INC)
+      }
+  
+      if ($self->{PERL_SRC}) {
+  	my(@macros);
+  	my($mmsquals) = '$(USEMAKEFILE)[.vms]$(FIRST_MAKEFILE)';
+  	push(@macros,'__AXP__=1') if $Config{'archname'} eq 'VMS_AXP';
+  	push(@macros,'DECC=1')    if $Config{'vms_cc_type'} eq 'decc';
+  	push(@macros,'GNUC=1')    if $Config{'vms_cc_type'} eq 'gcc';
+  	push(@macros,'SOCKET=1')  if $Config{'d_has_sockets'};
+  	push(@macros,qq["CC=$Config{'cc'}"])  if $Config{'cc'} =~ m!/!;
+  	$mmsquals .= '$(USEMACROS)' . join(',',@macros) . '$(MACROEND)' if @macros;
+  	push(@m,q[
+  # Check for unpropagated config.sh changes. Should never happen.
+  # We do NOT just update config.h because that is not sufficient.
+  # An out of date config.h is not fatal but complains loudly!
+  $(PERL_INC)config.h : $(PERL_SRC)config.sh
+  	$(NOOP)
+  
+  $(PERL_ARCHLIB)Config.pm : $(PERL_SRC)config.sh
+  	$(NOECHO) Write Sys$Error "$(PERL_ARCHLIB)Config.pm may be out of date with config.h or genconfig.pl"
+  	olddef = F$Environment("Default")
+  	Set Default $(PERL_SRC)
+  	$(MMS)],$mmsquals,);
+  	if ($self->{PERL_ARCHLIB} =~ m|\[-| && $self->{PERL_SRC} =~ m|(\[-+)|) {
+  	    my($prefix,$target) = ($1,$self->fixpath('$(PERL_ARCHLIB)Config.pm',0));
+  	    $target =~ s/\Q$prefix/[/;
+  	    push(@m," $target");
+  	}
+  	else { push(@m,' $(MMS$TARGET)'); }
+  	push(@m,q[
+  	Set Default 'olddef'
+  ]);
+      }
+  
+      push(@m, join(" ", map($self->fixpath($_,0),values %{$self->{XS}}))." : \$(XSUBPPDEPS)\n")
+        if %{$self->{XS}};
+  
+      join('',@m);
+  }
+  
+  
+  =item makeaperl (override)
+  
+  Undertake to build a new set of Perl images using VMS commands.  Since
+  VMS does dynamic loading, it's not necessary to statically link each
+  extension into the Perl image, so this isn't the normal build path.
+  Consequently, it hasn't really been tested, and may well be incomplete.
+  
+  =cut
+  
+  our %olbs;  # needs to be localized
+  
+  sub makeaperl {
+      my($self, %attribs) = @_;
+      my($makefilename, $searchdirs, $static, $extra, $perlinc, $target, $tmpdir, $libperl) =
+        @attribs{qw(MAKE DIRS STAT EXTRA INCL TARGET TMP LIBPERL)};
+      my(@m);
+      push @m, "
+  # --- MakeMaker makeaperl section ---
+  MAP_TARGET    = $target
+  ";
+      return join '', @m if $self->{PARENT};
+  
+      my($dir) = join ":", @{$self->{DIR}};
+  
+      unless ($self->{MAKEAPERL}) {
+  	push @m, q{
+  $(MAKE_APERL_FILE) : $(FIRST_MAKEFILE)
+  	$(NOECHO) $(ECHO) "Writing ""$(MMS$TARGET)"" for this $(MAP_TARGET)"
+  	$(NOECHO) $(PERLRUNINST) \
+  		Makefile.PL DIR=}, $dir, q{ \
+  		FIRST_MAKEFILE=$(MAKE_APERL_FILE) LINKTYPE=static \
+  		MAKEAPERL=1 NORECURS=1 };
+  
+  	push @m, map(q[ \\\n\t\t"$_"], @ARGV),q{
+  
+  $(MAP_TARGET) :: $(MAKE_APERL_FILE)
+  	$(MAKE)$(USEMAKEFILE)$(MAKE_APERL_FILE) static $(MMS$TARGET)
+  };
+  	push @m, "\n";
+  
+  	return join '', @m;
+      }
+  
+  
+      my($linkcmd,@optlibs,@staticpkgs,$extralist,$targdir,$libperldir,%libseen);
+      local($_);
+  
+      # The front matter of the linkcommand...
+      $linkcmd = join ' ', $Config{'ld'},
+  	    grep($_, @Config{qw(large split ldflags ccdlflags)});
+      $linkcmd =~ s/\s+/ /g;
+  
+      # Which *.olb files could we make use of...
+      local(%olbs);       # XXX can this be lexical?
+      $olbs{$self->{INST_ARCHAUTODIR}} = "$self->{BASEEXT}\$(LIB_EXT)";
+      require File::Find;
+      File::Find::find(sub {
+  	return unless m/\Q$self->{LIB_EXT}\E$/;
+  	return if m/^libperl/;
+  
+  	if( exists $self->{INCLUDE_EXT} ){
+  		my $found = 0;
+  
+  		(my $xx = $File::Find::name) =~ s,.*?/auto/,,;
+  		$xx =~ s,/?$_,,;
+  		$xx =~ s,/,::,g;
+  
+  		# Throw away anything not explicitly marked for inclusion.
+  		# DynaLoader is implied.
+  		foreach my $incl ((@{$self->{INCLUDE_EXT}},'DynaLoader')){
+  			if( $xx eq $incl ){
+  				$found++;
+  				last;
+  			}
+  		}
+  		return unless $found;
+  	}
+  	elsif( exists $self->{EXCLUDE_EXT} ){
+  		(my $xx = $File::Find::name) =~ s,.*?/auto/,,;
+  		$xx =~ s,/?$_,,;
+  		$xx =~ s,/,::,g;
+  
+  		# Throw away anything explicitly marked for exclusion
+  		foreach my $excl (@{$self->{EXCLUDE_EXT}}){
+  			return if( $xx eq $excl );
+  		}
+  	}
+  
+  	$olbs{$ENV{DEFAULT}} = $_;
+      }, grep( -d $_, @{$searchdirs || []}));
+  
+      # We trust that what has been handed in as argument will be buildable
+      $static = [] unless $static;
+      @olbs{@{$static}} = (1) x @{$static};
+  
+      $extra = [] unless $extra && ref $extra eq 'ARRAY';
+      # Sort the object libraries in inverse order of
+      # filespec length to try to insure that dependent extensions
+      # will appear before their parents, so the linker will
+      # search the parent library to resolve references.
+      # (e.g. Intuit::DWIM will precede Intuit, so unresolved
+      # references from [.intuit.dwim]dwim.obj can be found
+      # in [.intuit]intuit.olb).
+      for (sort { length($a) <=> length($b) } keys %olbs) {
+  	next unless $olbs{$_} =~ /\Q$self->{LIB_EXT}\E$/;
+  	my($dir) = $self->fixpath($_,1);
+  	my($extralibs) = $dir . "extralibs.ld";
+  	my($extopt) = $dir . $olbs{$_};
+  	$extopt =~ s/$self->{LIB_EXT}$/.opt/;
+  	push @optlibs, "$dir$olbs{$_}";
+  	# Get external libraries this extension will need
+  	if (-f $extralibs ) {
+  	    my %seenthis;
+  	    open my $list, "<", $extralibs or warn $!,next;
+  	    while (<$list>) {
+  		chomp;
+  		# Include a library in the link only once, unless it's mentioned
+  		# multiple times within a single extension's options file, in which
+  		# case we assume the builder needed to search it again later in the
+  		# link.
+  		my $skip = exists($libseen{$_}) && !exists($seenthis{$_});
+  		$libseen{$_}++;  $seenthis{$_}++;
+  		next if $skip;
+  		push @$extra,$_;
+  	    }
+  	}
+  	# Get full name of extension for ExtUtils::Miniperl
+  	if (-f $extopt) {
+  	    open my $opt, '<', $extopt or die $!;
+  	    while (<$opt>) {
+  		next unless /(?:UNIVERSAL|VECTOR)=boot_([\w_]+)/;
+  		my $pkg = $1;
+  		$pkg =~ s#__*#::#g;
+  		push @staticpkgs,$pkg;
+  	    }
+  	}
+      }
+      # Place all of the external libraries after all of the Perl extension
+      # libraries in the final link, in order to maximize the opportunity
+      # for XS code from multiple extensions to resolve symbols against the
+      # same external library while only including that library once.
+      push @optlibs, @$extra;
+  
+      $target = "Perl$Config{'exe_ext'}" unless $target;
+      my $shrtarget;
+      ($shrtarget,$targdir) = fileparse($target);
+      $shrtarget =~ s/^([^.]*)/$1Shr/;
+      $shrtarget = $targdir . $shrtarget;
+      $target = "Perlshr.$Config{'dlext'}" unless $target;
+      $tmpdir = "[]" unless $tmpdir;
+      $tmpdir = $self->fixpath($tmpdir,1);
+      if (@optlibs) { $extralist = join(' ',@optlibs); }
+      else          { $extralist = ''; }
+      # Let ExtUtils::Liblist find the necessary libs for us (but skip PerlShr)
+      # that's what we're building here).
+      push @optlibs, grep { !/PerlShr/i } split ' ', +($self->ext())[2];
+      if ($libperl) {
+  	unless (-f $libperl || -f ($libperl = $self->catfile($Config{'installarchlib'},'CORE',$libperl))) {
+  	    print "Warning: $libperl not found\n";
+  	    undef $libperl;
+  	}
+      }
+      unless ($libperl) {
+  	if (defined $self->{PERL_SRC}) {
+  	    $libperl = $self->catfile($self->{PERL_SRC},"libperl$self->{LIB_EXT}");
+  	} elsif (-f ($libperl = $self->catfile($Config{'installarchlib'},'CORE',"libperl$self->{LIB_EXT}")) ) {
+  	} else {
+  	    print "Warning: $libperl not found
+      If you're going to build a static perl binary, make sure perl is installed
+      otherwise ignore this warning\n";
+  	}
+      }
+      $libperldir = $self->fixpath((fileparse($libperl))[1],1);
+  
+      push @m, '
+  # Fill in the target you want to produce if it\'s not perl
+  MAP_TARGET    = ',$self->fixpath($target,0),'
+  MAP_SHRTARGET = ',$self->fixpath($shrtarget,0),"
+  MAP_LINKCMD   = $linkcmd
+  MAP_PERLINC   = ", $perlinc ? map('"$_" ',@{$perlinc}) : '',"
+  MAP_EXTRA     = $extralist
+  MAP_LIBPERL = ",$self->fixpath($libperl,0),'
+  ';
+  
+  
+      push @m,"\n${tmpdir}Makeaperl.Opt : \$(MAP_EXTRA)\n";
+      foreach (@optlibs) {
+  	push @m,'	$(NOECHO) $(PERL) -e "print q{',$_,'}" >>$(MMS$TARGET)',"\n";
+      }
+      push @m,"\n${tmpdir}PerlShr.Opt :\n\t";
+      push @m,'$(NOECHO) $(PERL) -e "print q{$(MAP_SHRTARGET)}" >$(MMS$TARGET)',"\n";
+  
+      push @m,'
+  $(MAP_SHRTARGET) : $(MAP_LIBPERL) Makeaperl.Opt ',"${libperldir}Perlshr_Attr.Opt",'
+  	$(MAP_LINKCMD)/Shareable=$(MMS$TARGET) $(MAP_LIBPERL), Makeaperl.Opt/Option ',"${libperldir}Perlshr_Attr.Opt/Option",'
+  $(MAP_TARGET) : $(MAP_SHRTARGET) ',"${tmpdir}perlmain\$(OBJ_EXT) ${tmpdir}PerlShr.Opt",'
+  	$(MAP_LINKCMD) ',"${tmpdir}perlmain\$(OBJ_EXT)",', PerlShr.Opt/Option
+  	$(NOECHO) $(ECHO) "To install the new ""$(MAP_TARGET)"" binary, say"
+  	$(NOECHO) $(ECHO) "    $(MAKE)$(USEMAKEFILE)$(FIRST_MAKEFILE) inst_perl $(USEMACROS)MAP_TARGET=$(MAP_TARGET)$(ENDMACRO)"
+  	$(NOECHO) $(ECHO) "To remove the intermediate files, say
+  	$(NOECHO) $(ECHO) "    $(MAKE)$(USEMAKEFILE)$(FIRST_MAKEFILE) map_clean"
+  ';
+      push @m,"\n${tmpdir}perlmain.c : \$(FIRST_MAKEFILE)\n\t\$(NOECHO) \$(PERL) -e 1 >${tmpdir}Writemain.tmp\n";
+      push @m, "# More from the 255-char line length limit\n";
+      foreach (@staticpkgs) {
+  	push @m,'	$(NOECHO) $(PERL) -e "print q{',$_,qq[}" >>${tmpdir}Writemain.tmp\n];
+      }
+  
+      push @m, sprintf <<'MAKE_FRAG', $tmpdir, $tmpdir;
+  	$(NOECHO) $(PERL) $(MAP_PERLINC) -ane "use ExtUtils::Miniperl; writemain(@F)" %sWritemain.tmp >$(MMS$TARGET)
+  	$(NOECHO) $(RM_F) %sWritemain.tmp
+  MAKE_FRAG
+  
+      push @m, q[
+  # Still more from the 255-char line length limit
+  doc_inst_perl :
+  	$(NOECHO) $(MKPATH) $(DESTINSTALLARCHLIB)
+  	$(NOECHO) $(ECHO) "Perl binary $(MAP_TARGET)|" >.MM_tmp
+  	$(NOECHO) $(ECHO) "MAP_STATIC|$(MAP_STATIC)|" >>.MM_tmp
+  	$(NOECHO) $(PERL) -pl040 -e " " ].$self->catfile('$(INST_ARCHAUTODIR)','extralibs.all'),q[ >>.MM_tmp
+  	$(NOECHO) $(ECHO) -e "MAP_LIBPERL|$(MAP_LIBPERL)|" >>.MM_tmp
+  	$(NOECHO) $(DOC_INSTALL) <.MM_tmp >>].$self->catfile('$(DESTINSTALLARCHLIB)','perllocal.pod').q[
+  	$(NOECHO) $(RM_F) .MM_tmp
+  ];
+  
+      push @m, "
+  inst_perl : pure_inst_perl doc_inst_perl
+  	\$(NOECHO) \$(NOOP)
+  
+  pure_inst_perl : \$(MAP_TARGET)
+  	$self->{CP} \$(MAP_SHRTARGET) ",$self->fixpath($Config{'installbin'},1),"
+  	$self->{CP} \$(MAP_TARGET) ",$self->fixpath($Config{'installbin'},1),"
+  
+  clean :: map_clean
+  	\$(NOECHO) \$(NOOP)
+  
+  map_clean :
+  	\$(RM_F) ${tmpdir}perlmain\$(OBJ_EXT) ${tmpdir}perlmain.c \$(FIRST_MAKEFILE)
+  	\$(RM_F) ${tmpdir}Makeaperl.Opt ${tmpdir}PerlShr.Opt \$(MAP_TARGET)
+  ";
+  
+      join '', @m;
+  }
+  
+  
+  # --- Output postprocessing section ---
+  
+  =item maketext_filter (override)
+  
+  Insure that colons marking targets are preceded by space, in order
+  to distinguish the target delimiter from a colon appearing as
+  part of a filespec.
+  
+  =cut
+  
+  sub maketext_filter {
+      my($self, $text) = @_;
+  
+      $text =~ s/^([^\s:=]+)(:+\s)/$1 $2/mg;
+      return $text;
+  }
+  
+  =item prefixify (override)
+  
+  prefixifying on VMS is simple.  Each should simply be:
+  
+      perl_root:[some.dir]
+  
+  which can just be converted to:
+  
+      volume:[your.prefix.some.dir]
+  
+  otherwise you get the default layout.
+  
+  In effect, your search prefix is ignored and $Config{vms_prefix} is
+  used instead.
+  
+  =cut
+  
+  sub prefixify {
+      my($self, $var, $sprefix, $rprefix, $default) = @_;
+  
+      # Translate $(PERLPREFIX) to a real path.
+      $rprefix = $self->eliminate_macros($rprefix);
+      $rprefix = vmspath($rprefix) if $rprefix;
+      $sprefix = vmspath($sprefix) if $sprefix;
+  
+      $default = vmsify($default)
+        unless $default =~ /\[.*\]/;
+  
+      (my $var_no_install = $var) =~ s/^install//;
+      my $path = $self->{uc $var} ||
+                 $ExtUtils::MM_Unix::Config_Override{lc $var} ||
+                 $Config{lc $var} || $Config{lc $var_no_install};
+  
+      if( !$path ) {
+          warn "  no Config found for $var.\n" if $Verbose >= 2;
+          $path = $self->_prefixify_default($rprefix, $default);
+      }
+      elsif( !$self->{ARGS}{PREFIX} || !$self->file_name_is_absolute($path) ) {
+          # do nothing if there's no prefix or if its relative
+      }
+      elsif( $sprefix eq $rprefix ) {
+          warn "  no new prefix.\n" if $Verbose >= 2;
+      }
+      else {
+  
+          warn "  prefixify $var => $path\n"     if $Verbose >= 2;
+          warn "    from $sprefix to $rprefix\n" if $Verbose >= 2;
+  
+          my($path_vol, $path_dirs) = $self->splitpath( $path );
+          if( $path_vol eq $Config{vms_prefix}.':' ) {
+              warn "  $Config{vms_prefix}: seen\n" if $Verbose >= 2;
+  
+              $path_dirs =~ s{^\[}{\[.} unless $path_dirs =~ m{^\[\.};
+              $path = $self->_catprefix($rprefix, $path_dirs);
+          }
+          else {
+              $path = $self->_prefixify_default($rprefix, $default);
+          }
+      }
+  
+      print "    now $path\n" if $Verbose >= 2;
+      return $self->{uc $var} = $path;
+  }
+  
+  
+  sub _prefixify_default {
+      my($self, $rprefix, $default) = @_;
+  
+      warn "  cannot prefix, using default.\n" if $Verbose >= 2;
+  
+      if( !$default ) {
+          warn "No default!\n" if $Verbose >= 1;
+          return;
+      }
+      if( !$rprefix ) {
+          warn "No replacement prefix!\n" if $Verbose >= 1;
+          return '';
+      }
+  
+      return $self->_catprefix($rprefix, $default);
+  }
+  
+  sub _catprefix {
+      my($self, $rprefix, $default) = @_;
+  
+      my($rvol, $rdirs) = $self->splitpath($rprefix);
+      if( $rvol ) {
+          return $self->catpath($rvol,
+                                     $self->catdir($rdirs, $default),
+                                     ''
+                                    )
+      }
+      else {
+          return $self->catdir($rdirs, $default);
+      }
+  }
+  
+  
+  =item cd
+  
+  =cut
+  
+  sub cd {
+      my($self, $dir, @cmds) = @_;
+  
+      $dir = vmspath($dir);
+  
+      my $cmd = join "\n\t", map "$_", @cmds;
+  
+      # No leading tab makes it look right when embedded
+      my $make_frag = sprintf <<'MAKE_FRAG', $dir, $cmd;
+  startdir = F$Environment("Default")
+  	Set Default %s
+  	%s
+  	Set Default 'startdir'
+  MAKE_FRAG
+  
+      # No trailing newline makes this easier to embed
+      chomp $make_frag;
+  
+      return $make_frag;
+  }
+  
+  
+  =item oneliner
+  
+  =cut
+  
+  sub oneliner {
+      my($self, $cmd, $switches) = @_;
+      $switches = [] unless defined $switches;
+  
+      # Strip leading and trailing newlines
+      $cmd =~ s{^\n+}{};
+      $cmd =~ s{\n+$}{};
+  
+      $cmd = $self->quote_literal($cmd);
+      $cmd = $self->escape_newlines($cmd);
+  
+      # Switches must be quoted else they will be lowercased.
+      $switches = join ' ', map { qq{"$_"} } @$switches;
+  
+      return qq{\$(ABSPERLRUN) $switches -e $cmd "--"};
+  }
+  
+  
+  =item B<echo>
+  
+  perl trips up on "<foo>" thinking it's an input redirect.  So we use the
+  native Write command instead.  Besides, its faster.
+  
+  =cut
+  
+  sub echo {
+      my($self, $text, $file, $opts) = @_;
+  
+      # Compatibility with old options
+      if( !ref $opts ) {
+          my $append = $opts;
+          $opts = { append => $append || 0 };
+      }
+      my $opencmd = $opts->{append} ? 'Open/Append' : 'Open/Write';
+  
+      $opts->{allow_variables} = 0 unless defined $opts->{allow_variables};
+  
+      my $ql_opts = { allow_variables => $opts->{allow_variables} };
+  
+      my @cmds = ("\$(NOECHO) $opencmd MMECHOFILE $file ");
+      push @cmds, map { '$(NOECHO) Write MMECHOFILE '.$self->quote_literal($_, $ql_opts) }
+                  split /\n/, $text;
+      push @cmds, '$(NOECHO) Close MMECHOFILE';
+      return @cmds;
+  }
+  
+  
+  =item quote_literal
+  
+  =cut
+  
+  sub quote_literal {
+      my($self, $text, $opts) = @_;
+      $opts->{allow_variables} = 1 unless defined $opts->{allow_variables};
+  
+      # I believe this is all we should need.
+      $text =~ s{"}{""}g;
+  
+      $text = $opts->{allow_variables}
+        ? $self->escape_dollarsigns($text) : $self->escape_all_dollarsigns($text);
+  
+      return qq{"$text"};
+  }
+  
+  =item escape_dollarsigns
+  
+  Quote, don't escape.
+  
+  =cut
+  
+  sub escape_dollarsigns {
+      my($self, $text) = @_;
+  
+      # Quote dollar signs which are not starting a variable
+      $text =~ s{\$ (?!\() }{"\$"}gx;
+  
+      return $text;
+  }
+  
+  
+  =item escape_all_dollarsigns
+  
+  Quote, don't escape.
+  
+  =cut
+  
+  sub escape_all_dollarsigns {
+      my($self, $text) = @_;
+  
+      # Quote dollar signs
+      $text =~ s{\$}{"\$\"}gx;
+  
+      return $text;
+  }
+  
+  =item escape_newlines
+  
+  =cut
+  
+  sub escape_newlines {
+      my($self, $text) = @_;
+  
+      $text =~ s{\n}{-\n}g;
+  
+      return $text;
+  }
+  
+  =item max_exec_len
+  
+  256 characters.
+  
+  =cut
+  
+  sub max_exec_len {
+      my $self = shift;
+  
+      return $self->{_MAX_EXEC_LEN} ||= 256;
+  }
+  
+  =item init_linker
+  
+  =cut
+  
+  sub init_linker {
+      my $self = shift;
+      $self->{EXPORT_LIST} ||= '$(BASEEXT).opt';
+  
+      my $shr = $Config{dbgprefix} . 'PERLSHR';
+      if ($self->{PERL_SRC}) {
+          $self->{PERL_ARCHIVE} ||=
+            $self->catfile($self->{PERL_SRC}, "$shr.$Config{'dlext'}");
+      }
+      else {
+          $self->{PERL_ARCHIVE} ||=
+            $ENV{$shr} ? $ENV{$shr} : "Sys\$Share:$shr.$Config{'dlext'}";
+      }
+  
+      $self->{PERL_ARCHIVEDEP} ||= '';
+      $self->{PERL_ARCHIVE_AFTER} ||= '';
+  }
+  
+  
+  =item catdir (override)
+  
+  =item catfile (override)
+  
+  Eliminate the macros in the output to the MMS/MMK file.
+  
+  (File::Spec::VMS used to do this for us, but it's being removed)
+  
+  =cut
+  
+  sub catdir {
+      my $self = shift;
+  
+      # Process the macros on VMS MMS/MMK
+      my @args = map { m{\$\(} ? $self->eliminate_macros($_) : $_  } @_;
+  
+      my $dir = $self->SUPER::catdir(@args);
+  
+      # Fix up the directory and force it to VMS format.
+      $dir = $self->fixpath($dir, 1);
+  
+      return $dir;
+  }
+  
+  sub catfile {
+      my $self = shift;
+  
+      # Process the macros on VMS MMS/MMK
+      my @args = map { m{\$\(} ? $self->eliminate_macros($_) : $_  } @_;
+  
+      my $file = $self->SUPER::catfile(@args);
+  
+      $file = vmsify($file);
+  
+      return $file
+  }
+  
+  
+  =item eliminate_macros
+  
+  Expands MM[KS]/Make macros in a text string, using the contents of
+  identically named elements of C<%$self>, and returns the result
+  as a file specification in Unix syntax.
+  
+  NOTE:  This is the canonical version of the method.  The version in
+  File::Spec::VMS is deprecated.
+  
+  =cut
+  
+  sub eliminate_macros {
+      my($self,$path) = @_;
+      return '' unless $path;
+      $self = {} unless ref $self;
+  
+      my($npath) = unixify($path);
+      # sometimes unixify will return a string with an off-by-one trailing null
+      $npath =~ s{\0$}{};
+  
+      my($complex) = 0;
+      my($head,$macro,$tail);
+  
+      # perform m##g in scalar context so it acts as an iterator
+      while ($npath =~ m#(.*?)\$\((\S+?)\)(.*)#gs) {
+          if (defined $self->{$2}) {
+              ($head,$macro,$tail) = ($1,$2,$3);
+              if (ref $self->{$macro}) {
+                  if (ref $self->{$macro} eq 'ARRAY') {
+                      $macro = join ' ', @{$self->{$macro}};
+                  }
+                  else {
+                      print "Note: can't expand macro \$($macro) containing ",ref($self->{$macro}),
+                            "\n\t(using MMK-specific deferred substitutuon; MMS will break)\n";
+                      $macro = "\cB$macro\cB";
+                      $complex = 1;
+                  }
+              }
+              else { ($macro = unixify($self->{$macro})) =~ s#/\Z(?!\n)##; }
+              $npath = "$head$macro$tail";
+          }
+      }
+      if ($complex) { $npath =~ s#\cB(.*?)\cB#\${$1}#gs; }
+      $npath;
+  }
+  
+  =item fixpath
+  
+     my $path = $mm->fixpath($path);
+     my $path = $mm->fixpath($path, $is_dir);
+  
+  Catchall routine to clean up problem MM[SK]/Make macros.  Expands macros
+  in any directory specification, in order to avoid juxtaposing two
+  VMS-syntax directories when MM[SK] is run.  Also expands expressions which
+  are all macro, so that we can tell how long the expansion is, and avoid
+  overrunning DCL's command buffer when MM[KS] is running.
+  
+  fixpath() checks to see whether the result matches the name of a
+  directory in the current default directory and returns a directory or
+  file specification accordingly.  C<$is_dir> can be set to true to
+  force fixpath() to consider the path to be a directory or false to force
+  it to be a file.
+  
+  NOTE:  This is the canonical version of the method.  The version in
+  File::Spec::VMS is deprecated.
+  
+  =cut
+  
+  sub fixpath {
+      my($self,$path,$force_path) = @_;
+      return '' unless $path;
+      $self = bless {}, $self unless ref $self;
+      my($fixedpath,$prefix,$name);
+  
+      if ($path =~ m#^\$\([^\)]+\)\Z(?!\n)#s || $path =~ m#[/:>\]]#) {
+          if ($force_path or $path =~ /(?:DIR\)|\])\Z(?!\n)/) {
+              $fixedpath = vmspath($self->eliminate_macros($path));
+          }
+          else {
+              $fixedpath = vmsify($self->eliminate_macros($path));
+          }
+      }
+      elsif ((($prefix,$name) = ($path =~ m#^\$\(([^\)]+)\)(.+)#s)) && $self->{$prefix}) {
+          my($vmspre) = $self->eliminate_macros("\$($prefix)");
+          # is it a dir or just a name?
+          $vmspre = ($vmspre =~ m|/| or $prefix =~ /DIR\Z(?!\n)/) ? vmspath($vmspre) : '';
+          $fixedpath = ($vmspre ? $vmspre : $self->{$prefix}) . $name;
+          $fixedpath = vmspath($fixedpath) if $force_path;
+      }
+      else {
+          $fixedpath = $path;
+          $fixedpath = vmspath($fixedpath) if $force_path;
+      }
+      # No hints, so we try to guess
+      if (!defined($force_path) and $fixedpath !~ /[:>(.\]]/) {
+          $fixedpath = vmspath($fixedpath) if -d $fixedpath;
+      }
+  
+      # Trim off root dirname if it's had other dirs inserted in front of it.
+      $fixedpath =~ s/\.000000([\]>])/$1/;
+      # Special case for VMS absolute directory specs: these will have had device
+      # prepended during trip through Unix syntax in eliminate_macros(), since
+      # Unix syntax has no way to express "absolute from the top of this device's
+      # directory tree".
+      if ($path =~ /^[\[>][^.\-]/) { $fixedpath =~ s/^[^\[<]+//; }
+  
+      return $fixedpath;
+  }
+  
+  
+  =item os_flavor
+  
+  VMS is VMS.
+  
+  =cut
+  
+  sub os_flavor {
+      return('VMS');
+  }
+  
+  
+  =item is_make_type (override)
+  
+  None of the make types being checked for is viable on VMS,
+  plus our $self->{MAKE} is an unexpanded (and unexpandable)
+  macro whose value is known only to the make utility itself.
+  
+  =cut
+  
+  sub is_make_type {
+      my($self, $type) = @_;
+      return 0;
+  }
+  
+  
+  =back
+  
+  
+  =head1 AUTHOR
+  
+  Original author Charles Bailey F<bailey@newman.upenn.edu>
+  
+  Maintained by Michael G Schwern F<schwern@pobox.com>
+  
+  See L<ExtUtils::MakeMaker> for patching and contact information.
+  
+  
+  =cut
+  
+  1;
+  
+EXTUTILS_MM_VMS
+
+$fatpacked{"ExtUtils/MM_VOS.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_MM_VOS';
+  package ExtUtils::MM_VOS;
+  
+  use strict;
+  our $VERSION = '7.04';
+  
+  require ExtUtils::MM_Unix;
+  our @ISA = qw(ExtUtils::MM_Unix);
+  
+  
+  =head1 NAME
+  
+  ExtUtils::MM_VOS - VOS specific subclass of ExtUtils::MM_Unix
+  
+  =head1 SYNOPSIS
+  
+    Don't use this module directly.
+    Use ExtUtils::MM and let it choose.
+  
+  =head1 DESCRIPTION
+  
+  This is a subclass of ExtUtils::MM_Unix which contains functionality for
+  VOS.
+  
+  Unless otherwise stated it works just like ExtUtils::MM_Unix
+  
+  =head2 Overridden methods
+  
+  =head3 extra_clean_files
+  
+  Cleanup VOS core files
+  
+  =cut
+  
+  sub extra_clean_files {
+      return qw(*.kp);
+  }
+  
+  
+  =head1 AUTHOR
+  
+  Michael G Schwern <schwern@pobox.com> with code from ExtUtils::MM_Unix
+  
+  =head1 SEE ALSO
+  
+  L<ExtUtils::MakeMaker>
+  
+  =cut
+  
+  
+  1;
+EXTUTILS_MM_VOS
+
+$fatpacked{"ExtUtils/MM_Win32.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_MM_WIN32';
+  package ExtUtils::MM_Win32;
+  
+  use strict;
+  
+  
+  =head1 NAME
+  
+  ExtUtils::MM_Win32 - methods to override UN*X behaviour in ExtUtils::MakeMaker
+  
+  =head1 SYNOPSIS
+  
+   use ExtUtils::MM_Win32; # Done internally by ExtUtils::MakeMaker if needed
+  
+  =head1 DESCRIPTION
+  
+  See ExtUtils::MM_Unix for a documentation of the methods provided
+  there. This package overrides the implementation of these methods, not
+  the semantics.
+  
+  =cut
+  
+  use ExtUtils::MakeMaker::Config;
+  use File::Basename;
+  use File::Spec;
+  use ExtUtils::MakeMaker qw( neatvalue );
+  
+  require ExtUtils::MM_Any;
+  require ExtUtils::MM_Unix;
+  our @ISA = qw( ExtUtils::MM_Any ExtUtils::MM_Unix );
+  our $VERSION = '7.04';
+  
+  $ENV{EMXSHELL} = 'sh'; # to run `commands`
+  
+  my ( $BORLAND, $GCC, $DLLTOOL ) = _identify_compiler_environment( \%Config );
+  
+  sub _identify_compiler_environment {
+  	my ( $config ) = @_;
+  
+  	my $BORLAND = $config->{cc} =~ /^bcc/i ? 1 : 0;
+  	my $GCC     = $config->{cc} =~ /\bgcc\b/i ? 1 : 0;
+  	my $DLLTOOL = $config->{dlltool} || 'dlltool';
+  
+  	return ( $BORLAND, $GCC, $DLLTOOL );
+  }
+  
+  
+  =head2 Overridden methods
+  
+  =over 4
+  
+  =item B<dlsyms>
+  
+  =cut
+  
+  sub dlsyms {
+      my($self,%attribs) = @_;
+  
+      my($funcs) = $attribs{DL_FUNCS} || $self->{DL_FUNCS} || {};
+      my($vars)  = $attribs{DL_VARS} || $self->{DL_VARS} || [];
+      my($funclist) = $attribs{FUNCLIST} || $self->{FUNCLIST} || [];
+      my($imports)  = $attribs{IMPORTS} || $self->{IMPORTS} || {};
+      my(@m);
+  
+      if (not $self->{SKIPHASH}{'dynamic'}) {
+  	push(@m,"
+  $self->{BASEEXT}.def: Makefile.PL
+  ",
+       q!	$(PERLRUN) -MExtUtils::Mksymlists \\
+       -e "Mksymlists('NAME'=>\"!, $self->{NAME},
+       q!\", 'DLBASE' => '!,$self->{DLBASE},
+       # The above two lines quoted differently to work around
+       # a bug in the 4DOS/4NT command line interpreter.  The visible
+       # result of the bug was files named q('extension_name',) *with the
+       # single quotes and the comma* in the extension build directories.
+       q!', 'DL_FUNCS' => !,neatvalue($funcs),
+       q!, 'FUNCLIST' => !,neatvalue($funclist),
+       q!, 'IMPORTS' => !,neatvalue($imports),
+       q!, 'DL_VARS' => !, neatvalue($vars), q!);"
+  !);
+      }
+      join('',@m);
+  }
+  
+  =item replace_manpage_separator
+  
+  Changes the path separator with .
+  
+  =cut
+  
+  sub replace_manpage_separator {
+      my($self,$man) = @_;
+      $man =~ s,/+,.,g;
+      $man;
+  }
+  
+  
+  =item B<maybe_command>
+  
+  Since Windows has nothing as simple as an executable bit, we check the
+  file extension.
+  
+  The PATHEXT env variable will be used to get a list of extensions that
+  might indicate a command, otherwise .com, .exe, .bat and .cmd will be
+  used by default.
+  
+  =cut
+  
+  sub maybe_command {
+      my($self,$file) = @_;
+      my @e = exists($ENV{'PATHEXT'})
+            ? split(/;/, $ENV{PATHEXT})
+  	  : qw(.com .exe .bat .cmd);
+      my $e = '';
+      for (@e) { $e .= "\Q$_\E|" }
+      chop $e;
+      # see if file ends in one of the known extensions
+      if ($file =~ /($e)$/i) {
+  	return $file if -e $file;
+      }
+      else {
+  	for (@e) {
+  	    return "$file$_" if -e "$file$_";
+  	}
+      }
+      return;
+  }
+  
+  
+  =item B<init_DIRFILESEP>
+  
+  Using \ for Windows, except for "gmake" where it is /.
+  
+  =cut
+  
+  sub init_DIRFILESEP {
+      my($self) = shift;
+  
+      # The ^ makes sure its not interpreted as an escape in nmake
+      $self->{DIRFILESEP} = $self->is_make_type('nmake') ? '^\\' :
+                            $self->is_make_type('dmake') ? '\\\\' :
+                            $self->is_make_type('gmake') ? '/'
+                                                         : '\\';
+  }
+  
+  =item init_tools
+  
+  Override some of the slower, portable commands with Windows specific ones.
+  
+  =cut
+  
+  sub init_tools {
+      my ($self) = @_;
+  
+      $self->{NOOP}     ||= 'rem';
+      $self->{DEV_NULL} ||= '> NUL';
+  
+      $self->{FIXIN}    ||= $self->{PERL_CORE} ?
+        "\$(PERLRUN) $self->{PERL_SRC}\\win32\\bin\\pl2bat.pl" :
+        'pl2bat.bat';
+  
+      $self->SUPER::init_tools;
+  
+      # Setting SHELL from $Config{sh} can break dmake.  Its ok without it.
+      delete $self->{SHELL};
+  
+      return;
+  }
+  
+  
+  =item init_others
+  
+  Override the default link and compile tools.
+  
+  LDLOADLIBS's default is changed to $Config{libs}.
+  
+  Adjustments are made for Borland's quirks needing -L to come first.
+  
+  =cut
+  
+  sub init_others {
+      my $self = shift;
+  
+      $self->{LD}     ||= 'link';
+      $self->{AR}     ||= 'lib';
+  
+      $self->SUPER::init_others;
+  
+      $self->{LDLOADLIBS} ||= $Config{libs};
+      # -Lfoo must come first for Borland, so we put it in LDDLFLAGS
+      if ($BORLAND) {
+          my $libs = $self->{LDLOADLIBS};
+          my $libpath = '';
+          while ($libs =~ s/(?:^|\s)(("?)-L.+?\2)(?:\s|$)/ /) {
+              $libpath .= ' ' if length $libpath;
+              $libpath .= $1;
+          }
+          $self->{LDLOADLIBS} = $libs;
+          $self->{LDDLFLAGS} ||= $Config{lddlflags};
+          $self->{LDDLFLAGS} .= " $libpath";
+      }
+  
+      return;
+  }
+  
+  
+  =item init_platform
+  
+  Add MM_Win32_VERSION.
+  
+  =item platform_constants
+  
+  =cut
+  
+  sub init_platform {
+      my($self) = shift;
+  
+      $self->{MM_Win32_VERSION} = $VERSION;
+  
+      return;
+  }
+  
+  sub platform_constants {
+      my($self) = shift;
+      my $make_frag = '';
+  
+      foreach my $macro (qw(MM_Win32_VERSION))
+      {
+          next unless defined $self->{$macro};
+          $make_frag .= "$macro = $self->{$macro}\n";
+      }
+  
+      return $make_frag;
+  }
+  
+  
+  =item constants
+  
+  Add MAXLINELENGTH for dmake before all the constants are output.
+  
+  =cut
+  
+  sub constants {
+      my $self = shift;
+  
+      my $make_text = $self->SUPER::constants;
+      return $make_text unless $self->is_make_type('dmake');
+  
+      # dmake won't read any single "line" (even those with escaped newlines)
+      # larger than a certain size which can be as small as 8k.  PM_TO_BLIB
+      # on large modules like DateTime::TimeZone can create lines over 32k.
+      # So we'll crank it up to a <ironic>WHOPPING</ironic> 64k.
+      #
+      # This has to come here before all the constants and not in
+      # platform_constants which is after constants.
+      my $size = $self->{MAXLINELENGTH} || 800000;
+      my $prefix = qq{
+  # Get dmake to read long commands like PM_TO_BLIB
+  MAXLINELENGTH = $size
+  
+  };
+  
+      return $prefix . $make_text;
+  }
+  
+  
+  =item special_targets
+  
+  Add .USESHELL target for dmake.
+  
+  =cut
+  
+  sub special_targets {
+      my($self) = @_;
+  
+      my $make_frag = $self->SUPER::special_targets;
+  
+      $make_frag .= <<'MAKE_FRAG' if $self->is_make_type('dmake');
+  .USESHELL :
+  MAKE_FRAG
+  
+      return $make_frag;
+  }
+  
+  
+  =item static_lib
+  
+  Changes how to run the linker.
+  
+  The rest is duplicate code from MM_Unix.  Should move the linker code
+  to its own method.
+  
+  =cut
+  
+  sub static_lib {
+      my($self) = @_;
+      return '' unless $self->has_link_code;
+  
+      my(@m);
+      push(@m, <<'END');
+  $(INST_STATIC): $(OBJECT) $(MYEXTLIB) $(INST_ARCHAUTODIR)$(DFSEP).exists
+  	$(RM_RF) $@
+  END
+  
+      # If this extension has its own library (eg SDBM_File)
+      # then copy that to $(INST_STATIC) and add $(OBJECT) into it.
+      push @m, <<'MAKE_FRAG' if $self->{MYEXTLIB};
+  	$(CP) $(MYEXTLIB) $@
+  MAKE_FRAG
+  
+      push @m,
+  q{	$(AR) }.($BORLAND ? '$@ $(OBJECT:^"+")'
+  			  : ($GCC ? '-ru $@ $(OBJECT)'
+  			          : '-out:$@ $(OBJECT)')).q{
+  	$(CHMOD) $(PERM_RWX) $@
+  	$(NOECHO) $(ECHO) "$(EXTRALIBS)" > $(INST_ARCHAUTODIR)\extralibs.ld
+  };
+  
+      # Old mechanism - still available:
+      push @m, <<'MAKE_FRAG' if $self->{PERL_SRC} && $self->{EXTRALIBS};
+  	$(NOECHO) $(ECHO) "$(EXTRALIBS)" >> $(PERL_SRC)\ext.libs
+  MAKE_FRAG
+  
+      join('', @m);
+  }
+  
+  
+  =item dynamic_lib
+  
+  Complicated stuff for Win32 that I don't understand. :(
+  
+  =cut
+  
+  sub dynamic_lib {
+      my($self, %attribs) = @_;
+      return '' unless $self->needs_linking(); #might be because of a subdir
+  
+      return '' unless $self->has_link_code;
+  
+      my($otherldflags) = $attribs{OTHERLDFLAGS} || ($BORLAND ? 'c0d32.obj': '');
+      my($inst_dynamic_dep) = $attribs{INST_DYNAMIC_DEP} || "";
+      my($ldfrom) = '$(LDFROM)';
+      my(@m);
+  
+      push(@m,'
+  # This section creates the dynamically loadable $(INST_DYNAMIC)
+  # from $(OBJECT) and possibly $(MYEXTLIB).
+  OTHERLDFLAGS = '.$otherldflags.'
+  INST_DYNAMIC_DEP = '.$inst_dynamic_dep.'
+  
+  $(INST_DYNAMIC): $(OBJECT) $(MYEXTLIB) $(BOOTSTRAP) $(INST_ARCHAUTODIR)$(DFSEP).exists $(EXPORT_LIST) $(PERL_ARCHIVEDEP) $(INST_DYNAMIC_DEP)
+  ');
+      if ($GCC) {
+        push(@m,
+         q{	}.$DLLTOOL.q{ --def $(EXPORT_LIST) --output-exp dll.exp
+  	$(LD) -o $@ -Wl,--base-file -Wl,dll.base $(LDDLFLAGS) }.$ldfrom.q{ $(OTHERLDFLAGS) $(MYEXTLIB) "$(PERL_ARCHIVE)" $(LDLOADLIBS) dll.exp
+  	}.$DLLTOOL.q{ --def $(EXPORT_LIST) --base-file dll.base --output-exp dll.exp
+  	$(LD) -o $@ $(LDDLFLAGS) }.$ldfrom.q{ $(OTHERLDFLAGS) $(MYEXTLIB) "$(PERL_ARCHIVE)" $(LDLOADLIBS) dll.exp });
+      } elsif ($BORLAND) {
+        push(@m,
+         q{	$(LD) $(LDDLFLAGS) $(OTHERLDFLAGS) }.$ldfrom.q{,$@,,}
+         .($self->is_make_type('dmake')
+                  ? q{"$(PERL_ARCHIVE:s,/,\,)" $(LDLOADLIBS:s,/,\,) }
+  		 .q{$(MYEXTLIB:s,/,\,),$(EXPORT_LIST:s,/,\,)}
+  		: q{"$(subst /,\,$(PERL_ARCHIVE))" $(subst /,\,$(LDLOADLIBS)) }
+  		 .q{$(subst /,\,$(MYEXTLIB)),$(subst /,\,$(EXPORT_LIST))})
+         .q{,$(RESFILES)});
+      } else {	# VC
+        push(@m,
+         q{	$(LD) -out:$@ $(LDDLFLAGS) }.$ldfrom.q{ $(OTHERLDFLAGS) }
+        .q{$(MYEXTLIB) "$(PERL_ARCHIVE)" $(LDLOADLIBS) -def:$(EXPORT_LIST)});
+  
+        # Embed the manifest file if it exists
+        push(@m, q{
+  	if exist $@.manifest mt -nologo -manifest $@.manifest -outputresource:$@;2
+  	if exist $@.manifest del $@.manifest});
+      }
+      push @m, '
+  	$(CHMOD) $(PERM_RWX) $@
+  ';
+  
+      join('',@m);
+  }
+  
+  =item extra_clean_files
+  
+  Clean out some extra dll.{base,exp} files which might be generated by
+  gcc.  Otherwise, take out all *.pdb files.
+  
+  =cut
+  
+  sub extra_clean_files {
+      my $self = shift;
+  
+      return $GCC ? (qw(dll.base dll.exp)) : ('*.pdb');
+  }
+  
+  =item init_linker
+  
+  =cut
+  
+  sub init_linker {
+      my $self = shift;
+  
+      $self->{PERL_ARCHIVE}       = "\$(PERL_INC)\\$Config{libperl}";
+      $self->{PERL_ARCHIVEDEP}    = "\$(PERL_INCDEP)\\$Config{libperl}";
+      $self->{PERL_ARCHIVE_AFTER} = '';
+      $self->{EXPORT_LIST}        = '$(BASEEXT).def';
+  }
+  
+  
+  =item perl_script
+  
+  Checks for the perl program under several common perl extensions.
+  
+  =cut
+  
+  sub perl_script {
+      my($self,$file) = @_;
+      return $file if -r $file && -f _;
+      return "$file.pl"  if -r "$file.pl" && -f _;
+      return "$file.plx" if -r "$file.plx" && -f _;
+      return "$file.bat" if -r "$file.bat" && -f _;
+      return;
+  }
+  
+  sub can_dep_space {
+      my $self = shift;
+      1; # with Win32::GetShortPathName
+  }
+  
+  =item quote_dep
+  
+  =cut
+  
+  sub quote_dep {
+      my ($self, $arg) = @_;
+      if ($arg =~ / / and not $self->is_make_type('gmake')) {
+          require Win32;
+          $arg = Win32::GetShortPathName($arg);
+          die <<EOF if not defined $arg or $arg =~ / /;
+  Tried to use make dependency with space for non-GNU make:
+    '$arg'
+  Fallback to short pathname failed.
+  EOF
+          return $arg;
+      }
+      return $self->SUPER::quote_dep($arg);
+  }
+  
+  =item xs_o
+  
+  This target is stubbed out.  Not sure why.
+  
+  =cut
+  
+  sub xs_o {
+      return ''
+  }
+  
+  
+  =item pasthru
+  
+  All we send is -nologo to nmake to prevent it from printing its damned
+  banner.
+  
+  =cut
+  
+  sub pasthru {
+      my($self) = shift;
+      return "PASTHRU = " . ($self->is_make_type('nmake') ? "-nologo" : "");
+  }
+  
+  
+  =item arch_check (override)
+  
+  Normalize all arguments for consistency of comparison.
+  
+  =cut
+  
+  sub arch_check {
+      my $self = shift;
+  
+      # Win32 is an XS module, minperl won't have it.
+      # arch_check() is not critical, so just fake it.
+      return 1 unless $self->can_load_xs;
+      return $self->SUPER::arch_check( map { $self->_normalize_path_name($_) } @_);
+  }
+  
+  sub _normalize_path_name {
+      my $self = shift;
+      my $file = shift;
+  
+      require Win32;
+      my $short = Win32::GetShortPathName($file);
+      return defined $short ? lc $short : lc $file;
+  }
+  
+  
+  =item oneliner
+  
+  These are based on what command.com does on Win98.  They may be wrong
+  for other Windows shells, I don't know.
+  
+  =cut
+  
+  sub oneliner {
+      my($self, $cmd, $switches) = @_;
+      $switches = [] unless defined $switches;
+  
+      # Strip leading and trailing newlines
+      $cmd =~ s{^\n+}{};
+      $cmd =~ s{\n+$}{};
+  
+      $cmd = $self->quote_literal($cmd);
+      $cmd = $self->escape_newlines($cmd);
+  
+      $switches = join ' ', @$switches;
+  
+      return qq{\$(ABSPERLRUN) $switches -e $cmd --};
+  }
+  
+  
+  sub quote_literal {
+      my($self, $text, $opts) = @_;
+      $opts->{allow_variables} = 1 unless defined $opts->{allow_variables};
+  
+      # See: http://www.autohotkey.net/~deleyd/parameters/parameters.htm#CPP
+  
+      # Apply the Microsoft C/C++ parsing rules
+      $text =~ s{\\\\"}{\\\\\\\\\\"}g;  # \\" -> \\\\\"
+      $text =~ s{(?<!\\)\\"}{\\\\\\"}g; # \"  -> \\\"
+      $text =~ s{(?<!\\)"}{\\"}g;       # "   -> \"
+      $text = qq{"$text"} if $text =~ /[ \t]/;
+  
+      # Apply the Command Prompt parsing rules (cmd.exe)
+      my @text = split /("[^"]*")/, $text;
+      # We should also escape parentheses, but it breaks one-liners containing
+      # $(MACRO)s in makefiles.
+      s{([<>|&^@!])}{^$1}g foreach grep { !/^"[^"]*"$/ } @text;
+      $text = join('', @text);
+  
+      # dmake expands {{ to { and }} to }.
+      if( $self->is_make_type('dmake') ) {
+          $text =~ s/{/{{/g;
+          $text =~ s/}/}}/g;
+      }
+  
+      $text = $opts->{allow_variables}
+        ? $self->escape_dollarsigns($text) : $self->escape_all_dollarsigns($text);
+  
+      return $text;
+  }
+  
+  
+  sub escape_newlines {
+      my($self, $text) = @_;
+  
+      # Escape newlines
+      $text =~ s{\n}{\\\n}g;
+  
+      return $text;
+  }
+  
+  
+  =item cd
+  
+  dmake can handle Unix style cd'ing but nmake (at least 1.5) cannot.  It
+  wants:
+  
+      cd dir1\dir2
+      command
+      another_command
+      cd ..\..
+  
+  =cut
+  
+  sub cd {
+      my($self, $dir, @cmds) = @_;
+  
+      return $self->SUPER::cd($dir, @cmds) unless $self->is_make_type('nmake');
+  
+      my $cmd = join "\n\t", map "$_", @cmds;
+  
+      my $updirs = $self->catdir(map { $self->updir } $self->splitdir($dir));
+  
+      # No leading tab and no trailing newline makes for easier embedding.
+      my $make_frag = sprintf <<'MAKE_FRAG', $dir, $cmd, $updirs;
+  cd %s
+  	%s
+  	cd %s
+  MAKE_FRAG
+  
+      chomp $make_frag;
+  
+      return $make_frag;
+  }
+  
+  
+  =item max_exec_len
+  
+  nmake 1.50 limits command length to 2048 characters.
+  
+  =cut
+  
+  sub max_exec_len {
+      my $self = shift;
+  
+      return $self->{_MAX_EXEC_LEN} ||= 2 * 1024;
+  }
+  
+  
+  =item os_flavor
+  
+  Windows is Win32.
+  
+  =cut
+  
+  sub os_flavor {
+      return('Win32');
+  }
+  
+  
+  =item cflags
+  
+  Defines the PERLDLL symbol if we are configured for static building since all
+  code destined for the perl5xx.dll must be compiled with the PERLDLL symbol
+  defined.
+  
+  =cut
+  
+  sub cflags {
+      my($self,$libperl)=@_;
+      return $self->{CFLAGS} if $self->{CFLAGS};
+      return '' unless $self->needs_linking();
+  
+      my $base = $self->SUPER::cflags($libperl);
+      foreach (split /\n/, $base) {
+          /^(\S*)\s*=\s*(\S*)$/ and $self->{$1} = $2;
+      };
+      $self->{CCFLAGS} .= " -DPERLDLL" if ($self->{LINKTYPE} eq 'static');
+  
+      return $self->{CFLAGS} = qq{
+  CCFLAGS = $self->{CCFLAGS}
+  OPTIMIZE = $self->{OPTIMIZE}
+  PERLTYPE = $self->{PERLTYPE}
+  };
+  
+  }
+  
+  1;
+  __END__
+  
+  =back
+EXTUTILS_MM_WIN32
+
+$fatpacked{"ExtUtils/MM_Win95.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_MM_WIN95';
+  package ExtUtils::MM_Win95;
+  
+  use strict;
+  
+  our $VERSION = '7.04';
+  
+  require ExtUtils::MM_Win32;
+  our @ISA = qw(ExtUtils::MM_Win32);
+  
+  use ExtUtils::MakeMaker::Config;
+  
+  
+  =head1 NAME
+  
+  ExtUtils::MM_Win95 - method to customize MakeMaker for Win9X
+  
+  =head1 SYNOPSIS
+  
+    You should not be using this module directly.
+  
+  =head1 DESCRIPTION
+  
+  This is a subclass of ExtUtils::MM_Win32 containing changes necessary
+  to get MakeMaker playing nice with command.com and other Win9Xisms.
+  
+  =head2 Overridden methods
+  
+  Most of these make up for limitations in the Win9x/nmake command shell.
+  Mostly its lack of &&.
+  
+  =over 4
+  
+  
+  =item xs_c
+  
+  The && problem.
+  
+  =cut
+  
+  sub xs_c {
+      my($self) = shift;
+      return '' unless $self->needs_linking();
+      '
+  .xs.c:
+  	$(XSUBPPRUN) $(XSPROTOARG) $(XSUBPPARGS) $*.xs > $*.c
+  	'
+  }
+  
+  
+  =item xs_cpp
+  
+  The && problem
+  
+  =cut
+  
+  sub xs_cpp {
+      my($self) = shift;
+      return '' unless $self->needs_linking();
+      '
+  .xs.cpp:
+  	$(XSUBPPRUN) $(XSPROTOARG) $(XSUBPPARGS) $*.xs > $*.cpp
+  	';
+  }
+  
+  =item xs_o
+  
+  The && problem.
+  
+  =cut
+  
+  sub xs_o {
+      my($self) = shift;
+      return '' unless $self->needs_linking();
+      '
+  .xs$(OBJ_EXT):
+  	$(XSUBPPRUN) $(XSPROTOARG) $(XSUBPPARGS) $*.xs > $*.c
+  	$(CCCMD) $(CCCDLFLAGS) -I$(PERL_INC) $(DEFINE) $*.c
+  	';
+  }
+  
+  
+  =item max_exec_len
+  
+  Win98 chokes on things like Encode if we set the max length to nmake's max
+  of 2K.  So we go for a more conservative value of 1K.
+  
+  =cut
+  
+  sub max_exec_len {
+      my $self = shift;
+  
+      return $self->{_MAX_EXEC_LEN} ||= 1024;
+  }
+  
+  
+  =item os_flavor
+  
+  Win95 and Win98 and WinME are collectively Win9x and Win32
+  
+  =cut
+  
+  sub os_flavor {
+      my $self = shift;
+      return ($self->SUPER::os_flavor, 'Win9x');
+  }
+  
+  
+  =back
+  
+  
+  =head1 AUTHOR
+  
+  Code originally inside MM_Win32.  Original author unknown.
+  
+  Currently maintained by Michael G Schwern C<schwern@pobox.com>.
+  
+  Send patches and ideas to C<makemaker@perl.org>.
+  
+  See https://metacpan.org/release/ExtUtils-MakeMaker.
+  
+  =cut
+  
+  
+  1;
+EXTUTILS_MM_WIN95
+
+$fatpacked{"ExtUtils/MY.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_MY';
+  package ExtUtils::MY;
+  
+  use strict;
+  require ExtUtils::MM;
+  
+  our $VERSION = '7.04';
+  our @ISA = qw(ExtUtils::MM);
+  
+  {
+      package MY;
+      our @ISA = qw(ExtUtils::MY);
+  }
+  
+  sub DESTROY {}
+  
+  
+  =head1 NAME
+  
+  ExtUtils::MY - ExtUtils::MakeMaker subclass for customization
+  
+  =head1 SYNOPSIS
+  
+    # in your Makefile.PL
+    sub MY::whatever {
+        ...
+    }
+  
+  =head1 DESCRIPTION
+  
+  B<FOR INTERNAL USE ONLY>
+  
+  ExtUtils::MY is a subclass of ExtUtils::MM.  Its provided in your
+  Makefile.PL for you to add and override MakeMaker functionality.
+  
+  It also provides a convenient alias via the MY class.
+  
+  ExtUtils::MY might turn out to be a temporary solution, but MY won't
+  go away.
+  
+  =cut
+EXTUTILS_MY
+
+$fatpacked{"ExtUtils/MakeMaker.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_MAKEMAKER';
+  # $Id$
+  package ExtUtils::MakeMaker;
+  
+  use strict;
+  
+  BEGIN {require 5.006;}
+  
+  require Exporter;
+  use ExtUtils::MakeMaker::Config;
+  use ExtUtils::MakeMaker::version; # ensure we always have our fake version.pm
+  use Carp;
+  use File::Path;
+  my $CAN_DECODE = eval { require ExtUtils::MakeMaker::Locale; }; # 2 birds, 1 stone
+  eval { ExtUtils::MakeMaker::Locale::reinit('UTF-8') }
+    if $CAN_DECODE and $ExtUtils::MakeMaker::Locale::ENCODING_LOCALE eq 'US-ASCII';
+  
+  our $Verbose = 0;       # exported
+  our @Parent;            # needs to be localized
+  our @Get_from_Config;   # referenced by MM_Unix
+  our @MM_Sections;
+  our @Overridable;
+  my @Prepend_parent;
+  my %Recognized_Att_Keys;
+  our %macro_fsentity; # whether a macro is a filesystem name
+  our %macro_dep; # whether a macro is a dependency
+  
+  our $VERSION = '7.04';
+  $VERSION = eval $VERSION;  ## no critic [BuiltinFunctions::ProhibitStringyEval]
+  
+  # Emulate something resembling CVS $Revision$
+  (our $Revision = $VERSION) =~ s{_}{};
+  $Revision = int $Revision * 10000;
+  
+  our $Filename = __FILE__;   # referenced outside MakeMaker
+  
+  our @ISA = qw(Exporter);
+  our @EXPORT    = qw(&WriteMakefile $Verbose &prompt);
+  our @EXPORT_OK = qw($VERSION &neatvalue &mkbootstrap &mksymlists
+                      &WriteEmptyMakefile);
+  
+  # These will go away once the last of the Win32 & VMS specific code is
+  # purged.
+  my $Is_VMS     = $^O eq 'VMS';
+  my $Is_Win32   = $^O eq 'MSWin32';
+  my $UNDER_CORE = $ENV{PERL_CORE};
+  
+  full_setup();
+  
+  require ExtUtils::MM;  # Things like CPAN assume loading ExtUtils::MakeMaker
+                         # will give them MM.
+  
+  require ExtUtils::MY;  # XXX pre-5.8 versions of ExtUtils::Embed expect
+                         # loading ExtUtils::MakeMaker will give them MY.
+                         # This will go when Embed is its own CPAN module.
+  
+  
+  sub WriteMakefile {
+      croak "WriteMakefile: Need even number of args" if @_ % 2;
+  
+      require ExtUtils::MY;
+      my %att = @_;
+  
+      _convert_compat_attrs(\%att);
+  
+      _verify_att(\%att);
+  
+      my $mm = MM->new(\%att);
+      $mm->flush;
+  
+      return $mm;
+  }
+  
+  
+  # Basic signatures of the attributes WriteMakefile takes.  Each is the
+  # reference type.  Empty value indicate it takes a non-reference
+  # scalar.
+  my %Att_Sigs;
+  my %Special_Sigs = (
+   AUTHOR             => 'ARRAY',
+   C                  => 'ARRAY',
+   CONFIG             => 'ARRAY',
+   CONFIGURE          => 'CODE',
+   DIR                => 'ARRAY',
+   DL_FUNCS           => 'HASH',
+   DL_VARS            => 'ARRAY',
+   EXCLUDE_EXT        => 'ARRAY',
+   EXE_FILES          => 'ARRAY',
+   FUNCLIST           => 'ARRAY',
+   H                  => 'ARRAY',
+   IMPORTS            => 'HASH',
+   INCLUDE_EXT        => 'ARRAY',
+   LIBS               => ['ARRAY',''],
+   MAN1PODS           => 'HASH',
+   MAN3PODS           => 'HASH',
+   META_ADD           => 'HASH',
+   META_MERGE         => 'HASH',
+   OBJECT             => ['ARRAY', ''],
+   PL_FILES           => 'HASH',
+   PM                 => 'HASH',
+   PMLIBDIRS          => 'ARRAY',
+   PMLIBPARENTDIRS    => 'ARRAY',
+   PREREQ_PM          => 'HASH',
+   BUILD_REQUIRES     => 'HASH',
+   CONFIGURE_REQUIRES => 'HASH',
+   TEST_REQUIRES      => 'HASH',
+   SKIP               => 'ARRAY',
+   TYPEMAPS           => 'ARRAY',
+   XS                 => 'HASH',
+   VERSION            => ['version',''],
+   _KEEP_AFTER_FLUSH  => '',
+  
+   clean      => 'HASH',
+   depend     => 'HASH',
+   dist       => 'HASH',
+   dynamic_lib=> 'HASH',
+   linkext    => 'HASH',
+   macro      => 'HASH',
+   postamble  => 'HASH',
+   realclean  => 'HASH',
+   test       => 'HASH',
+   tool_autosplit => 'HASH',
+  );
+  
+  @Att_Sigs{keys %Recognized_Att_Keys} = ('') x keys %Recognized_Att_Keys;
+  @Att_Sigs{keys %Special_Sigs} = values %Special_Sigs;
+  
+  sub _convert_compat_attrs { #result of running several times should be same
+      my($att) = @_;
+      if (exists $att->{AUTHOR}) {
+          if ($att->{AUTHOR}) {
+              if (!ref($att->{AUTHOR})) {
+                  my $t = $att->{AUTHOR};
+                  $att->{AUTHOR} = [$t];
+              }
+          } else {
+                  $att->{AUTHOR} = [];
+          }
+      }
+  }
+  
+  sub _verify_att {
+      my($att) = @_;
+  
+      while( my($key, $val) = each %$att ) {
+          my $sig = $Att_Sigs{$key};
+          unless( defined $sig ) {
+              warn "WARNING: $key is not a known parameter.\n";
+              next;
+          }
+  
+          my @sigs   = ref $sig ? @$sig : $sig;
+          my $given  = ref $val;
+          unless( grep { _is_of_type($val, $_) } @sigs ) {
+              my $takes = join " or ", map { _format_att($_) } @sigs;
+  
+              my $has = _format_att($given);
+              warn "WARNING: $key takes a $takes not a $has.\n".
+                   "         Please inform the author.\n";
+          }
+      }
+  }
+  
+  
+  # Check if a given thing is a reference or instance of $type
+  sub _is_of_type {
+      my($thing, $type) = @_;
+  
+      return 1 if ref $thing eq $type;
+  
+      local $SIG{__DIE__};
+      return 1 if eval{ $thing->isa($type) };
+  
+      return 0;
+  }
+  
+  
+  sub _format_att {
+      my $given = shift;
+  
+      return $given eq ''        ? "string/number"
+           : uc $given eq $given ? "$given reference"
+           :                       "$given object"
+           ;
+  }
+  
+  
+  sub prompt ($;$) {  ## no critic
+      my($mess, $def) = @_;
+      confess("prompt function called without an argument")
+          unless defined $mess;
+  
+      my $isa_tty = -t STDIN && (-t STDOUT || !(-f STDOUT || -c STDOUT)) ;
+  
+      my $dispdef = defined $def ? "[$def] " : " ";
+      $def = defined $def ? $def : "";
+  
+      local $|=1;
+      local $\;
+      print "$mess $dispdef";
+  
+      my $ans;
+      if ($ENV{PERL_MM_USE_DEFAULT} || (!$isa_tty && eof STDIN)) {
+          print "$def\n";
+      }
+      else {
+          $ans = <STDIN>;
+          if( defined $ans ) {
+              $ans =~ s{\015?\012$}{};
+          }
+          else { # user hit ctrl-D
+              print "\n";
+          }
+      }
+  
+      return (!defined $ans || $ans eq '') ? $def : $ans;
+  }
+  
+  sub eval_in_subdirs {
+      my($self) = @_;
+      use Cwd qw(cwd abs_path);
+      my $pwd = cwd() || die "Can't figure out your cwd!";
+  
+      local @INC = map eval {abs_path($_) if -e} || $_, @INC;
+      push @INC, '.';     # '.' has to always be at the end of @INC
+  
+      foreach my $dir (@{$self->{DIR}}){
+          my($abs) = $self->catdir($pwd,$dir);
+          eval { $self->eval_in_x($abs); };
+          last if $@;
+      }
+      chdir $pwd;
+      die $@ if $@;
+  }
+  
+  sub eval_in_x {
+      my($self,$dir) = @_;
+      chdir $dir or carp("Couldn't change to directory $dir: $!");
+  
+      {
+          package main;
+          do './Makefile.PL';
+      };
+      if ($@) {
+  #         if ($@ =~ /prerequisites/) {
+  #             die "MakeMaker WARNING: $@";
+  #         } else {
+  #             warn "WARNING from evaluation of $dir/Makefile.PL: $@";
+  #         }
+          die "ERROR from evaluation of $dir/Makefile.PL: $@";
+      }
+  }
+  
+  
+  # package name for the classes into which the first object will be blessed
+  my $PACKNAME = 'PACK000';
+  
+  sub full_setup {
+      $Verbose ||= 0;
+  
+      my @dep_macros = qw/
+      PERL_INCDEP        PERL_ARCHLIBDEP     PERL_ARCHIVEDEP
+      /;
+  
+      my @fs_macros = qw/
+      FULLPERL XSUBPPDIR
+  
+      INST_ARCHLIB INST_SCRIPT INST_BIN INST_LIB INST_MAN1DIR INST_MAN3DIR
+      INSTALLDIRS
+      DESTDIR PREFIX INSTALL_BASE
+      PERLPREFIX      SITEPREFIX      VENDORPREFIX
+      INSTALLPRIVLIB  INSTALLSITELIB  INSTALLVENDORLIB
+      INSTALLARCHLIB  INSTALLSITEARCH INSTALLVENDORARCH
+      INSTALLBIN      INSTALLSITEBIN  INSTALLVENDORBIN
+      INSTALLMAN1DIR          INSTALLMAN3DIR
+      INSTALLSITEMAN1DIR      INSTALLSITEMAN3DIR
+      INSTALLVENDORMAN1DIR    INSTALLVENDORMAN3DIR
+      INSTALLSCRIPT   INSTALLSITESCRIPT  INSTALLVENDORSCRIPT
+      PERL_LIB        PERL_ARCHLIB
+      SITELIBEXP      SITEARCHEXP
+  
+      MAKE LIBPERL_A LIB PERL_SRC PERL_INC
+      PPM_INSTALL_EXEC PPM_UNINSTALL_EXEC
+      PPM_INSTALL_SCRIPT PPM_UNINSTALL_SCRIPT
+      /;
+  
+      my @attrib_help = qw/
+  
+      AUTHOR ABSTRACT ABSTRACT_FROM BINARY_LOCATION
+      C CAPI CCFLAGS CONFIG CONFIGURE DEFINE DIR DISTNAME DISTVNAME
+      DL_FUNCS DL_VARS
+      EXCLUDE_EXT EXE_FILES FIRST_MAKEFILE
+      FULLPERLRUN FULLPERLRUNINST
+      FUNCLIST H IMPORTS
+  
+      INC INCLUDE_EXT LDFROM LIBS LICENSE
+      LINKTYPE MAKEAPERL MAKEFILE MAKEFILE_OLD MAN1PODS MAN3PODS MAP_TARGET
+      META_ADD META_MERGE MIN_PERL_VERSION BUILD_REQUIRES CONFIGURE_REQUIRES
+      MYEXTLIB NAME NEEDS_LINKING NOECHO NO_META NO_MYMETA NO_PACKLIST NO_PERLLOCAL
+      NORECURS NO_VC OBJECT OPTIMIZE PERL_MALLOC_OK PERL PERLMAINCC PERLRUN
+      PERLRUNINST PERL_CORE
+      PERM_DIR PERM_RW PERM_RWX MAGICXS
+      PL_FILES PM PM_FILTER PMLIBDIRS PMLIBPARENTDIRS POLLUTE
+      PREREQ_FATAL PREREQ_PM PREREQ_PRINT PRINT_PREREQ
+      SIGN SKIP TEST_REQUIRES TYPEMAPS UNINST VERSION VERSION_FROM XS XSOPT XSPROTOARG
+      XS_VERSION clean depend dist dynamic_lib linkext macro realclean
+      tool_autosplit
+  
+      MAN1EXT MAN3EXT
+  
+      MACPERL_SRC MACPERL_LIB MACLIBS_68K MACLIBS_PPC MACLIBS_SC MACLIBS_MRC
+      MACLIBS_ALL_68K MACLIBS_ALL_PPC MACLIBS_SHARED
+          /;
+      push @attrib_help, @fs_macros;
+      @macro_fsentity{@fs_macros, @dep_macros} = (1) x (@fs_macros+@dep_macros);
+      @macro_dep{@dep_macros} = (1) x @dep_macros;
+  
+      # IMPORTS is used under OS/2 and Win32
+  
+      # @Overridable is close to @MM_Sections but not identical.  The
+      # order is important. Many subroutines declare macros. These
+      # depend on each other. Let's try to collect the macros up front,
+      # then pasthru, then the rules.
+  
+      # MM_Sections are the sections we have to call explicitly
+      # in Overridable we have subroutines that are used indirectly
+  
+  
+      @MM_Sections =
+          qw(
+  
+   post_initialize const_config constants platform_constants
+   tool_autosplit tool_xsubpp tools_other
+  
+   makemakerdflt
+  
+   dist macro depend cflags const_loadlibs const_cccmd
+   post_constants
+  
+   pasthru
+  
+   special_targets
+   c_o xs_c xs_o
+   top_targets blibdirs linkext dlsyms dynamic_bs dynamic
+   dynamic_lib static static_lib manifypods processPL
+   installbin subdirs
+   clean_subdirs clean realclean_subdirs realclean
+   metafile signature
+   dist_basics dist_core distdir dist_test dist_ci distmeta distsignature
+   install force perldepend makefile staticmake test ppd
+  
+            ); # loses section ordering
+  
+      @Overridable = @MM_Sections;
+      push @Overridable, qw[
+  
+   libscan makeaperl needs_linking
+   subdir_x test_via_harness test_via_script
+  
+   init_VERSION init_dist init_INST init_INSTALL init_DEST init_dirscan
+   init_PM init_MANPODS init_xs init_PERL init_DIRFILESEP init_linker
+                           ];
+  
+      push @MM_Sections, qw[
+  
+   pm_to_blib selfdocument
+  
+                           ];
+  
+      # Postamble needs to be the last that was always the case
+      push @MM_Sections, "postamble";
+      push @Overridable, "postamble";
+  
+      # All sections are valid keys.
+      @Recognized_Att_Keys{@MM_Sections} = (1) x @MM_Sections;
+  
+      # we will use all these variables in the Makefile
+      @Get_from_Config =
+          qw(
+             ar cc cccdlflags ccdlflags dlext dlsrc exe_ext full_ar ld
+             lddlflags ldflags libc lib_ext obj_ext osname osvers ranlib
+             sitelibexp sitearchexp so
+            );
+  
+      # 5.5.3 doesn't have any concept of vendor libs
+      push @Get_from_Config, qw( vendorarchexp vendorlibexp ) if $] >= 5.006;
+  
+      foreach my $item (@attrib_help){
+          $Recognized_Att_Keys{$item} = 1;
+      }
+      foreach my $item (@Get_from_Config) {
+          $Recognized_Att_Keys{uc $item} = $Config{$item};
+          print "Attribute '\U$item\E' => '$Config{$item}'\n"
+              if ($Verbose >= 2);
+      }
+  
+      #
+      # When we eval a Makefile.PL in a subdirectory, that one will ask
+      # us (the parent) for the values and will prepend "..", so that
+      # all files to be installed end up below OUR ./blib
+      #
+      @Prepend_parent = qw(
+             INST_BIN INST_LIB INST_ARCHLIB INST_SCRIPT
+             MAP_TARGET INST_MAN1DIR INST_MAN3DIR PERL_SRC
+             PERL FULLPERL
+      );
+  }
+  
+  sub new {
+      my($class,$self) = @_;
+      my($key);
+  
+      _convert_compat_attrs($self) if defined $self && $self;
+  
+      # Store the original args passed to WriteMakefile()
+      foreach my $k (keys %$self) {
+          $self->{ARGS}{$k} = $self->{$k};
+      }
+  
+      $self = {} unless defined $self;
+  
+      # Temporarily bless it into MM so it can be used as an
+      # object.  It will be blessed into a temp package later.
+      bless $self, "MM";
+  
+      # Cleanup all the module requirement bits
+      for my $key (qw(PREREQ_PM BUILD_REQUIRES CONFIGURE_REQUIRES TEST_REQUIRES)) {
+          $self->{$key}      ||= {};
+          $self->clean_versions( $key );
+      }
+  
+  
+      if ("@ARGV" =~ /\bPREREQ_PRINT\b/) {
+          $self->_PREREQ_PRINT;
+      }
+  
+      # PRINT_PREREQ is RedHatism.
+      if ("@ARGV" =~ /\bPRINT_PREREQ\b/) {
+          $self->_PRINT_PREREQ;
+     }
+  
+      print "MakeMaker (v$VERSION)\n" if $Verbose;
+      if (-f "MANIFEST" && ! -f "Makefile" && ! $ENV{PERL_CORE}){
+          check_manifest();
+      }
+  
+      check_hints($self);
+  
+      if ( defined $self->{MIN_PERL_VERSION}
+            && $self->{MIN_PERL_VERSION} !~ /^v?[\d_\.]+$/ ) {
+        require version;
+        my $normal = eval {
+          local $SIG{__WARN__} = sub {
+              # simulate "use warnings FATAL => 'all'" for vintage perls
+              die @_;
+          };
+          version->new( $self->{MIN_PERL_VERSION} )
+        };
+        $self->{MIN_PERL_VERSION} = $normal if defined $normal && !$@;
+      }
+  
+      # Translate X.Y.Z to X.00Y00Z
+      if( defined $self->{MIN_PERL_VERSION} ) {
+          $self->{MIN_PERL_VERSION} =~ s{ ^v? (\d+) \. (\d+) \. (\d+) $ }
+                                        {sprintf "%d.%03d%03d", $1, $2, $3}ex;
+      }
+  
+      my $perl_version_ok = eval {
+          local $SIG{__WARN__} = sub {
+              # simulate "use warnings FATAL => 'all'" for vintage perls
+              die @_;
+          };
+          !$self->{MIN_PERL_VERSION} or $self->{MIN_PERL_VERSION} <= $]
+      };
+      if (!$perl_version_ok) {
+          if (!defined $perl_version_ok) {
+              die <<'END';
+  Warning: MIN_PERL_VERSION is not in a recognized format.
+  Recommended is a quoted numerical value like '5.005' or '5.008001'.
+  END
+          }
+          elsif ($self->{PREREQ_FATAL}) {
+              die sprintf <<"END", $self->{MIN_PERL_VERSION}, $];
+  MakeMaker FATAL: perl version too low for this distribution.
+  Required is %s. We run %s.
+  END
+          }
+          else {
+              warn sprintf
+                  "Warning: Perl version %s or higher required. We run %s.\n",
+                  $self->{MIN_PERL_VERSION}, $];
+          }
+      }
+  
+      my %configure_att;         # record &{$self->{CONFIGURE}} attributes
+      my(%initial_att) = %$self; # record initial attributes
+  
+      my(%unsatisfied) = ();
+      my $prereqs = $self->_all_prereqs;
+      foreach my $prereq (sort keys %$prereqs) {
+          my $required_version = $prereqs->{$prereq};
+  
+          my $pr_version = 0;
+          my $installed_file;
+  
+          if ( $prereq eq 'perl' ) {
+            if ( defined $required_version && $required_version =~ /^v?[\d_\.]+$/
+                 || $required_version !~ /^v?[\d_\.]+$/ ) {
+              require version;
+              my $normal = eval { version->new( $required_version ) };
+              $required_version = $normal if defined $normal;
+            }
+            $installed_file = $prereq;
+            $pr_version = $];
+          }
+          else {
+            $installed_file = MM->_installed_file_for_module($prereq);
+            $pr_version = MM->parse_version($installed_file) if $installed_file;
+            $pr_version = 0 if $pr_version eq 'undef';
+          }
+  
+          # convert X.Y_Z alpha version #s to X.YZ for easier comparisons
+          $pr_version =~ s/(\d+)\.(\d+)_(\d+)/$1.$2$3/;
+  
+          if (!$installed_file) {
+              warn sprintf "Warning: prerequisite %s %s not found.\n",
+                $prereq, $required_version
+                     unless $self->{PREREQ_FATAL}
+                         or $ENV{PERL_CORE};
+  
+              $unsatisfied{$prereq} = 'not installed';
+          }
+          elsif ($pr_version < $required_version ){
+              warn sprintf "Warning: prerequisite %s %s not found. We have %s.\n",
+                $prereq, $required_version, ($pr_version || 'unknown version')
+                    unless $self->{PREREQ_FATAL}
+                         or $ENV{PERL_CORE};
+  
+              $unsatisfied{$prereq} = $required_version ? $required_version : 'unknown version' ;
+          }
+      }
+  
+      if (%unsatisfied && $self->{PREREQ_FATAL}){
+          my $failedprereqs = join "\n", map {"    $_ $unsatisfied{$_}"}
+                              sort { $a cmp $b } keys %unsatisfied;
+          die <<"END";
+  MakeMaker FATAL: prerequisites not found.
+  $failedprereqs
+  
+  Please install these modules first and rerun 'perl Makefile.PL'.
+  END
+      }
+  
+      if (defined $self->{CONFIGURE}) {
+          if (ref $self->{CONFIGURE} eq 'CODE') {
+              %configure_att = %{&{$self->{CONFIGURE}}};
+              _convert_compat_attrs(\%configure_att);
+              $self = { %$self, %configure_att };
+          } else {
+              croak "Attribute 'CONFIGURE' to WriteMakefile() not a code reference\n";
+          }
+      }
+  
+      # This is for old Makefiles written pre 5.00, will go away
+      if ( Carp::longmess("") =~ /runsubdirpl/s ){
+          carp("WARNING: Please rerun 'perl Makefile.PL' to regenerate your Makefiles\n");
+      }
+  
+      my $newclass = ++$PACKNAME;
+      local @Parent = @Parent;    # Protect against non-local exits
+      {
+          print "Blessing Object into class [$newclass]\n" if $Verbose>=2;
+          mv_all_methods("MY",$newclass);
+          bless $self, $newclass;
+          push @Parent, $self;
+          require ExtUtils::MY;
+  
+          no strict 'refs';   ## no critic;
+          @{"$newclass\:\:ISA"} = 'MM';
+      }
+  
+      if (defined $Parent[-2]){
+          $self->{PARENT} = $Parent[-2];
+          for my $key (@Prepend_parent) {
+              next unless defined $self->{PARENT}{$key};
+  
+              # Don't stomp on WriteMakefile() args.
+              next if defined $self->{ARGS}{$key} and
+                      $self->{ARGS}{$key} eq $self->{$key};
+  
+              $self->{$key} = $self->{PARENT}{$key};
+  
+              if ($Is_VMS && $key =~ /PERL$/) {
+                  # PERL or FULLPERL will be a command verb or even a
+                  # command with an argument instead of a full file
+                  # specification under VMS.  So, don't turn the command
+                  # into a filespec, but do add a level to the path of
+                  # the argument if not already absolute.
+                  my @cmd = split /\s+/, $self->{$key};
+                  $cmd[1] = $self->catfile('[-]',$cmd[1])
+                    unless (@cmd < 2) || $self->file_name_is_absolute($cmd[1]);
+                  $self->{$key} = join(' ', @cmd);
+              } else {
+                  my $value = $self->{$key};
+                  # not going to test in FS so only stripping start
+                  $value =~ s/^"// if $key =~ /PERL$/;
+                  $value = $self->catdir("..", $value)
+                    unless $self->file_name_is_absolute($value);
+                  $value = qq{"$value} if $key =~ /PERL$/;
+                  $self->{$key} = $value;
+              }
+          }
+          if ($self->{PARENT}) {
+              $self->{PARENT}->{CHILDREN}->{$newclass} = $self;
+              foreach my $opt (qw(POLLUTE PERL_CORE LINKTYPE LD OPTIMIZE)) {
+                  if (exists $self->{PARENT}->{$opt}
+                      and not exists $self->{$opt})
+                      {
+                          # inherit, but only if already unspecified
+                          $self->{$opt} = $self->{PARENT}->{$opt};
+                      }
+              }
+          }
+          my @fm = grep /^FIRST_MAKEFILE=/, @ARGV;
+          parse_args($self,@fm) if @fm;
+      }
+      else {
+          parse_args($self, _shellwords($ENV{PERL_MM_OPT} || ''),@ARGV);
+      }
+  
+      # RT#91540 PREREQ_FATAL not recognized on command line
+      if (%unsatisfied && $self->{PREREQ_FATAL}){
+          my $failedprereqs = join "\n", map {"    $_ $unsatisfied{$_}"}
+                              sort { $a cmp $b } keys %unsatisfied;
+          die <<"END";
+  MakeMaker FATAL: prerequisites not found.
+  $failedprereqs
+  
+  Please install these modules first and rerun 'perl Makefile.PL'.
+  END
+      }
+  
+      $self->{NAME} ||= $self->guess_name;
+  
+      warn "Warning: NAME must be a package name\n"
+        unless $self->{NAME} =~ m!^[A-Z_a-z][0-9A-Z_a-z]*(?:::[0-9A-Z_a-z]+)*$!;
+  
+      ($self->{NAME_SYM} = $self->{NAME}) =~ s/\W+/_/g;
+  
+      $self->init_MAKE;
+      $self->init_main;
+      $self->init_VERSION;
+      $self->init_dist;
+      $self->init_INST;
+      $self->init_INSTALL;
+      $self->init_DEST;
+      $self->init_dirscan;
+      $self->init_PM;
+      $self->init_MANPODS;
+      $self->init_xs;
+      $self->init_PERL;
+      $self->init_DIRFILESEP;
+      $self->init_linker;
+      $self->init_ABSTRACT;
+  
+      $self->arch_check(
+          $INC{'Config.pm'},
+          $self->catfile($Config{'archlibexp'}, "Config.pm")
+      );
+  
+      $self->init_tools();
+      $self->init_others();
+      $self->init_platform();
+      $self->init_PERM();
+      my($argv) = neatvalue(\@ARGV);
+      $argv =~ s/^\[/(/;
+      $argv =~ s/\]$/)/;
+  
+      push @{$self->{RESULT}}, <<END;
+  # This Makefile is for the $self->{NAME} extension to perl.
+  #
+  # It was generated automatically by MakeMaker version
+  # $VERSION (Revision: $Revision) from the contents of
+  # Makefile.PL. Don't edit this file, edit Makefile.PL instead.
+  #
+  #       ANY CHANGES MADE HERE WILL BE LOST!
+  #
+  #   MakeMaker ARGV: $argv
+  #
+  END
+  
+      push @{$self->{RESULT}}, $self->_MakeMaker_Parameters_section(\%initial_att);
+  
+      if (defined $self->{CONFIGURE}) {
+         push @{$self->{RESULT}}, <<END;
+  
+  #   MakeMaker 'CONFIGURE' Parameters:
+  END
+          if (scalar(keys %configure_att) > 0) {
+              foreach my $key (sort keys %configure_att){
+                 next if $key eq 'ARGS';
+                 my($v) = neatvalue($configure_att{$key});
+                 $v =~ s/(CODE|HASH|ARRAY|SCALAR)\([\dxa-f]+\)/$1\(...\)/;
+                 $v =~ tr/\n/ /s;
+                 push @{$self->{RESULT}}, "#     $key => $v";
+              }
+          }
+          else
+          {
+             push @{$self->{RESULT}}, "# no values returned";
+          }
+          undef %configure_att;  # free memory
+      }
+  
+      # turn the SKIP array into a SKIPHASH hash
+      for my $skip (@{$self->{SKIP} || []}) {
+          $self->{SKIPHASH}{$skip} = 1;
+      }
+      delete $self->{SKIP}; # free memory
+  
+      if ($self->{PARENT}) {
+          for (qw/install dist dist_basics dist_core distdir dist_test dist_ci/) {
+              $self->{SKIPHASH}{$_} = 1;
+          }
+      }
+  
+      # We run all the subdirectories now. They don't have much to query
+      # from the parent, but the parent has to query them: if they need linking!
+      unless ($self->{NORECURS}) {
+          $self->eval_in_subdirs if @{$self->{DIR}};
+      }
+  
+      foreach my $section ( @MM_Sections ){
+          # Support for new foo_target() methods.
+          my $method = $section;
+          $method .= '_target' unless $self->can($method);
+  
+          print "Processing Makefile '$section' section\n" if ($Verbose >= 2);
+          my($skipit) = $self->skipcheck($section);
+          if ($skipit){
+              push @{$self->{RESULT}}, "\n# --- MakeMaker $section section $skipit.";
+          } else {
+              my(%a) = %{$self->{$section} || {}};
+              push @{$self->{RESULT}}, "\n# --- MakeMaker $section section:";
+              push @{$self->{RESULT}}, "# " . join ", ", %a if $Verbose && %a;
+              push @{$self->{RESULT}}, $self->maketext_filter(
+                  $self->$method( %a )
+              );
+          }
+      }
+  
+      push @{$self->{RESULT}}, "\n# End.";
+  
+      $self;
+  }
+  
+  sub WriteEmptyMakefile {
+      croak "WriteEmptyMakefile: Need an even number of args" if @_ % 2;
+  
+      my %att = @_;
+      my $self = MM->new(\%att);
+  
+      my $new = $self->{MAKEFILE};
+      my $old = $self->{MAKEFILE_OLD};
+      if (-f $old) {
+          _unlink($old) or warn "unlink $old: $!";
+      }
+      if ( -f $new ) {
+          _rename($new, $old) or warn "rename $new => $old: $!"
+      }
+      open my $mfh, '>', $new or die "open $new for write: $!";
+      print $mfh <<'EOP';
+  all :
+  
+  clean :
+  
+  install :
+  
+  makemakerdflt :
+  
+  test :
+  
+  EOP
+      close $mfh or die "close $new for write: $!";
+  }
+  
+  
+  =begin private
+  
+  =head3 _installed_file_for_module
+  
+    my $file = MM->_installed_file_for_module($module);
+  
+  Return the first installed .pm $file associated with the $module.  The
+  one which will show up when you C<use $module>.
+  
+  $module is something like "strict" or "Test::More".
+  
+  =end private
+  
+  =cut
+  
+  sub _installed_file_for_module {
+      my $class  = shift;
+      my $prereq = shift;
+  
+      my $file = "$prereq.pm";
+      $file =~ s{::}{/}g;
+  
+      my $path;
+      for my $dir (@INC) {
+          my $tmp = File::Spec->catfile($dir, $file);
+          if ( -r $tmp ) {
+              $path = $tmp;
+              last;
+          }
+      }
+  
+      return $path;
+  }
+  
+  
+  # Extracted from MakeMaker->new so we can test it
+  sub _MakeMaker_Parameters_section {
+      my $self = shift;
+      my $att  = shift;
+  
+      my @result = <<'END';
+  #   MakeMaker Parameters:
+  END
+  
+      foreach my $key (sort keys %$att){
+          next if $key eq 'ARGS';
+          my $v;
+          if ($key eq 'PREREQ_PM') {
+              # CPAN.pm takes prereqs from this field in 'Makefile'
+              # and does not know about BUILD_REQUIRES
+              $v = neatvalue({
+                  %{ $att->{PREREQ_PM} || {} },
+                  %{ $att->{BUILD_REQUIRES} || {} },
+                  %{ $att->{TEST_REQUIRES} || {} },
+              });
+          } else {
+              $v = neatvalue($att->{$key});
+          }
+  
+          $v =~ s/(CODE|HASH|ARRAY|SCALAR)\([\dxa-f]+\)/$1\(...\)/;
+          $v =~ tr/\n/ /s;
+          push @result, "#     $key => $v";
+      }
+  
+      return @result;
+  }
+  
+  # _shellwords and _parseline borrowed from Text::ParseWords
+  sub _shellwords {
+      my (@lines) = @_;
+      my @allwords;
+  
+      foreach my $line (@lines) {
+        $line =~ s/^\s+//;
+        my @words = _parse_line('\s+', 0, $line);
+        pop @words if (@words and !defined $words[-1]);
+        return() unless (@words || !length($line));
+        push(@allwords, @words);
+      }
+      return(@allwords);
+  }
+  
+  sub _parse_line {
+      my($delimiter, $keep, $line) = @_;
+      my($word, @pieces);
+  
+      no warnings 'uninitialized';  # we will be testing undef strings
+  
+      while (length($line)) {
+          # This pattern is optimised to be stack conservative on older perls.
+          # Do not refactor without being careful and testing it on very long strings.
+          # See Perl bug #42980 for an example of a stack busting input.
+          $line =~ s/^
+                      (?:
+                          # double quoted string
+                          (")                             # $quote
+                          ((?>[^\\"]*(?:\\.[^\\"]*)*))"   # $quoted
+          | # --OR--
+                          # singe quoted string
+                          (')                             # $quote
+                          ((?>[^\\']*(?:\\.[^\\']*)*))'   # $quoted
+                      |   # --OR--
+                          # unquoted string
+              (                               # $unquoted
+                              (?:\\.|[^\\"'])*?
+                          )
+                          # followed by
+              (                               # $delim
+                              \Z(?!\n)                    # EOL
+                          |   # --OR--
+                              (?-x:$delimiter)            # delimiter
+                          |   # --OR--
+                              (?!^)(?=["'])               # a quote
+                          )
+          )//xs or return;    # extended layout
+          my ($quote, $quoted, $unquoted, $delim) = (($1 ? ($1,$2) : ($3,$4)), $5, $6);
+  
+  
+    return() unless( defined($quote) || length($unquoted) || length($delim));
+  
+          if ($keep) {
+        $quoted = "$quote$quoted$quote";
+    }
+          else {
+        $unquoted =~ s/\\(.)/$1/sg;
+        if (defined $quote) {
+      $quoted =~ s/\\(.)/$1/sg if ($quote eq '"');
+      #$quoted =~ s/\\([\\'])/$1/g if ( $PERL_SINGLE_QUOTE && $quote eq "'");
+              }
+    }
+          $word .= substr($line, 0, 0); # leave results tainted
+          $word .= defined $quote ? $quoted : $unquoted;
+  
+          if (length($delim)) {
+              push(@pieces, $word);
+              push(@pieces, $delim) if ($keep eq 'delimiters');
+              undef $word;
+          }
+          if (!length($line)) {
+              push(@pieces, $word);
+    }
+      }
+      return(@pieces);
+  }
+  
+  sub check_manifest {
+      print "Checking if your kit is complete...\n";
+      require ExtUtils::Manifest;
+      # avoid warning
+      $ExtUtils::Manifest::Quiet = $ExtUtils::Manifest::Quiet = 1;
+      my(@missed) = ExtUtils::Manifest::manicheck();
+      if (@missed) {
+          print "Warning: the following files are missing in your kit:\n";
+          print "\t", join "\n\t", @missed;
+          print "\n";
+          print "Please inform the author.\n";
+      } else {
+          print "Looks good\n";
+      }
+  }
+  
+  sub parse_args{
+      my($self, @args) = @_;
+      @args = map { Encode::decode(locale => $_) } @args if $CAN_DECODE;
+      foreach (@args) {
+          unless (m/(.*?)=(.*)/) {
+              ++$Verbose if m/^verb/;
+              next;
+          }
+          my($name, $value) = ($1, $2);
+          if ($value =~ m/^~(\w+)?/) { # tilde with optional username
+              $value =~ s [^~(\w*)]
+                  [$1 ?
+                   ((getpwnam($1))[7] || "~$1") :
+                   (getpwuid($>))[7]
+                   ]ex;
+          }
+  
+          # Remember the original args passed it.  It will be useful later.
+          $self->{ARGS}{uc $name} = $self->{uc $name} = $value;
+      }
+  
+      # catch old-style 'potential_libs' and inform user how to 'upgrade'
+      if (defined $self->{potential_libs}){
+          my($msg)="'potential_libs' => '$self->{potential_libs}' should be";
+          if ($self->{potential_libs}){
+              print "$msg changed to:\n\t'LIBS' => ['$self->{potential_libs}']\n";
+          } else {
+              print "$msg deleted.\n";
+          }
+          $self->{LIBS} = [$self->{potential_libs}];
+          delete $self->{potential_libs};
+      }
+      # catch old-style 'ARMAYBE' and inform user how to 'upgrade'
+      if (defined $self->{ARMAYBE}){
+          my($armaybe) = $self->{ARMAYBE};
+          print "ARMAYBE => '$armaybe' should be changed to:\n",
+                          "\t'dynamic_lib' => {ARMAYBE => '$armaybe'}\n";
+          my(%dl) = %{$self->{dynamic_lib} || {}};
+          $self->{dynamic_lib} = { %dl, ARMAYBE => $armaybe};
+          delete $self->{ARMAYBE};
+      }
+      if (defined $self->{LDTARGET}){
+          print "LDTARGET should be changed to LDFROM\n";
+          $self->{LDFROM} = $self->{LDTARGET};
+          delete $self->{LDTARGET};
+      }
+      # Turn a DIR argument on the command line into an array
+      if (defined $self->{DIR} && ref \$self->{DIR} eq 'SCALAR') {
+          # So they can choose from the command line, which extensions they want
+          # the grep enables them to have some colons too much in case they
+          # have to build a list with the shell
+          $self->{DIR} = [grep $_, split ":", $self->{DIR}];
+      }
+      # Turn a INCLUDE_EXT argument on the command line into an array
+      if (defined $self->{INCLUDE_EXT} && ref \$self->{INCLUDE_EXT} eq 'SCALAR') {
+          $self->{INCLUDE_EXT} = [grep $_, split '\s+', $self->{INCLUDE_EXT}];
+      }
+      # Turn a EXCLUDE_EXT argument on the command line into an array
+      if (defined $self->{EXCLUDE_EXT} && ref \$self->{EXCLUDE_EXT} eq 'SCALAR') {
+          $self->{EXCLUDE_EXT} = [grep $_, split '\s+', $self->{EXCLUDE_EXT}];
+      }
+  
+      foreach my $mmkey (sort keys %$self){
+          next if $mmkey eq 'ARGS';
+          print "  $mmkey => ", neatvalue($self->{$mmkey}), "\n" if $Verbose;
+          print "'$mmkey' is not a known MakeMaker parameter name.\n"
+              unless exists $Recognized_Att_Keys{$mmkey};
+      }
+      $| = 1 if $Verbose;
+  }
+  
+  sub check_hints {
+      my($self) = @_;
+      # We allow extension-specific hints files.
+  
+      require File::Spec;
+      my $curdir = File::Spec->curdir;
+  
+      my $hint_dir = File::Spec->catdir($curdir, "hints");
+      return unless -d $hint_dir;
+  
+      # First we look for the best hintsfile we have
+      my($hint)="${^O}_$Config{osvers}";
+      $hint =~ s/\./_/g;
+      $hint =~ s/_$//;
+      return unless $hint;
+  
+      # Also try without trailing minor version numbers.
+      while (1) {
+          last if -f File::Spec->catfile($hint_dir, "$hint.pl");  # found
+      } continue {
+          last unless $hint =~ s/_[^_]*$//; # nothing to cut off
+      }
+      my $hint_file = File::Spec->catfile($hint_dir, "$hint.pl");
+  
+      return unless -f $hint_file;    # really there
+  
+      _run_hintfile($self, $hint_file);
+  }
+  
+  sub _run_hintfile {
+      our $self;
+      local($self) = shift;       # make $self available to the hint file.
+      my($hint_file) = shift;
+  
+      local($@, $!);
+      warn "Processing hints file $hint_file\n";
+  
+      # Just in case the ./ isn't on the hint file, which File::Spec can
+      # often strip off, we bung the curdir into @INC
+      local @INC = (File::Spec->curdir, @INC);
+      my $ret = do $hint_file;
+      if( !defined $ret ) {
+          my $error = $@ || $!;
+          warn $error;
+      }
+  }
+  
+  sub mv_all_methods {
+      my($from,$to) = @_;
+  
+      # Here you see the *current* list of methods that are overridable
+      # from Makefile.PL via MY:: subroutines. As of VERSION 5.07 I'm
+      # still trying to reduce the list to some reasonable minimum --
+      # because I want to make it easier for the user. A.K.
+  
+      local $SIG{__WARN__} = sub {
+          # can't use 'no warnings redefined', 5.6 only
+          warn @_ unless $_[0] =~ /^Subroutine .* redefined/
+      };
+      foreach my $method (@Overridable) {
+  
+          # We cannot say "next" here. Nick might call MY->makeaperl
+          # which isn't defined right now
+  
+          # Above statement was written at 4.23 time when Tk-b8 was
+          # around. As Tk-b9 only builds with 5.002something and MM 5 is
+          # standard, we try to enable the next line again. It was
+          # commented out until MM 5.23
+  
+          next unless defined &{"${from}::$method"};
+  
+          {
+              no strict 'refs';   ## no critic
+              *{"${to}::$method"} = \&{"${from}::$method"};
+  
+              # If we delete a method, then it will be undefined and cannot
+              # be called.  But as long as we have Makefile.PLs that rely on
+              # %MY:: being intact, we have to fill the hole with an
+              # inheriting method:
+  
+              {
+                  package MY;
+                  my $super = "SUPER::".$method;
+                  *{$method} = sub {
+                      shift->$super(@_);
+                  };
+              }
+          }
+      }
+  
+      # We have to clean out %INC also, because the current directory is
+      # changed frequently and Graham Barr prefers to get his version
+      # out of a History.pl file which is "required" so wouldn't get
+      # loaded again in another extension requiring a History.pl
+  
+      # With perl5.002_01 the deletion of entries in %INC caused Tk-b11
+      # to core dump in the middle of a require statement. The required
+      # file was Tk/MMutil.pm.  The consequence is, we have to be
+      # extremely careful when we try to give perl a reason to reload a
+      # library with same name.  The workaround prefers to drop nothing
+      # from %INC and teach the writers not to use such libraries.
+  
+  #    my $inc;
+  #    foreach $inc (keys %INC) {
+  #       #warn "***$inc*** deleted";
+  #       delete $INC{$inc};
+  #    }
+  }
+  
+  sub skipcheck {
+      my($self) = shift;
+      my($section) = @_;
+      if ($section eq 'dynamic') {
+          print "Warning (non-fatal): Target 'dynamic' depends on targets ",
+          "in skipped section 'dynamic_bs'\n"
+              if $self->{SKIPHASH}{dynamic_bs} && $Verbose;
+          print "Warning (non-fatal): Target 'dynamic' depends on targets ",
+          "in skipped section 'dynamic_lib'\n"
+              if $self->{SKIPHASH}{dynamic_lib} && $Verbose;
+      }
+      if ($section eq 'dynamic_lib') {
+          print "Warning (non-fatal): Target '\$(INST_DYNAMIC)' depends on ",
+          "targets in skipped section 'dynamic_bs'\n"
+              if $self->{SKIPHASH}{dynamic_bs} && $Verbose;
+      }
+      if ($section eq 'static') {
+          print "Warning (non-fatal): Target 'static' depends on targets ",
+          "in skipped section 'static_lib'\n"
+              if $self->{SKIPHASH}{static_lib} && $Verbose;
+      }
+      return 'skipped' if $self->{SKIPHASH}{$section};
+      return '';
+  }
+  
+  sub flush {
+      my $self = shift;
+  
+      # This needs a bit more work for more wacky OSen
+      my $type = 'Unix-style';
+      if ( $self->os_flavor_is('Win32') ) {
+        my $make = $self->make;
+        $make = +( File::Spec->splitpath( $make ) )[-1];
+        $make =~ s!\.exe$!!i;
+        $type = $make . '-style';
+      }
+      elsif ( $Is_VMS ) {
+          $type = $Config{make} . '-style';
+      }
+  
+      my $finalname = $self->{MAKEFILE};
+      print "Generating a $type $finalname\n";
+      print "Writing $finalname for $self->{NAME}\n";
+  
+      unlink($finalname, "MakeMaker.tmp", $Is_VMS ? 'Descrip.MMS' : ());
+      open(my $fh,">", "MakeMaker.tmp")
+          or die "Unable to open MakeMaker.tmp: $!";
+      binmode $fh, ':encoding(locale)' if $CAN_DECODE;
+  
+      for my $chunk (@{$self->{RESULT}}) {
+          my $to_write = "$chunk\n";
+          if (!$CAN_DECODE && $] > 5.008) {
+              utf8::encode $to_write;
+          }
+          print $fh "$chunk\n"
+              or die "Can't write to MakeMaker.tmp: $!";
+      }
+  
+      close $fh
+          or die "Can't write to MakeMaker.tmp: $!";
+      _rename("MakeMaker.tmp", $finalname) or
+        warn "rename MakeMaker.tmp => $finalname: $!";
+      chmod 0644, $finalname unless $Is_VMS;
+  
+      unless ($self->{NO_MYMETA}) {
+          # Write MYMETA.yml to communicate metadata up to the CPAN clients
+          if ( $self->write_mymeta( $self->mymeta ) ) {
+              print "Writing MYMETA.yml and MYMETA.json\n";
+          }
+  
+      }
+      my %keep = map { ($_ => 1) } qw(NEEDS_LINKING HAS_LINK_CODE);
+      if ($self->{PARENT} && !$self->{_KEEP_AFTER_FLUSH}) {
+          foreach (keys %$self) { # safe memory
+              delete $self->{$_} unless $keep{$_};
+          }
+      }
+  
+      system("$Config::Config{eunicefix} $finalname") unless $Config::Config{eunicefix} eq ":";
+  }
+  
+  # This is a rename for OS's where the target must be unlinked first.
+  sub _rename {
+      my($src, $dest) = @_;
+      chmod 0666, $dest;
+      unlink $dest;
+      return rename $src, $dest;
+  }
+  
+  # This is an unlink for OS's where the target must be writable first.
+  sub _unlink {
+      my @files = @_;
+      chmod 0666, @files;
+      return unlink @files;
+  }
+  
+  
+  # The following mkbootstrap() is only for installations that are calling
+  # the pre-4.1 mkbootstrap() from their old Makefiles. This MakeMaker
+  # writes Makefiles, that use ExtUtils::Mkbootstrap directly.
+  sub mkbootstrap {
+      die <<END;
+  !!! Your Makefile has been built such a long time ago, !!!
+  !!! that is unlikely to work with current MakeMaker.   !!!
+  !!! Please rebuild your Makefile                       !!!
+  END
+  }
+  
+  # Ditto for mksymlists() as of MakeMaker 5.17
+  sub mksymlists {
+      die <<END;
+  !!! Your Makefile has been built such a long time ago, !!!
+  !!! that is unlikely to work with current MakeMaker.   !!!
+  !!! Please rebuild your Makefile                       !!!
+  END
+  }
+  
+  sub neatvalue {
+      my($v) = @_;
+      return "undef" unless defined $v;
+      my($t) = ref $v;
+      return "q[$v]" unless $t;
+      if ($t eq 'ARRAY') {
+          my(@m, @neat);
+          push @m, "[";
+          foreach my $elem (@$v) {
+              push @neat, "q[$elem]";
+          }
+          push @m, join ", ", @neat;
+          push @m, "]";
+          return join "", @m;
+      }
+      return $v unless $t eq 'HASH';
+      my(@m, $key, $val);
+      for my $key (sort keys %$v) {
+          last unless defined $key; # cautious programming in case (undef,undef) is true
+          push @m,"$key=>".neatvalue($v->{$key});
+      }
+      return "{ ".join(', ',@m)." }";
+  }
+  
+  sub _find_magic_vstring {
+      my $value = shift;
+      return $value if $UNDER_CORE;
+      my $tvalue = '';
+      require B;
+      my $sv = B::svref_2object(\$value);
+      my $magic = ref($sv) eq 'B::PVMG' ? $sv->MAGIC : undef;
+      while ( $magic ) {
+          if ( $magic->TYPE eq 'V' ) {
+              $tvalue = $magic->PTR;
+              $tvalue =~ s/^v?(.+)$/v$1/;
+              last;
+          }
+          else {
+              $magic = $magic->MOREMAGIC;
+          }
+      }
+      return $tvalue;
+  }
+  
+  
+  # Look for weird version numbers, warn about them and set them to 0
+  # before CPAN::Meta chokes.
+  sub clean_versions {
+      my($self, $key) = @_;
+      my $reqs = $self->{$key};
+      for my $module (keys %$reqs) {
+          my $v = $reqs->{$module};
+          my $printable = _find_magic_vstring($v);
+          $v = $printable if length $printable;
+          my $version = eval {
+              local $SIG{__WARN__} = sub {
+                # simulate "use warnings FATAL => 'all'" for vintage perls
+                die @_;
+              };
+              version->new($v)->stringify;
+          };
+          if( $@ || $reqs->{$module} eq '' ) {
+              if ( $] < 5.008 && $v !~ /^v?[\d_\.]+$/ ) {
+                 $v = sprintf "v%vd", $v unless $v eq '';
+              }
+              carp "Unparsable version '$v' for prerequisite $module";
+              $reqs->{$module} = 0;
+          }
+          else {
+              $reqs->{$module} = $version;
+          }
+      }
+  }
+  
+  sub selfdocument {
+      my($self) = @_;
+      my(@m);
+      if ($Verbose){
+          push @m, "\n# Full list of MakeMaker attribute values:";
+          foreach my $key (sort keys %$self){
+              next if $key eq 'RESULT' || $key =~ /^[A-Z][a-z]/;
+              my($v) = neatvalue($self->{$key});
+              $v =~ s/(CODE|HASH|ARRAY|SCALAR)\([\dxa-f]+\)/$1\(...\)/;
+              $v =~ tr/\n/ /s;
+              push @m, "# $key => $v";
+          }
+      }
+      join "\n", @m;
+  }
+  
+  1;
+  
+  __END__
+  
+  =head1 NAME
+  
+  ExtUtils::MakeMaker - Create a module Makefile
+  
+  =head1 SYNOPSIS
+  
+    use ExtUtils::MakeMaker;
+  
+    WriteMakefile(
+        NAME              => "Foo::Bar",
+        VERSION_FROM      => "lib/Foo/Bar.pm",
+    );
+  
+  =head1 DESCRIPTION
+  
+  This utility is designed to write a Makefile for an extension module
+  from a Makefile.PL. It is based on the Makefile.SH model provided by
+  Andy Dougherty and the perl5-porters.
+  
+  It splits the task of generating the Makefile into several subroutines
+  that can be individually overridden.  Each subroutine returns the text
+  it wishes to have written to the Makefile.
+  
+  As there are various Make programs with incompatible syntax, which
+  use operating system shells, again with incompatible syntax, it is
+  important for users of this module to know which flavour of Make
+  a Makefile has been written for so they'll use the correct one and
+  won't have to face the possibly bewildering errors resulting from
+  using the wrong one.
+  
+  On POSIX systems, that program will likely be GNU Make; on Microsoft
+  Windows, it will be either Microsoft NMake, DMake or GNU Make.
+  See the section on the L</"MAKE"> parameter for details.
+  
+  ExtUtils::MakeMaker (EUMM) is object oriented. Each directory below the current
+  directory that contains a Makefile.PL is treated as a separate
+  object. This makes it possible to write an unlimited number of
+  Makefiles with a single invocation of WriteMakefile().
+  
+  All inputs to WriteMakefile are Unicode characters, not just octets. EUMM
+  seeks to handle all of these correctly. It is currently still not possible
+  to portably use Unicode characters in module names, because this requires
+  Perl to handle Unicode filenames, which is not yet the case on Windows.
+  
+  =head2 How To Write A Makefile.PL
+  
+  See L<ExtUtils::MakeMaker::Tutorial>.
+  
+  The long answer is the rest of the manpage :-)
+  
+  =head2 Default Makefile Behaviour
+  
+  The generated Makefile enables the user of the extension to invoke
+  
+    perl Makefile.PL # optionally "perl Makefile.PL verbose"
+    make
+    make test        # optionally set TEST_VERBOSE=1
+    make install     # See below
+  
+  The Makefile to be produced may be altered by adding arguments of the
+  form C<KEY=VALUE>. E.g.
+  
+    perl Makefile.PL INSTALL_BASE=~
+  
+  Other interesting targets in the generated Makefile are
+  
+    make config     # to check if the Makefile is up-to-date
+    make clean      # delete local temp files (Makefile gets renamed)
+    make realclean  # delete derived files (including ./blib)
+    make ci         # check in all the files in the MANIFEST file
+    make dist       # see below the Distribution Support section
+  
+  =head2 make test
+  
+  MakeMaker checks for the existence of a file named F<test.pl> in the
+  current directory, and if it exists it executes the script with the
+  proper set of perl C<-I> options.
+  
+  MakeMaker also checks for any files matching glob("t/*.t"). It will
+  execute all matching files in alphabetical order via the
+  L<Test::Harness> module with the C<-I> switches set correctly.
+  
+  If you'd like to see the raw output of your tests, set the
+  C<TEST_VERBOSE> variable to true.
+  
+    make test TEST_VERBOSE=1
+  
+  If you want to run particular test files, set the C<TEST_FILES> variable.
+  It is possible to use globbing with this mechanism.
+  
+    make test TEST_FILES='t/foobar.t t/dagobah*.t'
+  
+  Windows users who are using C<nmake> should note that due to a bug in C<nmake>,
+  when specifying C<TEST_FILES> you must use back-slashes instead of forward-slashes.
+  
+    nmake test TEST_FILES='t\foobar.t t\dagobah*.t'
+  
+  =head2 make testdb
+  
+  A useful variation of the above is the target C<testdb>. It runs the
+  test under the Perl debugger (see L<perldebug>). If the file
+  F<test.pl> exists in the current directory, it is used for the test.
+  
+  If you want to debug some other testfile, set the C<TEST_FILE> variable
+  thusly:
+  
+    make testdb TEST_FILE=t/mytest.t
+  
+  By default the debugger is called using C<-d> option to perl. If you
+  want to specify some other option, set the C<TESTDB_SW> variable:
+  
+    make testdb TESTDB_SW=-Dx
+  
+  =head2 make install
+  
+  make alone puts all relevant files into directories that are named by
+  the macros INST_LIB, INST_ARCHLIB, INST_SCRIPT, INST_MAN1DIR and
+  INST_MAN3DIR.  All these default to something below ./blib if you are
+  I<not> building below the perl source directory. If you I<are>
+  building below the perl source, INST_LIB and INST_ARCHLIB default to
+  ../../lib, and INST_SCRIPT is not defined.
+  
+  The I<install> target of the generated Makefile copies the files found
+  below each of the INST_* directories to their INSTALL*
+  counterparts. Which counterparts are chosen depends on the setting of
+  INSTALLDIRS according to the following table:
+  
+                                   INSTALLDIRS set to
+                             perl        site          vendor
+  
+                   PERLPREFIX      SITEPREFIX          VENDORPREFIX
+    INST_ARCHLIB   INSTALLARCHLIB  INSTALLSITEARCH     INSTALLVENDORARCH
+    INST_LIB       INSTALLPRIVLIB  INSTALLSITELIB      INSTALLVENDORLIB
+    INST_BIN       INSTALLBIN      INSTALLSITEBIN      INSTALLVENDORBIN
+    INST_SCRIPT    INSTALLSCRIPT   INSTALLSITESCRIPT   INSTALLVENDORSCRIPT
+    INST_MAN1DIR   INSTALLMAN1DIR  INSTALLSITEMAN1DIR  INSTALLVENDORMAN1DIR
+    INST_MAN3DIR   INSTALLMAN3DIR  INSTALLSITEMAN3DIR  INSTALLVENDORMAN3DIR
+  
+  The INSTALL... macros in turn default to their %Config
+  ($Config{installprivlib}, $Config{installarchlib}, etc.) counterparts.
+  
+  You can check the values of these variables on your system with
+  
+      perl '-V:install.*'
+  
+  And to check the sequence in which the library directories are
+  searched by perl, run
+  
+      perl -le 'print join $/, @INC'
+  
+  Sometimes older versions of the module you're installing live in other
+  directories in @INC.  Because Perl loads the first version of a module it
+  finds, not the newest, you might accidentally get one of these older
+  versions even after installing a brand new version.  To delete I<all other
+  versions of the module you're installing> (not simply older ones) set the
+  C<UNINST> variable.
+  
+      make install UNINST=1
+  
+  
+  =head2 INSTALL_BASE
+  
+  INSTALL_BASE can be passed into Makefile.PL to change where your
+  module will be installed.  INSTALL_BASE is more like what everyone
+  else calls "prefix" than PREFIX is.
+  
+  To have everything installed in your home directory, do the following.
+  
+      # Unix users, INSTALL_BASE=~ works fine
+      perl Makefile.PL INSTALL_BASE=/path/to/your/home/dir
+  
+  Like PREFIX, it sets several INSTALL* attributes at once.  Unlike
+  PREFIX it is easy to predict where the module will end up.  The
+  installation pattern looks like this:
+  
+      INSTALLARCHLIB     INSTALL_BASE/lib/perl5/$Config{archname}
+      INSTALLPRIVLIB     INSTALL_BASE/lib/perl5
+      INSTALLBIN         INSTALL_BASE/bin
+      INSTALLSCRIPT      INSTALL_BASE/bin
+      INSTALLMAN1DIR     INSTALL_BASE/man/man1
+      INSTALLMAN3DIR     INSTALL_BASE/man/man3
+  
+  INSTALL_BASE in MakeMaker and C<--install_base> in Module::Build (as
+  of 0.28) install to the same location.  If you want MakeMaker and
+  Module::Build to install to the same location simply set INSTALL_BASE
+  and C<--install_base> to the same location.
+  
+  INSTALL_BASE was added in 6.31.
+  
+  
+  =head2 PREFIX and LIB attribute
+  
+  PREFIX and LIB can be used to set several INSTALL* attributes in one
+  go.  Here's an example for installing into your home directory.
+  
+      # Unix users, PREFIX=~ works fine
+      perl Makefile.PL PREFIX=/path/to/your/home/dir
+  
+  This will install all files in the module under your home directory,
+  with man pages and libraries going into an appropriate place (usually
+  ~/man and ~/lib).  How the exact location is determined is complicated
+  and depends on how your Perl was configured.  INSTALL_BASE works more
+  like what other build systems call "prefix" than PREFIX and we
+  recommend you use that instead.
+  
+  Another way to specify many INSTALL directories with a single
+  parameter is LIB.
+  
+      perl Makefile.PL LIB=~/lib
+  
+  This will install the module's architecture-independent files into
+  ~/lib, the architecture-dependent files into ~/lib/$archname.
+  
+  Note, that in both cases the tilde expansion is done by MakeMaker, not
+  by perl by default, nor by make.
+  
+  Conflicts between parameters LIB, PREFIX and the various INSTALL*
+  arguments are resolved so that:
+  
+  =over 4
+  
+  =item *
+  
+  setting LIB overrides any setting of INSTALLPRIVLIB, INSTALLARCHLIB,
+  INSTALLSITELIB, INSTALLSITEARCH (and they are not affected by PREFIX);
+  
+  =item *
+  
+  without LIB, setting PREFIX replaces the initial C<$Config{prefix}>
+  part of those INSTALL* arguments, even if the latter are explicitly
+  set (but are set to still start with C<$Config{prefix}>).
+  
+  =back
+  
+  If the user has superuser privileges, and is not working on AFS or
+  relatives, then the defaults for INSTALLPRIVLIB, INSTALLARCHLIB,
+  INSTALLSCRIPT, etc. will be appropriate, and this incantation will be
+  the best:
+  
+      perl Makefile.PL;
+      make;
+      make test
+      make install
+  
+  make install by default writes some documentation of what has been
+  done into the file C<$(INSTALLARCHLIB)/perllocal.pod>. This feature
+  can be bypassed by calling make pure_install.
+  
+  =head2 AFS users
+  
+  will have to specify the installation directories as these most
+  probably have changed since perl itself has been installed. They will
+  have to do this by calling
+  
+      perl Makefile.PL INSTALLSITELIB=/afs/here/today \
+          INSTALLSCRIPT=/afs/there/now INSTALLMAN3DIR=/afs/for/manpages
+      make
+  
+  Be careful to repeat this procedure every time you recompile an
+  extension, unless you are sure the AFS installation directories are
+  still valid.
+  
+  =head2 Static Linking of a new Perl Binary
+  
+  An extension that is built with the above steps is ready to use on
+  systems supporting dynamic loading. On systems that do not support
+  dynamic loading, any newly created extension has to be linked together
+  with the available resources. MakeMaker supports the linking process
+  by creating appropriate targets in the Makefile whenever an extension
+  is built. You can invoke the corresponding section of the makefile with
+  
+      make perl
+  
+  That produces a new perl binary in the current directory with all
+  extensions linked in that can be found in INST_ARCHLIB, SITELIBEXP,
+  and PERL_ARCHLIB. To do that, MakeMaker writes a new Makefile, on
+  UNIX, this is called F<Makefile.aperl> (may be system dependent). If you
+  want to force the creation of a new perl, it is recommended that you
+  delete this F<Makefile.aperl>, so the directories are searched through
+  for linkable libraries again.
+  
+  The binary can be installed into the directory where perl normally
+  resides on your machine with
+  
+      make inst_perl
+  
+  To produce a perl binary with a different name than C<perl>, either say
+  
+      perl Makefile.PL MAP_TARGET=myperl
+      make myperl
+      make inst_perl
+  
+  or say
+  
+      perl Makefile.PL
+      make myperl MAP_TARGET=myperl
+      make inst_perl MAP_TARGET=myperl
+  
+  In any case you will be prompted with the correct invocation of the
+  C<inst_perl> target that installs the new binary into INSTALLBIN.
+  
+  make inst_perl by default writes some documentation of what has been
+  done into the file C<$(INSTALLARCHLIB)/perllocal.pod>. This
+  can be bypassed by calling make pure_inst_perl.
+  
+  Warning: the inst_perl: target will most probably overwrite your
+  existing perl binary. Use with care!
+  
+  Sometimes you might want to build a statically linked perl although
+  your system supports dynamic loading. In this case you may explicitly
+  set the linktype with the invocation of the Makefile.PL or make:
+  
+      perl Makefile.PL LINKTYPE=static    # recommended
+  
+  or
+  
+      make LINKTYPE=static                # works on most systems
+  
+  =head2 Determination of Perl Library and Installation Locations
+  
+  MakeMaker needs to know, or to guess, where certain things are
+  located.  Especially INST_LIB and INST_ARCHLIB (where to put the files
+  during the make(1) run), PERL_LIB and PERL_ARCHLIB (where to read
+  existing modules from), and PERL_INC (header files and C<libperl*.*>).
+  
+  Extensions may be built either using the contents of the perl source
+  directory tree or from the installed perl library. The recommended way
+  is to build extensions after you have run 'make install' on perl
+  itself. You can do that in any directory on your hard disk that is not
+  below the perl source tree. The support for extensions below the ext
+  directory of the perl distribution is only good for the standard
+  extensions that come with perl.
+  
+  If an extension is being built below the C<ext/> directory of the perl
+  source then MakeMaker will set PERL_SRC automatically (e.g.,
+  C<../..>).  If PERL_SRC is defined and the extension is recognized as
+  a standard extension, then other variables default to the following:
+  
+    PERL_INC     = PERL_SRC
+    PERL_LIB     = PERL_SRC/lib
+    PERL_ARCHLIB = PERL_SRC/lib
+    INST_LIB     = PERL_LIB
+    INST_ARCHLIB = PERL_ARCHLIB
+  
+  If an extension is being built away from the perl source then MakeMaker
+  will leave PERL_SRC undefined and default to using the installed copy
+  of the perl library. The other variables default to the following:
+  
+    PERL_INC     = $archlibexp/CORE
+    PERL_LIB     = $privlibexp
+    PERL_ARCHLIB = $archlibexp
+    INST_LIB     = ./blib/lib
+    INST_ARCHLIB = ./blib/arch
+  
+  If perl has not yet been installed then PERL_SRC can be defined on the
+  command line as shown in the previous section.
+  
+  
+  =head2 Which architecture dependent directory?
+  
+  If you don't want to keep the defaults for the INSTALL* macros,
+  MakeMaker helps you to minimize the typing needed: the usual
+  relationship between INSTALLPRIVLIB and INSTALLARCHLIB is determined
+  by Configure at perl compilation time. MakeMaker supports the user who
+  sets INSTALLPRIVLIB. If INSTALLPRIVLIB is set, but INSTALLARCHLIB not,
+  then MakeMaker defaults the latter to be the same subdirectory of
+  INSTALLPRIVLIB as Configure decided for the counterparts in %Config,
+  otherwise it defaults to INSTALLPRIVLIB. The same relationship holds
+  for INSTALLSITELIB and INSTALLSITEARCH.
+  
+  MakeMaker gives you much more freedom than needed to configure
+  internal variables and get different results. It is worth mentioning
+  that make(1) also lets you configure most of the variables that are
+  used in the Makefile. But in the majority of situations this will not
+  be necessary, and should only be done if the author of a package
+  recommends it (or you know what you're doing).
+  
+  =head2 Using Attributes and Parameters
+  
+  The following attributes may be specified as arguments to WriteMakefile()
+  or as NAME=VALUE pairs on the command line. Attributes that became
+  available with later versions of MakeMaker are indicated.
+  
+  In order to maintain portability of attributes with older versions of
+  MakeMaker you may want to use L<App::EUMM::Upgrade> with your C<Makefile.PL>.
+  
+  =over 2
+  
+  =item ABSTRACT
+  
+  One line description of the module. Will be included in PPD file.
+  
+  =item ABSTRACT_FROM
+  
+  Name of the file that contains the package description. MakeMaker looks
+  for a line in the POD matching /^($package\s-\s)(.*)/. This is typically
+  the first line in the "=head1 NAME" section. $2 becomes the abstract.
+  
+  =item AUTHOR
+  
+  Array of strings containing name (and email address) of package author(s).
+  Is used in CPAN Meta files (META.yml or META.json) and PPD
+  (Perl Package Description) files for PPM (Perl Package Manager).
+  
+  =item BINARY_LOCATION
+  
+  Used when creating PPD files for binary packages.  It can be set to a
+  full or relative path or URL to the binary archive for a particular
+  architecture.  For example:
+  
+          perl Makefile.PL BINARY_LOCATION=x86/Agent.tar.gz
+  
+  builds a PPD package that references a binary of the C<Agent> package,
+  located in the C<x86> directory relative to the PPD itself.
+  
+  =item BUILD_REQUIRES
+  
+  Available in version 6.5503 and above.
+  
+  A hash of modules that are needed to build your module but not run it.
+  
+  This will go into the C<build_requires> field of your F<META.yml> and the C<build> of the C<prereqs> field of your F<META.json>.
+  
+  Defaults to C<<< { "ExtUtils::MakeMaker" => 0 } >>> if this attribute is not specified.
+  
+  The format is the same as PREREQ_PM.
+  
+  =item C
+  
+  Ref to array of *.c file names. Initialised from a directory scan
+  and the values portion of the XS attribute hash. This is not
+  currently used by MakeMaker but may be handy in Makefile.PLs.
+  
+  =item CCFLAGS
+  
+  String that will be included in the compiler call command line between
+  the arguments INC and OPTIMIZE.
+  
+  =item CONFIG
+  
+  Arrayref. E.g. [qw(archname manext)] defines ARCHNAME & MANEXT from
+  config.sh. MakeMaker will add to CONFIG the following values anyway:
+  ar
+  cc
+  cccdlflags
+  ccdlflags
+  dlext
+  dlsrc
+  ld
+  lddlflags
+  ldflags
+  libc
+  lib_ext
+  obj_ext
+  ranlib
+  sitelibexp
+  sitearchexp
+  so
+  
+  =item CONFIGURE
+  
+  CODE reference. The subroutine should return a hash reference. The
+  hash may contain further attributes, e.g. {LIBS =E<gt> ...}, that have to
+  be determined by some evaluation method.
+  
+  =item CONFIGURE_REQUIRES
+  
+  Available in version 6.52 and above.
+  
+  A hash of modules that are required to run Makefile.PL itself, but not
+  to run your distribution.
+  
+  This will go into the C<configure_requires> field of your F<META.yml> and the C<configure> of the C<prereqs> field of your F<META.json>.
+  
+  Defaults to C<<< { "ExtUtils::MakeMaker" => 0 } >>> if this attribute is not specified.
+  
+  The format is the same as PREREQ_PM.
+  
+  =item DEFINE
+  
+  Something like C<"-DHAVE_UNISTD_H">
+  
+  =item DESTDIR
+  
+  This is the root directory into which the code will be installed.  It
+  I<prepends itself to the normal prefix>.  For example, if your code
+  would normally go into F</usr/local/lib/perl> you could set DESTDIR=~/tmp/
+  and installation would go into F<~/tmp/usr/local/lib/perl>.
+  
+  This is primarily of use for people who repackage Perl modules.
+  
+  NOTE: Due to the nature of make, it is important that you put the trailing
+  slash on your DESTDIR.  F<~/tmp/> not F<~/tmp>.
+  
+  =item DIR
+  
+  Ref to array of subdirectories containing Makefile.PLs e.g. ['sdbm']
+  in ext/SDBM_File
+  
+  =item DISTNAME
+  
+  A safe filename for the package.
+  
+  Defaults to NAME below but with :: replaced with -.
+  
+  For example, Foo::Bar becomes Foo-Bar.
+  
+  =item DISTVNAME
+  
+  Your name for distributing the package with the version number
+  included.  This is used by 'make dist' to name the resulting archive
+  file.
+  
+  Defaults to DISTNAME-VERSION.
+  
+  For example, version 1.04 of Foo::Bar becomes Foo-Bar-1.04.
+  
+  On some OS's where . has special meaning VERSION_SYM may be used in
+  place of VERSION.
+  
+  =item DLEXT
+  
+  Specifies the extension of the module's loadable object. For example:
+  
+    DLEXT => 'unusual_ext', # Default value is $Config{so}
+  
+  NOTE: When using this option to alter the extension of a module's
+  loadable object, it is also necessary that the module's pm file
+  specifies the same change:
+  
+    local $DynaLoader::dl_dlext = 'unusual_ext';
+  
+  =item DL_FUNCS
+  
+  Hashref of symbol names for routines to be made available as universal
+  symbols.  Each key/value pair consists of the package name and an
+  array of routine names in that package.  Used only under AIX, OS/2,
+  VMS and Win32 at present.  The routine names supplied will be expanded
+  in the same way as XSUB names are expanded by the XS() macro.
+  Defaults to
+  
+    {"$(NAME)" => ["boot_$(NAME)" ] }
+  
+  e.g.
+  
+    {"RPC" => [qw( boot_rpcb rpcb_gettime getnetconfigent )],
+     "NetconfigPtr" => [ 'DESTROY'] }
+  
+  Please see the L<ExtUtils::Mksymlists> documentation for more information
+  about the DL_FUNCS, DL_VARS and FUNCLIST attributes.
+  
+  =item DL_VARS
+  
+  Array of symbol names for variables to be made available as universal symbols.
+  Used only under AIX, OS/2, VMS and Win32 at present.  Defaults to [].
+  (e.g. [ qw(Foo_version Foo_numstreams Foo_tree ) ])
+  
+  =item EXCLUDE_EXT
+  
+  Array of extension names to exclude when doing a static build.  This
+  is ignored if INCLUDE_EXT is present.  Consult INCLUDE_EXT for more
+  details.  (e.g.  [ qw( Socket POSIX ) ] )
+  
+  This attribute may be most useful when specified as a string on the
+  command line:  perl Makefile.PL EXCLUDE_EXT='Socket Safe'
+  
+  =item EXE_FILES
+  
+  Ref to array of executable files. The files will be copied to the
+  INST_SCRIPT directory. Make realclean will delete them from there
+  again.
+  
+  If your executables start with something like #!perl or
+  #!/usr/bin/perl MakeMaker will change this to the path of the perl
+  'Makefile.PL' was invoked with so the programs will be sure to run
+  properly even if perl is not in /usr/bin/perl.
+  
+  =item FIRST_MAKEFILE
+  
+  The name of the Makefile to be produced.  This is used for the second
+  Makefile that will be produced for the MAP_TARGET.
+  
+  Defaults to 'Makefile' or 'Descrip.MMS' on VMS.
+  
+  (Note: we couldn't use MAKEFILE because dmake uses this for something
+  else).
+  
+  =item FULLPERL
+  
+  Perl binary able to run this extension, load XS modules, etc...
+  
+  =item FULLPERLRUN
+  
+  Like PERLRUN, except it uses FULLPERL.
+  
+  =item FULLPERLRUNINST
+  
+  Like PERLRUNINST, except it uses FULLPERL.
+  
+  =item FUNCLIST
+  
+  This provides an alternate means to specify function names to be
+  exported from the extension.  Its value is a reference to an
+  array of function names to be exported by the extension.  These
+  names are passed through unaltered to the linker options file.
+  
+  =item H
+  
+  Ref to array of *.h file names. Similar to C.
+  
+  =item IMPORTS
+  
+  This attribute is used to specify names to be imported into the
+  extension. Takes a hash ref.
+  
+  It is only used on OS/2 and Win32.
+  
+  =item INC
+  
+  Include file dirs eg: C<"-I/usr/5include -I/path/to/inc">
+  
+  =item INCLUDE_EXT
+  
+  Array of extension names to be included when doing a static build.
+  MakeMaker will normally build with all of the installed extensions when
+  doing a static build, and that is usually the desired behavior.  If
+  INCLUDE_EXT is present then MakeMaker will build only with those extensions
+  which are explicitly mentioned. (e.g.  [ qw( Socket POSIX ) ])
+  
+  It is not necessary to mention DynaLoader or the current extension when
+  filling in INCLUDE_EXT.  If the INCLUDE_EXT is mentioned but is empty then
+  only DynaLoader and the current extension will be included in the build.
+  
+  This attribute may be most useful when specified as a string on the
+  command line:  perl Makefile.PL INCLUDE_EXT='POSIX Socket Devel::Peek'
+  
+  =item INSTALLARCHLIB
+  
+  Used by 'make install', which copies files from INST_ARCHLIB to this
+  directory if INSTALLDIRS is set to perl.
+  
+  =item INSTALLBIN
+  
+  Directory to install binary files (e.g. tkperl) into if
+  INSTALLDIRS=perl.
+  
+  =item INSTALLDIRS
+  
+  Determines which of the sets of installation directories to choose:
+  perl, site or vendor.  Defaults to site.
+  
+  =item INSTALLMAN1DIR
+  
+  =item INSTALLMAN3DIR
+  
+  These directories get the man pages at 'make install' time if
+  INSTALLDIRS=perl.  Defaults to $Config{installman*dir}.
+  
+  If set to 'none', no man pages will be installed.
+  
+  =item INSTALLPRIVLIB
+  
+  Used by 'make install', which copies files from INST_LIB to this
+  directory if INSTALLDIRS is set to perl.
+  
+  Defaults to $Config{installprivlib}.
+  
+  =item INSTALLSCRIPT
+  
+  Used by 'make install' which copies files from INST_SCRIPT to this
+  directory if INSTALLDIRS=perl.
+  
+  =item INSTALLSITEARCH
+  
+  Used by 'make install', which copies files from INST_ARCHLIB to this
+  directory if INSTALLDIRS is set to site (default).
+  
+  =item INSTALLSITEBIN
+  
+  Used by 'make install', which copies files from INST_BIN to this
+  directory if INSTALLDIRS is set to site (default).
+  
+  =item INSTALLSITELIB
+  
+  Used by 'make install', which copies files from INST_LIB to this
+  directory if INSTALLDIRS is set to site (default).
+  
+  =item INSTALLSITEMAN1DIR
+  
+  =item INSTALLSITEMAN3DIR
+  
+  These directories get the man pages at 'make install' time if
+  INSTALLDIRS=site (default).  Defaults to
+  $(SITEPREFIX)/man/man$(MAN*EXT).
+  
+  If set to 'none', no man pages will be installed.
+  
+  =item INSTALLSITESCRIPT
+  
+  Used by 'make install' which copies files from INST_SCRIPT to this
+  directory if INSTALLDIRS is set to site (default).
+  
+  =item INSTALLVENDORARCH
+  
+  Used by 'make install', which copies files from INST_ARCHLIB to this
+  directory if INSTALLDIRS is set to vendor.
+  
+  =item INSTALLVENDORBIN
+  
+  Used by 'make install', which copies files from INST_BIN to this
+  directory if INSTALLDIRS is set to vendor.
+  
+  =item INSTALLVENDORLIB
+  
+  Used by 'make install', which copies files from INST_LIB to this
+  directory if INSTALLDIRS is set to vendor.
+  
+  =item INSTALLVENDORMAN1DIR
+  
+  =item INSTALLVENDORMAN3DIR
+  
+  These directories get the man pages at 'make install' time if
+  INSTALLDIRS=vendor.  Defaults to $(VENDORPREFIX)/man/man$(MAN*EXT).
+  
+  If set to 'none', no man pages will be installed.
+  
+  =item INSTALLVENDORSCRIPT
+  
+  Used by 'make install' which copies files from INST_SCRIPT to this
+  directory if INSTALLDIRS is set to vendor.
+  
+  =item INST_ARCHLIB
+  
+  Same as INST_LIB for architecture dependent files.
+  
+  =item INST_BIN
+  
+  Directory to put real binary files during 'make'. These will be copied
+  to INSTALLBIN during 'make install'
+  
+  =item INST_LIB
+  
+  Directory where we put library files of this extension while building
+  it.
+  
+  =item INST_MAN1DIR
+  
+  Directory to hold the man pages at 'make' time
+  
+  =item INST_MAN3DIR
+  
+  Directory to hold the man pages at 'make' time
+  
+  =item INST_SCRIPT
+  
+  Directory where executable files should be installed during
+  'make'. Defaults to "./blib/script", just to have a dummy location during
+  testing. make install will copy the files in INST_SCRIPT to
+  INSTALLSCRIPT.
+  
+  =item LD
+  
+  Program to be used to link libraries for dynamic loading.
+  
+  Defaults to $Config{ld}.
+  
+  =item LDDLFLAGS
+  
+  Any special flags that might need to be passed to ld to create a
+  shared library suitable for dynamic loading.  It is up to the makefile
+  to use it.  (See L<Config/lddlflags>)
+  
+  Defaults to $Config{lddlflags}.
+  
+  =item LDFROM
+  
+  Defaults to "$(OBJECT)" and is used in the ld command to specify
+  what files to link/load from (also see dynamic_lib below for how to
+  specify ld flags)
+  
+  =item LIB
+  
+  LIB should only be set at C<perl Makefile.PL> time but is allowed as a
+  MakeMaker argument. It has the effect of setting both INSTALLPRIVLIB
+  and INSTALLSITELIB to that value regardless any explicit setting of
+  those arguments (or of PREFIX).  INSTALLARCHLIB and INSTALLSITEARCH
+  are set to the corresponding architecture subdirectory.
+  
+  =item LIBPERL_A
+  
+  The filename of the perllibrary that will be used together with this
+  extension. Defaults to libperl.a.
+  
+  =item LIBS
+  
+  An anonymous array of alternative library
+  specifications to be searched for (in order) until
+  at least one library is found. E.g.
+  
+    'LIBS' => ["-lgdbm", "-ldbm -lfoo", "-L/path -ldbm.nfs"]
+  
+  Mind, that any element of the array
+  contains a complete set of arguments for the ld
+  command. So do not specify
+  
+    'LIBS' => ["-ltcl", "-ltk", "-lX11"]
+  
+  See ODBM_File/Makefile.PL for an example, where an array is needed. If
+  you specify a scalar as in
+  
+    'LIBS' => "-ltcl -ltk -lX11"
+  
+  MakeMaker will turn it into an array with one element.
+  
+  =item LICENSE
+  
+  Available in version 6.31 and above.
+  
+  The licensing terms of your distribution.  Generally it's "perl_5" for the
+  same license as Perl itself.
+  
+  See L<CPAN::Meta::Spec> for the list of options.
+  
+  Defaults to "unknown".
+  
+  =item LINKTYPE
+  
+  'static' or 'dynamic' (default unless usedl=undef in
+  config.sh). Should only be used to force static linking (also see
+  linkext below).
+  
+  =item MAGICXS
+  
+  When this is set to C<1>, C<OBJECT> will be automagically derived from
+  C<O_FILES>.
+  
+  =item MAKE
+  
+  Variant of make you intend to run the generated Makefile with.  This
+  parameter lets Makefile.PL know what make quirks to account for when
+  generating the Makefile.
+  
+  MakeMaker also honors the MAKE environment variable.  This parameter
+  takes precedence.
+  
+  Currently the only significant values are 'dmake' and 'nmake' for Windows
+  users, instructing MakeMaker to generate a Makefile in the flavour of
+  DMake ("Dennis Vadura's Make") or Microsoft NMake respectively.
+  
+  Defaults to $Config{make}, which may go looking for a Make program
+  in your environment.
+  
+  How are you supposed to know what flavour of Make a Makefile has
+  been generated for if you didn't specify a value explicitly? Search
+  the generated Makefile for the definition of the MAKE variable,
+  which is used to recursively invoke the Make utility. That will tell
+  you what Make you're supposed to invoke the Makefile with.
+  
+  =item MAKEAPERL
+  
+  Boolean which tells MakeMaker that it should include the rules to
+  make a perl. This is handled automatically as a switch by
+  MakeMaker. The user normally does not need it.
+  
+  =item MAKEFILE_OLD
+  
+  When 'make clean' or similar is run, the $(FIRST_MAKEFILE) will be
+  backed up at this location.
+  
+  Defaults to $(FIRST_MAKEFILE).old or $(FIRST_MAKEFILE)_old on VMS.
+  
+  =item MAN1PODS
+  
+  Hashref of pod-containing files. MakeMaker will default this to all
+  EXE_FILES files that include POD directives. The files listed
+  here will be converted to man pages and installed as was requested
+  at Configure time.
+  
+  This hash should map POD files (or scripts containing POD) to the
+  man file names under the C<blib/man1/> directory, as in the following
+  example:
+  
+    MAN1PODS            => {
+      'doc/command.pod'    => 'blib/man1/command.1',
+      'scripts/script.pl'  => 'blib/man1/script.1',
+    }
+  
+  =item MAN3PODS
+  
+  Hashref that assigns to *.pm and *.pod files the files into which the
+  manpages are to be written. MakeMaker parses all *.pod and *.pm files
+  for POD directives. Files that contain POD will be the default keys of
+  the MAN3PODS hashref. These will then be converted to man pages during
+  C<make> and will be installed during C<make install>.
+  
+  Example similar to MAN1PODS.
+  
+  =item MAP_TARGET
+  
+  If it is intended that a new perl binary be produced, this variable
+  may hold a name for that binary. Defaults to perl
+  
+  =item META_ADD
+  
+  =item META_MERGE
+  
+  Available in version 6.46 and above.
+  
+  A hashref of items to add to the CPAN Meta file (F<META.yml> or
+  F<META.json>).
+  
+  They differ in how they behave if they have the same key as the
+  default metadata.  META_ADD will override the default value with its
+  own.  META_MERGE will merge its value with the default.
+  
+  Unless you want to override the defaults, prefer META_MERGE so as to
+  get the advantage of any future defaults.
+  
+  Where prereqs are concerned, if META_MERGE is used, prerequisites are merged
+  with their counterpart C<WriteMakefile()> argument
+  (PREREQ_PM is merged into {prereqs}{runtime}{requires},
+  BUILD_REQUIRES into C<{prereqs}{build}{requires}>,
+  CONFIGURE_REQUIRES into C<{prereqs}{configure}{requires}>,
+  and TEST_REQUIRES into C<{prereqs}{test}{requires})>.
+  When prereqs are specified with META_ADD, the only prerequisites added to the
+  file come from the metadata, not C<WriteMakefile()> arguments.
+  
+  Note that these configuration options are only used for generating F<META.yml>
+  and F<META.json> -- they are NOT used for F<MYMETA.yml> and F<MYMETA.json>.
+  Therefore data in these fields should NOT be used for dynamic (user-side)
+  configuration.
+  
+  By default CPAN Meta specification C<1.4> is used. In order to use
+  CPAN Meta specification C<2.0>, indicate with C<meta-spec> the version
+  you want to use.
+  
+    META_MERGE        => {
+  
+      "meta-spec" => { version => 2 },
+  
+      resources => {
+  
+        repository => {
+            type => 'git',
+            url => 'git://github.com/Perl-Toolchain-Gang/ExtUtils-MakeMaker.git',
+            web => 'https://github.com/Perl-Toolchain-Gang/ExtUtils-MakeMaker',
+        },
+  
+      },
+  
+    },
+  
+  =item MIN_PERL_VERSION
+  
+  Available in version 6.48 and above.
+  
+  The minimum required version of Perl for this distribution.
+  
+  Either the 5.006001 or the 5.6.1 format is acceptable.
+  
+  =item MYEXTLIB
+  
+  If the extension links to a library that it builds, set this to the
+  name of the library (see SDBM_File)
+  
+  =item NAME
+  
+  The package representing the distribution. For example, C<Test::More>
+  or C<ExtUtils::MakeMaker>. It will be used to derive information about
+  the distribution such as the L</DISTNAME>, installation locations
+  within the Perl library and where XS files will be looked for by
+  default (see L</XS>).
+  
+  C<NAME> I<must> be a valid Perl package name and it I<must> have an
+  associated C<.pm> file. For example, C<Foo::Bar> is a valid C<NAME>
+  and there must exist F<Foo/Bar.pm>.  Any XS code should be in
+  F<Bar.xs> unless stated otherwise.
+  
+  Your distribution B<must> have a C<NAME>.
+  
+  =item NEEDS_LINKING
+  
+  MakeMaker will figure out if an extension contains linkable code
+  anywhere down the directory tree, and will set this variable
+  accordingly, but you can speed it up a very little bit if you define
+  this boolean variable yourself.
+  
+  =item NOECHO
+  
+  Command so make does not print the literal commands it's running.
+  
+  By setting it to an empty string you can generate a Makefile that
+  prints all commands. Mainly used in debugging MakeMaker itself.
+  
+  Defaults to C<@>.
+  
+  =item NORECURS
+  
+  Boolean.  Attribute to inhibit descending into subdirectories.
+  
+  =item NO_META
+  
+  When true, suppresses the generation and addition to the MANIFEST of
+  the META.yml and META.json module meta-data files during 'make distdir'.
+  
+  Defaults to false.
+  
+  =item NO_MYMETA
+  
+  When true, suppresses the generation of MYMETA.yml and MYMETA.json module
+  meta-data files during 'perl Makefile.PL'.
+  
+  Defaults to false.
+  
+  =item NO_PACKLIST
+  
+  When true, suppresses the writing of C<packlist> files for installs.
+  
+  Defaults to false.
+  
+  =item NO_PERLLOCAL
+  
+  When true, suppresses the appending of installations to C<perllocal>.
+  
+  Defaults to false.
+  
+  =item NO_VC
+  
+  In general, any generated Makefile checks for the current version of
+  MakeMaker and the version the Makefile was built under. If NO_VC is
+  set, the version check is neglected. Do not write this into your
+  Makefile.PL, use it interactively instead.
+  
+  =item OBJECT
+  
+  List of object files, defaults to '$(BASEEXT)$(OBJ_EXT)', but can be a long
+  string or an array containing all object files, e.g. "tkpBind.o
+  tkpButton.o tkpCanvas.o" or ["tkpBind.o", "tkpButton.o", "tkpCanvas.o"]
+  
+  (Where BASEEXT is the last component of NAME, and OBJ_EXT is $Config{obj_ext}.)
+  
+  =item OPTIMIZE
+  
+  Defaults to C<-O>. Set it to C<-g> to turn debugging on. The flag is
+  passed to subdirectory makes.
+  
+  =item PERL
+  
+  Perl binary for tasks that can be done by miniperl.
+  
+  =item PERL_CORE
+  
+  Set only when MakeMaker is building the extensions of the Perl core
+  distribution.
+  
+  =item PERLMAINCC
+  
+  The call to the program that is able to compile perlmain.c. Defaults
+  to $(CC).
+  
+  =item PERL_ARCHLIB
+  
+  Same as for PERL_LIB, but for architecture dependent files.
+  
+  Used only when MakeMaker is building the extensions of the Perl core
+  distribution (because normally $(PERL_ARCHLIB) is automatically in @INC,
+  and adding it would get in the way of PERL5LIB).
+  
+  =item PERL_LIB
+  
+  Directory containing the Perl library to use.
+  
+  Used only when MakeMaker is building the extensions of the Perl core
+  distribution (because normally $(PERL_LIB) is automatically in @INC,
+  and adding it would get in the way of PERL5LIB).
+  
+  =item PERL_MALLOC_OK
+  
+  defaults to 0.  Should be set to TRUE if the extension can work with
+  the memory allocation routines substituted by the Perl malloc() subsystem.
+  This should be applicable to most extensions with exceptions of those
+  
+  =over 4
+  
+  =item *
+  
+  with bugs in memory allocations which are caught by Perl's malloc();
+  
+  =item *
+  
+  which interact with the memory allocator in other ways than via
+  malloc(), realloc(), free(), calloc(), sbrk() and brk();
+  
+  =item *
+  
+  which rely on special alignment which is not provided by Perl's malloc().
+  
+  =back
+  
+  B<NOTE.>  Neglecting to set this flag in I<any one> of the loaded extension
+  nullifies many advantages of Perl's malloc(), such as better usage of
+  system resources, error detection, memory usage reporting, catchable failure
+  of memory allocations, etc.
+  
+  =item PERLPREFIX
+  
+  Directory under which core modules are to be installed.
+  
+  Defaults to $Config{installprefixexp}, falling back to
+  $Config{installprefix}, $Config{prefixexp} or $Config{prefix} should
+  $Config{installprefixexp} not exist.
+  
+  Overridden by PREFIX.
+  
+  =item PERLRUN
+  
+  Use this instead of $(PERL) when you wish to run perl.  It will set up
+  extra necessary flags for you.
+  
+  =item PERLRUNINST
+  
+  Use this instead of $(PERL) when you wish to run perl to work with
+  modules.  It will add things like -I$(INST_ARCH) and other necessary
+  flags so perl can see the modules you're about to install.
+  
+  =item PERL_SRC
+  
+  Directory containing the Perl source code (use of this should be
+  avoided, it may be undefined)
+  
+  =item PERM_DIR
+  
+  Desired permission for directories. Defaults to C<755>.
+  
+  =item PERM_RW
+  
+  Desired permission for read/writable files. Defaults to C<644>.
+  
+  =item PERM_RWX
+  
+  Desired permission for executable files. Defaults to C<755>.
+  
+  =item PL_FILES
+  
+  MakeMaker can run programs to generate files for you at build time.
+  By default any file named *.PL (except Makefile.PL and Build.PL) in
+  the top level directory will be assumed to be a Perl program and run
+  passing its own basename in as an argument.  For example...
+  
+      perl foo.PL foo
+  
+  This behavior can be overridden by supplying your own set of files to
+  search.  PL_FILES accepts a hash ref, the key being the file to run
+  and the value is passed in as the first argument when the PL file is run.
+  
+      PL_FILES => {'bin/foobar.PL' => 'bin/foobar'}
+  
+  Would run bin/foobar.PL like this:
+  
+      perl bin/foobar.PL bin/foobar
+  
+  If multiple files from one program are desired an array ref can be used.
+  
+      PL_FILES => {'bin/foobar.PL' => [qw(bin/foobar1 bin/foobar2)]}
+  
+  In this case the program will be run multiple times using each target file.
+  
+      perl bin/foobar.PL bin/foobar1
+      perl bin/foobar.PL bin/foobar2
+  
+  PL files are normally run B<after> pm_to_blib and include INST_LIB and
+  INST_ARCH in their C<@INC>, so the just built modules can be
+  accessed... unless the PL file is making a module (or anything else in
+  PM) in which case it is run B<before> pm_to_blib and does not include
+  INST_LIB and INST_ARCH in its C<@INC>.  This apparently odd behavior
+  is there for backwards compatibility (and it's somewhat DWIM).
+  
+  
+  =item PM
+  
+  Hashref of .pm files and *.pl files to be installed.  e.g.
+  
+    {'name_of_file.pm' => '$(INST_LIB)/install_as.pm'}
+  
+  By default this will include *.pm and *.pl and the files found in
+  the PMLIBDIRS directories.  Defining PM in the
+  Makefile.PL will override PMLIBDIRS.
+  
+  =item PMLIBDIRS
+  
+  Ref to array of subdirectories containing library files.  Defaults to
+  [ 'lib', $(BASEEXT) ]. The directories will be scanned and I<any> files
+  they contain will be installed in the corresponding location in the
+  library.  A libscan() method can be used to alter the behaviour.
+  Defining PM in the Makefile.PL will override PMLIBDIRS.
+  
+  (Where BASEEXT is the last component of NAME.)
+  
+  =item PM_FILTER
+  
+  A filter program, in the traditional Unix sense (input from stdin, output
+  to stdout) that is passed on each .pm file during the build (in the
+  pm_to_blib() phase).  It is empty by default, meaning no filtering is done.
+  
+  Great care is necessary when defining the command if quoting needs to be
+  done.  For instance, you would need to say:
+  
+    {'PM_FILTER' => 'grep -v \\"^\\#\\"'}
+  
+  to remove all the leading comments on the fly during the build.  The
+  extra \\ are necessary, unfortunately, because this variable is interpolated
+  within the context of a Perl program built on the command line, and double
+  quotes are what is used with the -e switch to build that command line.  The
+  # is escaped for the Makefile, since what is going to be generated will then
+  be:
+  
+    PM_FILTER = grep -v \"^\#\"
+  
+  Without the \\ before the #, we'd have the start of a Makefile comment,
+  and the macro would be incorrectly defined.
+  
+  =item POLLUTE
+  
+  Release 5.005 grandfathered old global symbol names by providing preprocessor
+  macros for extension source compatibility.  As of release 5.6, these
+  preprocessor definitions are not available by default.  The POLLUTE flag
+  specifies that the old names should still be defined:
+  
+    perl Makefile.PL POLLUTE=1
+  
+  Please inform the module author if this is necessary to successfully install
+  a module under 5.6 or later.
+  
+  =item PPM_INSTALL_EXEC
+  
+  Name of the executable used to run C<PPM_INSTALL_SCRIPT> below. (e.g. perl)
+  
+  =item PPM_INSTALL_SCRIPT
+  
+  Name of the script that gets executed by the Perl Package Manager after
+  the installation of a package.
+  
+  =item PPM_UNINSTALL_EXEC
+  
+  Name of the executable used to run C<PPM_UNINSTALL_SCRIPT> below. (e.g. perl)
+  
+  =item PPM_UNINSTALL_SCRIPT
+  
+  Name of the script that gets executed by the Perl Package Manager before
+  the removal of a package.
+  
+  =item PREFIX
+  
+  This overrides all the default install locations.  Man pages,
+  libraries, scripts, etc...  MakeMaker will try to make an educated
+  guess about where to place things under the new PREFIX based on your
+  Config defaults.  Failing that, it will fall back to a structure
+  which should be sensible for your platform.
+  
+  If you specify LIB or any INSTALL* variables they will not be affected
+  by the PREFIX.
+  
+  =item PREREQ_FATAL
+  
+  Bool. If this parameter is true, failing to have the required modules
+  (or the right versions thereof) will be fatal. C<perl Makefile.PL>
+  will C<die> instead of simply informing the user of the missing dependencies.
+  
+  It is I<extremely> rare to have to use C<PREREQ_FATAL>. Its use by module
+  authors is I<strongly discouraged> and should never be used lightly.
+  
+  For dependencies that are required in order to run C<Makefile.PL>,
+  see C<CONFIGURE_REQUIRES>.
+  
+  Module installation tools have ways of resolving unmet dependencies but
+  to do that they need a F<Makefile>.  Using C<PREREQ_FATAL> breaks this.
+  That's bad.
+  
+  Assuming you have good test coverage, your tests should fail with
+  missing dependencies informing the user more strongly that something
+  is wrong.  You can write a F<t/00compile.t> test which will simply
+  check that your code compiles and stop "make test" prematurely if it
+  doesn't.  See L<Test::More/BAIL_OUT> for more details.
+  
+  
+  =item PREREQ_PM
+  
+  A hash of modules that are needed to run your module.  The keys are
+  the module names ie. Test::More, and the minimum version is the
+  value. If the required version number is 0 any version will do.
+  
+  This will go into the C<requires> field of your F<META.yml> and the C<runtime> of the C<prereqs> field of your F<META.json>.
+  
+      PREREQ_PM => {
+          # Require Test::More at least 0.47
+          "Test::More" => "0.47",
+  
+          # Require any version of Acme::Buffy
+          "Acme::Buffy" => 0,
+      }
+  
+  =item PREREQ_PRINT
+  
+  Bool.  If this parameter is true, the prerequisites will be printed to
+  stdout and MakeMaker will exit.  The output format is an evalable hash
+  ref.
+  
+    $PREREQ_PM = {
+                   'A::B' => Vers1,
+                   'C::D' => Vers2,
+                   ...
+                 };
+  
+  If a distribution defines a minimal required perl version, this is
+  added to the output as an additional line of the form:
+  
+    $MIN_PERL_VERSION = '5.008001';
+  
+  If BUILD_REQUIRES is not empty, it will be dumped as $BUILD_REQUIRES hashref.
+  
+  =item PRINT_PREREQ
+  
+  RedHatism for C<PREREQ_PRINT>.  The output format is different, though:
+  
+      perl(A::B)>=Vers1 perl(C::D)>=Vers2 ...
+  
+  A minimal required perl version, if present, will look like this:
+  
+      perl(perl)>=5.008001
+  
+  =item SITEPREFIX
+  
+  Like PERLPREFIX, but only for the site install locations.
+  
+  Defaults to $Config{siteprefixexp}.  Perls prior to 5.6.0 didn't have
+  an explicit siteprefix in the Config.  In those cases
+  $Config{installprefix} will be used.
+  
+  Overridable by PREFIX
+  
+  =item SIGN
+  
+  When true, perform the generation and addition to the MANIFEST of the
+  SIGNATURE file in the distdir during 'make distdir', via 'cpansign
+  -s'.
+  
+  Note that you need to install the Module::Signature module to
+  perform this operation.
+  
+  Defaults to false.
+  
+  =item SKIP
+  
+  Arrayref. E.g. [qw(name1 name2)] skip (do not write) sections of the
+  Makefile. Caution! Do not use the SKIP attribute for the negligible
+  speedup. It may seriously damage the resulting Makefile. Only use it
+  if you really need it.
+  
+  =item TEST_REQUIRES
+  
+  Available in version 6.64 and above.
+  
+  A hash of modules that are needed to test your module but not run or
+  build it.
+  
+  This will go into the C<build_requires> field of your F<META.yml> and the C<test> of the C<prereqs> field of your F<META.json>.
+  
+  The format is the same as PREREQ_PM.
+  
+  =item TYPEMAPS
+  
+  Ref to array of typemap file names.  Use this when the typemaps are
+  in some directory other than the current directory or when they are
+  not named B<typemap>.  The last typemap in the list takes
+  precedence.  A typemap in the current directory has highest
+  precedence, even if it isn't listed in TYPEMAPS.  The default system
+  typemap has lowest precedence.
+  
+  =item VENDORPREFIX
+  
+  Like PERLPREFIX, but only for the vendor install locations.
+  
+  Defaults to $Config{vendorprefixexp}.
+  
+  Overridable by PREFIX
+  
+  =item VERBINST
+  
+  If true, make install will be verbose
+  
+  =item VERSION
+  
+  Your version number for distributing the package.  This defaults to
+  0.1.
+  
+  =item VERSION_FROM
+  
+  Instead of specifying the VERSION in the Makefile.PL you can let
+  MakeMaker parse a file to determine the version number. The parsing
+  routine requires that the file named by VERSION_FROM contains one
+  single line to compute the version number. The first line in the file
+  that contains something like a $VERSION assignment or C<package Name
+  VERSION> will be used. The following lines will be parsed o.k.:
+  
+      # Good
+      package Foo::Bar 1.23;                      # 1.23
+      $VERSION   = '1.00';                        # 1.00
+      *VERSION   = \'1.01';                       # 1.01
+      ($VERSION) = q$Revision$ =~ /(\d+)/g;       # The digits in $Revision$
+      $FOO::VERSION = '1.10';                     # 1.10
+      *FOO::VERSION = \'1.11';                    # 1.11
+  
+  but these will fail:
+  
+      # Bad
+      my $VERSION         = '1.01';
+      local $VERSION      = '1.02';
+      local $FOO::VERSION = '1.30';
+  
+  (Putting C<my> or C<local> on the preceding line will work o.k.)
+  
+  "Version strings" are incompatible and should not be used.
+  
+      # Bad
+      $VERSION = 1.2.3;
+      $VERSION = v1.2.3;
+  
+  L<version> objects are fine.  As of MakeMaker 6.35 version.pm will be
+  automatically loaded, but you must declare the dependency on version.pm.
+  For compatibility with older MakeMaker you should load on the same line
+  as $VERSION is declared.
+  
+      # All on one line
+      use version; our $VERSION = qv(1.2.3);
+  
+  The file named in VERSION_FROM is not added as a dependency to
+  Makefile. This is not really correct, but it would be a major pain
+  during development to have to rewrite the Makefile for any smallish
+  change in that file. If you want to make sure that the Makefile
+  contains the correct VERSION macro after any change of the file, you
+  would have to do something like
+  
+      depend => { Makefile => '$(VERSION_FROM)' }
+  
+  See attribute C<depend> below.
+  
+  =item VERSION_SYM
+  
+  A sanitized VERSION with . replaced by _.  For places where . has
+  special meaning (some filesystems, RCS labels, etc...)
+  
+  =item XS
+  
+  Hashref of .xs files. MakeMaker will default this.  e.g.
+  
+    {'name_of_file.xs' => 'name_of_file.c'}
+  
+  The .c files will automatically be included in the list of files
+  deleted by a make clean.
+  
+  =item XSOPT
+  
+  String of options to pass to xsubpp.  This might include C<-C++> or
+  C<-extern>.  Do not include typemaps here; the TYPEMAP parameter exists for
+  that purpose.
+  
+  =item XSPROTOARG
+  
+  May be set to C<-protoypes>, C<-noprototypes> or the empty string.  The
+  empty string is equivalent to the xsubpp default, or C<-noprototypes>.
+  See the xsubpp documentation for details.  MakeMaker
+  defaults to the empty string.
+  
+  =item XS_VERSION
+  
+  Your version number for the .xs file of this package.  This defaults
+  to the value of the VERSION attribute.
+  
+  =back
+  
+  =head2 Additional lowercase attributes
+  
+  can be used to pass parameters to the methods which implement that
+  part of the Makefile.  Parameters are specified as a hash ref but are
+  passed to the method as a hash.
+  
+  =over 2
+  
+  =item clean
+  
+    {FILES => "*.xyz foo"}
+  
+  =item depend
+  
+    {ANY_TARGET => ANY_DEPENDENCY, ...}
+  
+  (ANY_TARGET must not be given a double-colon rule by MakeMaker.)
+  
+  =item dist
+  
+    {TARFLAGS => 'cvfF', COMPRESS => 'gzip', SUFFIX => '.gz',
+    SHAR => 'shar -m', DIST_CP => 'ln', ZIP => '/bin/zip',
+    ZIPFLAGS => '-rl', DIST_DEFAULT => 'private tardist' }
+  
+  If you specify COMPRESS, then SUFFIX should also be altered, as it is
+  needed to tell make the target file of the compression. Setting
+  DIST_CP to ln can be useful, if you need to preserve the timestamps on
+  your files. DIST_CP can take the values 'cp', which copies the file,
+  'ln', which links the file, and 'best' which copies symbolic links and
+  links the rest. Default is 'best'.
+  
+  =item dynamic_lib
+  
+    {ARMAYBE => 'ar', OTHERLDFLAGS => '...', INST_DYNAMIC_DEP => '...'}
+  
+  =item linkext
+  
+    {LINKTYPE => 'static', 'dynamic' or ''}
+  
+  NB: Extensions that have nothing but *.pm files had to say
+  
+    {LINKTYPE => ''}
+  
+  with Pre-5.0 MakeMakers. Since version 5.00 of MakeMaker such a line
+  can be deleted safely. MakeMaker recognizes when there's nothing to
+  be linked.
+  
+  =item macro
+  
+    {ANY_MACRO => ANY_VALUE, ...}
+  
+  =item postamble
+  
+  Anything put here will be passed to MY::postamble() if you have one.
+  
+  =item realclean
+  
+    {FILES => '$(INST_ARCHAUTODIR)/*.xyz'}
+  
+  =item test
+  
+  Specify the targets for testing.
+  
+    {TESTS => 't/*.t'}
+  
+  C<RECURSIVE_TEST_FILES> can be used to include all directories
+  recursively under C<t> that contain C<.t> files. It will be ignored if
+  you provide your own C<TESTS> attribute, defaults to false.
+  
+    {RECURSIVE_TEST_FILES=>1}
+  
+  =item tool_autosplit
+  
+    {MAXLEN => 8}
+  
+  =back
+  
+  =head2 Overriding MakeMaker Methods
+  
+  If you cannot achieve the desired Makefile behaviour by specifying
+  attributes you may define private subroutines in the Makefile.PL.
+  Each subroutine returns the text it wishes to have written to
+  the Makefile. To override a section of the Makefile you can
+  either say:
+  
+          sub MY::c_o { "new literal text" }
+  
+  or you can edit the default by saying something like:
+  
+          package MY; # so that "SUPER" works right
+          sub c_o {
+              my $inherited = shift->SUPER::c_o(@_);
+              $inherited =~ s/old text/new text/;
+              $inherited;
+          }
+  
+  If you are running experiments with embedding perl as a library into
+  other applications, you might find MakeMaker is not sufficient. You'd
+  better have a look at ExtUtils::Embed which is a collection of utilities
+  for embedding.
+  
+  If you still need a different solution, try to develop another
+  subroutine that fits your needs and submit the diffs to
+  C<makemaker@perl.org>
+  
+  For a complete description of all MakeMaker methods see
+  L<ExtUtils::MM_Unix>.
+  
+  Here is a simple example of how to add a new target to the generated
+  Makefile:
+  
+      sub MY::postamble {
+          return <<'MAKE_FRAG';
+      $(MYEXTLIB): sdbm/Makefile
+              cd sdbm && $(MAKE) all
+  
+      MAKE_FRAG
+      }
+  
+  =head2 The End Of Cargo Cult Programming
+  
+  WriteMakefile() now does some basic sanity checks on its parameters to
+  protect against typos and malformatted values.  This means some things
+  which happened to work in the past will now throw warnings and
+  possibly produce internal errors.
+  
+  Some of the most common mistakes:
+  
+  =over 2
+  
+  =item C<< MAN3PODS => ' ' >>
+  
+  This is commonly used to suppress the creation of man pages.  MAN3PODS
+  takes a hash ref not a string, but the above worked by accident in old
+  versions of MakeMaker.
+  
+  The correct code is C<< MAN3PODS => { } >>.
+  
+  =back
+  
+  
+  =head2 Hintsfile support
+  
+  MakeMaker.pm uses the architecture-specific information from
+  Config.pm. In addition it evaluates architecture specific hints files
+  in a C<hints/> directory. The hints files are expected to be named
+  like their counterparts in C<PERL_SRC/hints>, but with an C<.pl> file
+  name extension (eg. C<next_3_2.pl>). They are simply C<eval>ed by
+  MakeMaker within the WriteMakefile() subroutine, and can be used to
+  execute commands as well as to include special variables. The rules
+  which hintsfile is chosen are the same as in Configure.
+  
+  The hintsfile is eval()ed immediately after the arguments given to
+  WriteMakefile are stuffed into a hash reference $self but before this
+  reference becomes blessed. So if you want to do the equivalent to
+  override or create an attribute you would say something like
+  
+      $self->{LIBS} = ['-ldbm -lucb -lc'];
+  
+  =head2 Distribution Support
+  
+  For authors of extensions MakeMaker provides several Makefile
+  targets. Most of the support comes from the ExtUtils::Manifest module,
+  where additional documentation can be found.
+  
+  =over 4
+  
+  =item    make distcheck
+  
+  reports which files are below the build directory but not in the
+  MANIFEST file and vice versa. (See ExtUtils::Manifest::fullcheck() for
+  details)
+  
+  =item    make skipcheck
+  
+  reports which files are skipped due to the entries in the
+  C<MANIFEST.SKIP> file (See ExtUtils::Manifest::skipcheck() for
+  details)
+  
+  =item    make distclean
+  
+  does a realclean first and then the distcheck. Note that this is not
+  needed to build a new distribution as long as you are sure that the
+  MANIFEST file is ok.
+  
+  =item    make veryclean
+  
+  does a realclean first and then removes backup files such as C<*~>,
+  C<*.bak>, C<*.old> and C<*.orig>
+  
+  =item    make manifest
+  
+  rewrites the MANIFEST file, adding all remaining files found (See
+  ExtUtils::Manifest::mkmanifest() for details)
+  
+  =item    make distdir
+  
+  Copies all the files that are in the MANIFEST file to a newly created
+  directory with the name C<$(DISTNAME)-$(VERSION)>. If that directory
+  exists, it will be removed first.
+  
+  Additionally, it will create META.yml and META.json module meta-data file
+  in the distdir and add this to the distdir's MANIFEST.  You can shut this
+  behavior off with the NO_META flag.
+  
+  =item   make disttest
+  
+  Makes a distdir first, and runs a C<perl Makefile.PL>, a make, and
+  a make test in that directory.
+  
+  =item    make tardist
+  
+  First does a distdir. Then a command $(PREOP) which defaults to a null
+  command, followed by $(TO_UNIX), which defaults to a null command under
+  UNIX, and will convert files in distribution directory to UNIX format
+  otherwise. Next it runs C<tar> on that directory into a tarfile and
+  deletes the directory. Finishes with a command $(POSTOP) which
+  defaults to a null command.
+  
+  =item    make dist
+  
+  Defaults to $(DIST_DEFAULT) which in turn defaults to tardist.
+  
+  =item    make uutardist
+  
+  Runs a tardist first and uuencodes the tarfile.
+  
+  =item    make shdist
+  
+  First does a distdir. Then a command $(PREOP) which defaults to a null
+  command. Next it runs C<shar> on that directory into a sharfile and
+  deletes the intermediate directory again. Finishes with a command
+  $(POSTOP) which defaults to a null command.  Note: For shdist to work
+  properly a C<shar> program that can handle directories is mandatory.
+  
+  =item    make zipdist
+  
+  First does a distdir. Then a command $(PREOP) which defaults to a null
+  command. Runs C<$(ZIP) $(ZIPFLAGS)> on that directory into a
+  zipfile. Then deletes that directory. Finishes with a command
+  $(POSTOP) which defaults to a null command.
+  
+  =item    make ci
+  
+  Does a $(CI) and a $(RCS_LABEL) on all files in the MANIFEST file.
+  
+  =back
+  
+  Customization of the dist targets can be done by specifying a hash
+  reference to the dist attribute of the WriteMakefile call. The
+  following parameters are recognized:
+  
+      CI           ('ci -u')
+      COMPRESS     ('gzip --best')
+      POSTOP       ('@ :')
+      PREOP        ('@ :')
+      TO_UNIX      (depends on the system)
+      RCS_LABEL    ('rcs -q -Nv$(VERSION_SYM):')
+      SHAR         ('shar')
+      SUFFIX       ('.gz')
+      TAR          ('tar')
+      TARFLAGS     ('cvf')
+      ZIP          ('zip')
+      ZIPFLAGS     ('-r')
+  
+  An example:
+  
+      WriteMakefile(
+          ...other options...
+          dist => {
+              COMPRESS => "bzip2",
+              SUFFIX   => ".bz2"
+          }
+      );
+  
+  
+  =head2 Module Meta-Data (META and MYMETA)
+  
+  Long plaguing users of MakeMaker based modules has been the problem of
+  getting basic information about the module out of the sources
+  I<without> running the F<Makefile.PL> and doing a bunch of messy
+  heuristics on the resulting F<Makefile>.  Over the years, it has become
+  standard to keep this information in one or more CPAN Meta files
+  distributed with each distribution.
+  
+  The original format of CPAN Meta files was L<YAML> and the corresponding
+  file was called F<META.yml>.  In 2010, version 2 of the L<CPAN::Meta::Spec>
+  was released, which mandates JSON format for the metadata in order to
+  overcome certain compatibility issues between YAML serializers and to
+  avoid breaking older clients unable to handle a new version of the spec.
+  The L<CPAN::Meta> library is now standard for accessing old and new-style
+  Meta files.
+  
+  If L<CPAN::Meta> is installed, MakeMaker will automatically generate
+  F<META.json> and F<META.yml> files for you and add them to your F<MANIFEST> as
+  part of the 'distdir' target (and thus the 'dist' target).  This is intended to
+  seamlessly and rapidly populate CPAN with module meta-data.  If you wish to
+  shut this feature off, set the C<NO_META> C<WriteMakefile()> flag to true.
+  
+  At the 2008 QA Hackathon in Oslo, Perl module toolchain maintainers agrees
+  to use the CPAN Meta format to communicate post-configuration requirements
+  between toolchain components.  These files, F<MYMETA.json> and F<MYMETA.yml>,
+  are generated when F<Makefile.PL> generates a F<Makefile> (if L<CPAN::Meta>
+  is installed).  Clients like L<CPAN> or L<CPANPLUS> will read this
+  files to see what prerequisites must be fulfilled before building or testing
+  the distribution.  If you with to shut this feature off, set the C<NO_MYMETA>
+  C<WriteMakeFile()> flag to true.
+  
+  =head2 Disabling an extension
+  
+  If some events detected in F<Makefile.PL> imply that there is no way
+  to create the Module, but this is a normal state of things, then you
+  can create a F<Makefile> which does nothing, but succeeds on all the
+  "usual" build targets.  To do so, use
+  
+      use ExtUtils::MakeMaker qw(WriteEmptyMakefile);
+      WriteEmptyMakefile();
+  
+  instead of WriteMakefile().
+  
+  This may be useful if other modules expect this module to be I<built>
+  OK, as opposed to I<work> OK (say, this system-dependent module builds
+  in a subdirectory of some other distribution, or is listed as a
+  dependency in a CPAN::Bundle, but the functionality is supported by
+  different means on the current architecture).
+  
+  =head2 Other Handy Functions
+  
+  =over 4
+  
+  =item prompt
+  
+      my $value = prompt($message);
+      my $value = prompt($message, $default);
+  
+  The C<prompt()> function provides an easy way to request user input
+  used to write a makefile.  It displays the $message as a prompt for
+  input.  If a $default is provided it will be used as a default.  The
+  function returns the $value selected by the user.
+  
+  If C<prompt()> detects that it is not running interactively and there
+  is nothing on STDIN or if the PERL_MM_USE_DEFAULT environment variable
+  is set to true, the $default will be used without prompting.  This
+  prevents automated processes from blocking on user input.
+  
+  If no $default is provided an empty string will be used instead.
+  
+  =back
+  
+  =head2 Supported versions of Perl
+  
+  Please note that while this module works on Perl 5.6, it is no longer
+  being routinely tested on 5.6 - the earliest Perl version being routinely
+  tested, and expressly supported, is 5.8.1. However, patches to repair
+  any breakage on 5.6 are still being accepted.
+  
+  =head1 ENVIRONMENT
+  
+  =over 4
+  
+  =item PERL_MM_OPT
+  
+  Command line options used by C<MakeMaker-E<gt>new()>, and thus by
+  C<WriteMakefile()>.  The string is split as the shell would, and the result
+  is processed before any actual command line arguments are processed.
+  
+    PERL_MM_OPT='CCFLAGS="-Wl,-rpath -Wl,/foo/bar/lib" LIBS="-lwibble -lwobble"'
+  
+  =item PERL_MM_USE_DEFAULT
+  
+  If set to a true value then MakeMaker's prompt function will
+  always return the default without waiting for user input.
+  
+  =item PERL_CORE
+  
+  Same as the PERL_CORE parameter.  The parameter overrides this.
+  
+  =back
+  
+  =head1 SEE ALSO
+  
+  L<Module::Build> is a pure-Perl alternative to MakeMaker which does
+  not rely on make or any other external utility.  It is easier to
+  extend to suit your needs.
+  
+  L<Module::Install> is a wrapper around MakeMaker which adds features
+  not normally available.
+  
+  L<ExtUtils::ModuleMaker> and L<Module::Starter> are both modules to
+  help you setup your distribution.
+  
+  L<CPAN::Meta> and L<CPAN::Meta::Spec> explain CPAN Meta files in detail.
+  
+  L<File::ShareDir::Install> makes it easy to install static, sometimes
+  also referred to as 'shared' files. L<File::ShareDir> helps accessing
+  the shared files after installation.
+  
+  L<Dist::Zilla> makes it easy for the module author to create MakeMaker-based
+  distributions with lots of bells and whistles.
+  
+  =head1 AUTHORS
+  
+  Andy Dougherty C<doughera@lafayette.edu>, Andreas KE<ouml>nig
+  C<andreas.koenig@mind.de>, Tim Bunce C<timb@cpan.org>.  VMS
+  support by Charles Bailey C<bailey@newman.upenn.edu>.  OS/2 support
+  by Ilya Zakharevich C<ilya@math.ohio-state.edu>.
+  
+  Currently maintained by Michael G Schwern C<schwern@pobox.com>
+  
+  Send patches and ideas to C<makemaker@perl.org>.
+  
+  Send bug reports via http://rt.cpan.org/.  Please send your
+  generated Makefile along with your report.
+  
+  For more up-to-date information, see L<https://metacpan.org/release/ExtUtils-MakeMaker>.
+  
+  Repository available at L<https://github.com/Perl-Toolchain-Gang/ExtUtils-MakeMaker>.
+  
+  =head1 LICENSE
+  
+  This program is free software; you can redistribute it and/or
+  modify it under the same terms as Perl itself.
+  
+  See L<http://www.perl.com/perl/misc/Artistic.html>
+  
+  
+  =cut
+EXTUTILS_MAKEMAKER
+
+$fatpacked{"ExtUtils/MakeMaker/Config.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_MAKEMAKER_CONFIG';
+  package ExtUtils::MakeMaker::Config;
+  
+  use strict;
+  
+  our $VERSION = '7.04';
+  
+  use Config ();
+  
+  # Give us an overridable config.
+  our %Config = %Config::Config;
+  
+  sub import {
+      my $caller = caller;
+  
+      no strict 'refs';   ## no critic
+      *{$caller.'::Config'} = \%Config;
+  }
+  
+  1;
+  
+  
+  =head1 NAME
+  
+  ExtUtils::MakeMaker::Config - Wrapper around Config.pm
+  
+  
+  =head1 SYNOPSIS
+  
+    use ExtUtils::MakeMaker::Config;
+    print $Config{installbin};  # or whatever
+  
+  
+  =head1 DESCRIPTION
+  
+  B<FOR INTERNAL USE ONLY>
+  
+  A very thin wrapper around Config.pm so MakeMaker is easier to test.
+  
+  =cut
+EXTUTILS_MAKEMAKER_CONFIG
+
+$fatpacked{"ExtUtils/MakeMaker/Locale.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_MAKEMAKER_LOCALE';
+  package ExtUtils::MakeMaker::Locale;
+  
+  use strict;
+  our $VERSION = "7.04";
+  
+  use base 'Exporter';
+  our @EXPORT_OK = qw(
+      decode_argv env
+      $ENCODING_LOCALE $ENCODING_LOCALE_FS
+      $ENCODING_CONSOLE_IN $ENCODING_CONSOLE_OUT
+  );
+  
+  use Encode ();
+  use Encode::Alias ();
+  
+  our $ENCODING_LOCALE;
+  our $ENCODING_LOCALE_FS;
+  our $ENCODING_CONSOLE_IN;
+  our $ENCODING_CONSOLE_OUT;
+  
+  sub DEBUG () { 0 }
+  
+  sub _init {
+      if ($^O eq "MSWin32") {
+  	unless ($ENCODING_LOCALE) {
+  	    # Try to obtain what the Windows ANSI code page is
+  	    eval {
+  		unless (defined &GetACP) {
+  		    require Win32::API;
+  		    Win32::API->Import('kernel32', 'int GetACP()');
+  		};
+  		if (defined &GetACP) {
+  		    my $cp = GetACP();
+  		    $ENCODING_LOCALE = "cp$cp" if $cp;
+  		}
+  	    };
+  	}
+  
+  	unless ($ENCODING_CONSOLE_IN) {
+  	    # If we have the Win32::Console module installed we can ask
+  	    # it for the code set to use
+  	    eval {
+  		require Win32::Console;
+  		my $cp = Win32::Console::InputCP();
+  		$ENCODING_CONSOLE_IN = "cp$cp" if $cp;
+  		$cp = Win32::Console::OutputCP();
+  		$ENCODING_CONSOLE_OUT = "cp$cp" if $cp;
+  	    };
+  	    # Invoking the 'chcp' program might also work
+  	    if (!$ENCODING_CONSOLE_IN && (qx(chcp) || '') =~ /^Active code page: (\d+)/) {
+  		$ENCODING_CONSOLE_IN = "cp$1";
+  	    }
+  	}
+      }
+  
+      unless ($ENCODING_LOCALE) {
+  	eval {
+  	    require I18N::Langinfo;
+  	    $ENCODING_LOCALE = I18N::Langinfo::langinfo(I18N::Langinfo::CODESET());
+  
+  	    # Workaround of Encode < v2.25.  The "646" encoding  alias was
+  	    # introduced in Encode-2.25, but we don't want to require that version
+  	    # quite yet.  Should avoid the CPAN testers failure reported from
+  	    # openbsd-4.7/perl-5.10.0 combo.
+  	    $ENCODING_LOCALE = "ascii" if $ENCODING_LOCALE eq "646";
+  
+  	    # https://rt.cpan.org/Ticket/Display.html?id=66373
+  	    $ENCODING_LOCALE = "hp-roman8" if $^O eq "hpux" && $ENCODING_LOCALE eq "roman8";
+  	};
+  	$ENCODING_LOCALE ||= $ENCODING_CONSOLE_IN;
+      }
+  
+      if ($^O eq "darwin") {
+  	$ENCODING_LOCALE_FS ||= "UTF-8";
+      }
+  
+      # final fallback
+      $ENCODING_LOCALE ||= $^O eq "MSWin32" ? "cp1252" : "UTF-8";
+      $ENCODING_LOCALE_FS ||= $ENCODING_LOCALE;
+      $ENCODING_CONSOLE_IN ||= $ENCODING_LOCALE;
+      $ENCODING_CONSOLE_OUT ||= $ENCODING_CONSOLE_IN;
+  
+      unless (Encode::find_encoding($ENCODING_LOCALE)) {
+  	my $foundit;
+  	if (lc($ENCODING_LOCALE) eq "gb18030") {
+  	    eval {
+  		require Encode::HanExtra;
+  	    };
+  	    if ($@) {
+  		die "Need Encode::HanExtra to be installed to support locale codeset ($ENCODING_LOCALE), stopped";
+  	    }
+  	    $foundit++ if Encode::find_encoding($ENCODING_LOCALE);
+  	}
+  	die "The locale codeset ($ENCODING_LOCALE) isn't one that perl can decode, stopped"
+  	    unless $foundit;
+  
+      }
+  
+      # use Data::Dump; ddx $ENCODING_LOCALE, $ENCODING_LOCALE_FS, $ENCODING_CONSOLE_IN, $ENCODING_CONSOLE_OUT;
+  }
+  
+  _init();
+  Encode::Alias::define_alias(sub {
+      no strict 'refs';
+      no warnings 'once';
+      return ${"ENCODING_" . uc(shift)};
+  }, "locale");
+  
+  sub _flush_aliases {
+      no strict 'refs';
+      for my $a (keys %Encode::Alias::Alias) {
+  	if (defined ${"ENCODING_" . uc($a)}) {
+  	    delete $Encode::Alias::Alias{$a};
+  	    warn "Flushed alias cache for $a" if DEBUG;
+  	}
+      }
+  }
+  
+  sub reinit {
+      $ENCODING_LOCALE = shift;
+      $ENCODING_LOCALE_FS = shift;
+      $ENCODING_CONSOLE_IN = $ENCODING_LOCALE;
+      $ENCODING_CONSOLE_OUT = $ENCODING_LOCALE;
+      _init();
+      _flush_aliases();
+  }
+  
+  sub decode_argv {
+      die if defined wantarray;
+      for (@ARGV) {
+  	$_ = Encode::decode(locale => $_, @_);
+      }
+  }
+  
+  sub env {
+      my $k = Encode::encode(locale => shift);
+      my $old = $ENV{$k};
+      if (@_) {
+  	my $v = shift;
+  	if (defined $v) {
+  	    $ENV{$k} = Encode::encode(locale => $v);
+  	}
+  	else {
+  	    delete $ENV{$k};
+  	}
+      }
+      return Encode::decode(locale => $old) if defined wantarray;
+  }
+  
+  1;
+  
+  __END__
+  
+  =head1 NAME
+  
+  ExtUtils::MakeMaker::Locale - bundled Encode::Locale
+  
+  =head1 SYNOPSIS
+  
+    use Encode::Locale;
+    use Encode;
+  
+    $string = decode(locale => $bytes);
+    $bytes = encode(locale => $string);
+  
+    if (-t) {
+        binmode(STDIN, ":encoding(console_in)");
+        binmode(STDOUT, ":encoding(console_out)");
+        binmode(STDERR, ":encoding(console_out)");
+    }
+  
+    # Processing file names passed in as arguments
+    my $uni_filename = decode(locale => $ARGV[0]);
+    open(my $fh, "<", encode(locale_fs => $uni_filename))
+       || die "Can't open '$uni_filename': $!";
+    binmode($fh, ":encoding(locale)");
+    ...
+  
+  =head1 DESCRIPTION
+  
+  In many applications it's wise to let Perl use Unicode for the strings it
+  processes.  Most of the interfaces Perl has to the outside world are still byte
+  based.  Programs therefore need to decode byte strings that enter the program
+  from the outside and encode them again on the way out.
+  
+  The POSIX locale system is used to specify both the language conventions
+  requested by the user and the preferred character set to consume and
+  output.  The C<Encode::Locale> module looks up the charset and encoding (called
+  a CODESET in the locale jargon) and arranges for the L<Encode> module to know
+  this encoding under the name "locale".  It means bytes obtained from the
+  environment can be converted to Unicode strings by calling C<<
+  Encode::encode(locale => $bytes) >> and converted back again with C<<
+  Encode::decode(locale => $string) >>.
+  
+  Where file systems interfaces pass file names in and out of the program we also
+  need care.  The trend is for operating systems to use a fixed file encoding
+  that don't actually depend on the locale; and this module determines the most
+  appropriate encoding for file names. The L<Encode> module will know this
+  encoding under the name "locale_fs".  For traditional Unix systems this will
+  be an alias to the same encoding as "locale".
+  
+  For programs running in a terminal window (called a "Console" on some systems)
+  the "locale" encoding is usually a good choice for what to expect as input and
+  output.  Some systems allows us to query the encoding set for the terminal and
+  C<Encode::Locale> will do that if available and make these encodings known
+  under the C<Encode> aliases "console_in" and "console_out".  For systems where
+  we can't determine the terminal encoding these will be aliased as the same
+  encoding as "locale".  The advice is to use "console_in" for input known to
+  come from the terminal and "console_out" for output known to go from the
+  terminal.
+  
+  In addition to arranging for various Encode aliases the following functions and
+  variables are provided:
+  
+  =over
+  
+  =item decode_argv( )
+  
+  =item decode_argv( Encode::FB_CROAK )
+  
+  This will decode the command line arguments to perl (the C<@ARGV> array) in-place.
+  
+  The function will by default replace characters that can't be decoded by
+  "\x{FFFD}", the Unicode replacement character.
+  
+  Any argument provided is passed as CHECK to underlying Encode::decode() call.
+  Pass the value C<Encode::FB_CROAK> to have the decoding croak if not all the
+  command line arguments can be decoded.  See L<Encode/"Handling Malformed Data">
+  for details on other options for CHECK.
+  
+  =item env( $uni_key )
+  
+  =item env( $uni_key => $uni_value )
+  
+  Interface to get/set environment variables.  Returns the current value as a
+  Unicode string. The $uni_key and $uni_value arguments are expected to be
+  Unicode strings as well.  Passing C<undef> as $uni_value deletes the
+  environment variable named $uni_key.
+  
+  The returned value will have the characters that can't be decoded replaced by
+  "\x{FFFD}", the Unicode replacement character.
+  
+  There is no interface to request alternative CHECK behavior as for
+  decode_argv().  If you need that you need to call encode/decode yourself.
+  For example:
+  
+      my $key = Encode::encode(locale => $uni_key, Encode::FB_CROAK);
+      my $uni_value = Encode::decode(locale => $ENV{$key}, Encode::FB_CROAK);
+  
+  =item reinit( )
+  
+  =item reinit( $encoding )
+  
+  Reinitialize the encodings from the locale.  You want to call this function if
+  you changed anything in the environment that might influence the locale.
+  
+  This function will croak if the determined encoding isn't recognized by
+  the Encode module.
+  
+  With argument force $ENCODING_... variables to set to the given value.
+  
+  =item $ENCODING_LOCALE
+  
+  The encoding name determined to be suitable for the current locale.
+  L<Encode> know this encoding as "locale".
+  
+  =item $ENCODING_LOCALE_FS
+  
+  The encoding name determined to be suiteable for file system interfaces
+  involving file names.
+  L<Encode> know this encoding as "locale_fs".
+  
+  =item $ENCODING_CONSOLE_IN
+  
+  =item $ENCODING_CONSOLE_OUT
+  
+  The encodings to be used for reading and writing output to the a console.
+  L<Encode> know these encodings as "console_in" and "console_out".
+  
+  =back
+  
+  =head1 NOTES
+  
+  This table summarizes the mapping of the encodings set up
+  by the C<Encode::Locale> module:
+  
+    Encode      |         |              |
+    Alias       | Windows | Mac OS X     | POSIX
+    ------------+---------+--------------+------------
+    locale      | ANSI    | nl_langinfo  | nl_langinfo
+    locale_fs   | ANSI    | UTF-8        | nl_langinfo
+    console_in  | OEM     | nl_langinfo  | nl_langinfo
+    console_out | OEM     | nl_langinfo  | nl_langinfo
+  
+  =head2 Windows
+  
+  Windows has basically 2 sets of APIs.  A wide API (based on passing UTF-16
+  strings) and a byte based API based a character set called ANSI.  The
+  regular Perl interfaces to the OS currently only uses the ANSI APIs.
+  Unfortunately ANSI is not a single character set.
+  
+  The encoding that corresponds to ANSI varies between different editions of
+  Windows.  For many western editions of Windows ANSI corresponds to CP-1252
+  which is a character set similar to ISO-8859-1.  Conceptually the ANSI
+  character set is a similar concept to the POSIX locale CODESET so this module
+  figures out what the ANSI code page is and make this available as
+  $ENCODING_LOCALE and the "locale" Encoding alias.
+  
+  Windows systems also operate with another byte based character set.
+  It's called the OEM code page.  This is the encoding that the Console
+  takes as input and output.  It's common for the OEM code page to
+  differ from the ANSI code page.
+  
+  =head2 Mac OS X
+  
+  On Mac OS X the file system encoding is always UTF-8 while the locale
+  can otherwise be set up as normal for POSIX systems.
+  
+  File names on Mac OS X will at the OS-level be converted to
+  NFD-form.  A file created by passing a NFC-filename will come
+  in NFD-form from readdir().  See L<Unicode::Normalize> for details
+  of NFD/NFC.
+  
+  Actually, Apple does not follow the Unicode NFD standard since not all
+  character ranges are decomposed.  The claim is that this avoids problems with
+  round trip conversions from old Mac text encodings.  See L<Encode::UTF8Mac> for
+  details.
+  
+  =head2 POSIX (Linux and other Unixes)
+  
+  File systems might vary in what encoding is to be used for
+  filenames.  Since this module has no way to actually figure out
+  what the is correct it goes with the best guess which is to
+  assume filenames are encoding according to the current locale.
+  Users are advised to always specify UTF-8 as the locale charset.
+  
+  =head1 SEE ALSO
+  
+  L<I18N::Langinfo>, L<Encode>
+  
+  =head1 AUTHOR
+  
+  Copyright 2010 Gisle Aas <gisle@aas.no>.
+  
+  This library is free software; you can redistribute it and/or
+  modify it under the same terms as Perl itself.
+  
+  =cut
+EXTUTILS_MAKEMAKER_LOCALE
+
+$fatpacked{"ExtUtils/MakeMaker/version.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_MAKEMAKER_VERSION';
+  #--------------------------------------------------------------------------#
+  # This is a modified copy of version.pm 0.9909, bundled exclusively for
+  # use by ExtUtils::Makemaker and its dependencies to bootstrap when
+  # version.pm is not available.  It should not be used by ordinary modules.
+  #
+  # When loaded, it will try to load version.pm.  If that fails, it will load
+  # ExtUtils::MakeMaker::version::vpp and alias various *version functions
+  # to functions in that module.  It will also override UNIVERSAL::VERSION.
+  #--------------------------------------------------------------------------#
+  
+  package ExtUtils::MakeMaker::version;
+  
+  use 5.006002;
+  use strict;
+  
+  use vars qw(@ISA $VERSION $CLASS $STRICT $LAX *declare *qv);
+  
+  $VERSION = '7.04';
+  $CLASS = 'version';
+  
+  {
+      local $SIG{'__DIE__'};
+      eval "use version";
+      if ( $@ ) { # don't have any version.pm installed
+          eval "use ExtUtils::MakeMaker::version::vpp";
+          die "$@" if ( $@ );
+          local $^W;
+          delete $INC{'version.pm'};
+          $INC{'version.pm'} = $INC{'ExtUtils/MakeMaker/version.pm'};
+          push @version::ISA, "ExtUtils::MakeMaker::version::vpp";
+          $version::VERSION = $VERSION;
+          *version::qv = \&ExtUtils::MakeMaker::version::vpp::qv;
+          *version::declare = \&ExtUtils::MakeMaker::version::vpp::declare;
+          *version::_VERSION = \&ExtUtils::MakeMaker::version::vpp::_VERSION;
+          *version::vcmp = \&ExtUtils::MakeMaker::version::vpp::vcmp;
+          *version::new = \&ExtUtils::MakeMaker::version::vpp::new;
+          if ($] >= 5.009000) {
+              no strict 'refs';
+              *version::stringify = \&ExtUtils::MakeMaker::version::vpp::stringify;
+              *{'version::(""'} = \&ExtUtils::MakeMaker::version::vpp::stringify;
+              *{'version::(<=>'} = \&ExtUtils::MakeMaker::version::vpp::vcmp;
+              *version::parse = \&ExtUtils::MakeMaker::version::vpp::parse;
+          }
+          require ExtUtils::MakeMaker::version::regex;
+          *version::is_lax = \&ExtUtils::MakeMaker::version::regex::is_lax;
+          *version::is_strict = \&ExtUtils::MakeMaker::version::regex::is_strict;
+          *LAX = \$ExtUtils::MakeMaker::version::regex::LAX;
+          *STRICT = \$ExtUtils::MakeMaker::version::regex::STRICT;
+      }
+      elsif ( ! version->can('is_qv') ) {
+          *version::is_qv = sub { exists $_[0]->{qv} };
+      }
+  }
+  
+  1;
+EXTUTILS_MAKEMAKER_VERSION
+
+$fatpacked{"ExtUtils/MakeMaker/version/regex.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_MAKEMAKER_VERSION_REGEX';
+  #--------------------------------------------------------------------------#
+  # This is a modified copy of version.pm 0.9909, bundled exclusively for
+  # use by ExtUtils::Makemaker and its dependencies to bootstrap when
+  # version.pm is not available.  It should not be used by ordinary modules.
+  #--------------------------------------------------------------------------#
+  
+  package ExtUtils::MakeMaker::version::regex;
+  
+  use strict;
+  
+  use vars qw($VERSION $CLASS $STRICT $LAX);
+  
+  $VERSION = '7.04';
+  
+  #--------------------------------------------------------------------------#
+  # Version regexp components
+  #--------------------------------------------------------------------------#
+  
+  # Fraction part of a decimal version number.  This is a common part of
+  # both strict and lax decimal versions
+  
+  my $FRACTION_PART = qr/\.[0-9]+/;
+  
+  # First part of either decimal or dotted-decimal strict version number.
+  # Unsigned integer with no leading zeroes (except for zero itself) to
+  # avoid confusion with octal.
+  
+  my $STRICT_INTEGER_PART = qr/0|[1-9][0-9]*/;
+  
+  # First part of either decimal or dotted-decimal lax version number.
+  # Unsigned integer, but allowing leading zeros.  Always interpreted
+  # as decimal.  However, some forms of the resulting syntax give odd
+  # results if used as ordinary Perl expressions, due to how perl treats
+  # octals.  E.g.
+  #   version->new("010" ) == 10
+  #   version->new( 010  ) == 8
+  #   version->new( 010.2) == 82  # "8" . "2"
+  
+  my $LAX_INTEGER_PART = qr/[0-9]+/;
+  
+  # Second and subsequent part of a strict dotted-decimal version number.
+  # Leading zeroes are permitted, and the number is always decimal.
+  # Limited to three digits to avoid overflow when converting to decimal
+  # form and also avoid problematic style with excessive leading zeroes.
+  
+  my $STRICT_DOTTED_DECIMAL_PART = qr/\.[0-9]{1,3}/;
+  
+  # Second and subsequent part of a lax dotted-decimal version number.
+  # Leading zeroes are permitted, and the number is always decimal.  No
+  # limit on the numerical value or number of digits, so there is the
+  # possibility of overflow when converting to decimal form.
+  
+  my $LAX_DOTTED_DECIMAL_PART = qr/\.[0-9]+/;
+  
+  # Alpha suffix part of lax version number syntax.  Acts like a
+  # dotted-decimal part.
+  
+  my $LAX_ALPHA_PART = qr/_[0-9]+/;
+  
+  #--------------------------------------------------------------------------#
+  # Strict version regexp definitions
+  #--------------------------------------------------------------------------#
+  
+  # Strict decimal version number.
+  
+  my $STRICT_DECIMAL_VERSION =
+      qr/ $STRICT_INTEGER_PART $FRACTION_PART? /x;
+  
+  # Strict dotted-decimal version number.  Must have both leading "v" and
+  # at least three parts, to avoid confusion with decimal syntax.
+  
+  my $STRICT_DOTTED_DECIMAL_VERSION =
+      qr/ v $STRICT_INTEGER_PART $STRICT_DOTTED_DECIMAL_PART{2,} /x;
+  
+  # Complete strict version number syntax -- should generally be used
+  # anchored: qr/ \A $STRICT \z /x
+  
+  $STRICT =
+      qr/ $STRICT_DECIMAL_VERSION | $STRICT_DOTTED_DECIMAL_VERSION /x;
+  
+  #--------------------------------------------------------------------------#
+  # Lax version regexp definitions
+  #--------------------------------------------------------------------------#
+  
+  # Lax decimal version number.  Just like the strict one except for
+  # allowing an alpha suffix or allowing a leading or trailing
+  # decimal-point
+  
+  my $LAX_DECIMAL_VERSION =
+      qr/ $LAX_INTEGER_PART (?: \. | $FRACTION_PART $LAX_ALPHA_PART? )?
+  	|
+  	$FRACTION_PART $LAX_ALPHA_PART?
+      /x;
+  
+  # Lax dotted-decimal version number.  Distinguished by having either
+  # leading "v" or at least three non-alpha parts.  Alpha part is only
+  # permitted if there are at least two non-alpha parts. Strangely
+  # enough, without the leading "v", Perl takes .1.2 to mean v0.1.2,
+  # so when there is no "v", the leading part is optional
+  
+  my $LAX_DOTTED_DECIMAL_VERSION =
+      qr/
+  	v $LAX_INTEGER_PART (?: $LAX_DOTTED_DECIMAL_PART+ $LAX_ALPHA_PART? )?
+  	|
+  	$LAX_INTEGER_PART? $LAX_DOTTED_DECIMAL_PART{2,} $LAX_ALPHA_PART?
+      /x;
+  
+  # Complete lax version number syntax -- should generally be used
+  # anchored: qr/ \A $LAX \z /x
+  #
+  # The string 'undef' is a special case to make for easier handling
+  # of return values from ExtUtils::MM->parse_version
+  
+  $LAX =
+      qr/ undef | $LAX_DECIMAL_VERSION | $LAX_DOTTED_DECIMAL_VERSION /x;
+  
+  #--------------------------------------------------------------------------#
+  
+  # Preloaded methods go here.
+  sub is_strict	{ defined $_[0] && $_[0] =~ qr/ \A $STRICT \z /x }
+  sub is_lax	{ defined $_[0] && $_[0] =~ qr/ \A $LAX \z /x }
+  
+  1;
+EXTUTILS_MAKEMAKER_VERSION_REGEX
+
+$fatpacked{"ExtUtils/MakeMaker/version/vpp.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_MAKEMAKER_VERSION_VPP';
+  #--------------------------------------------------------------------------#
+  # This is a modified copy of version.pm 0.9909, bundled exclusively for
+  # use by ExtUtils::Makemaker and its dependencies to bootstrap when
+  # version.pm is not available.  It should not be used by ordinary modules.
+  #--------------------------------------------------------------------------#
+  
+  package ExtUtils::MakeMaker::charstar;
+  # a little helper class to emulate C char* semantics in Perl
+  # so that prescan_version can use the same code as in C
+  
+  use overload (
+      '""'	=> \&thischar,
+      '0+'	=> \&thischar,
+      '++'	=> \&increment,
+      '--'	=> \&decrement,
+      '+'		=> \&plus,
+      '-'		=> \&minus,
+      '*'		=> \&multiply,
+      'cmp'	=> \&cmp,
+      '<=>'	=> \&spaceship,
+      'bool'	=> \&thischar,
+      '='		=> \&clone,
+  );
+  
+  sub new {
+      my ($self, $string) = @_;
+      my $class = ref($self) || $self;
+  
+      my $obj = {
+  	string  => [split(//,$string)],
+  	current => 0,
+      };
+      return bless $obj, $class;
+  }
+  
+  sub thischar {
+      my ($self) = @_;
+      my $last = $#{$self->{string}};
+      my $curr = $self->{current};
+      if ($curr >= 0 && $curr <= $last) {
+  	return $self->{string}->[$curr];
+      }
+      else {
+  	return '';
+      }
+  }
+  
+  sub increment {
+      my ($self) = @_;
+      $self->{current}++;
+  }
+  
+  sub decrement {
+      my ($self) = @_;
+      $self->{current}--;
+  }
+  
+  sub plus {
+      my ($self, $offset) = @_;
+      my $rself = $self->clone;
+      $rself->{current} += $offset;
+      return $rself;
+  }
+  
+  sub minus {
+      my ($self, $offset) = @_;
+      my $rself = $self->clone;
+      $rself->{current} -= $offset;
+      return $rself;
+  }
+  
+  sub multiply {
+      my ($left, $right, $swapped) = @_;
+      my $char = $left->thischar();
+      return $char * $right;
+  }
+  
+  sub spaceship {
+      my ($left, $right, $swapped) = @_;
+      unless (ref($right)) { # not an object already
+  	$right = $left->new($right);
+      }
+      return $left->{current} <=> $right->{current};
+  }
+  
+  sub cmp {
+      my ($left, $right, $swapped) = @_;
+      unless (ref($right)) { # not an object already
+  	if (length($right) == 1) { # comparing single character only
+  	    return $left->thischar cmp $right;
+  	}
+  	$right = $left->new($right);
+      }
+      return $left->currstr cmp $right->currstr;
+  }
+  
+  sub bool {
+      my ($self) = @_;
+      my $char = $self->thischar;
+      return ($char ne '');
+  }
+  
+  sub clone {
+      my ($left, $right, $swapped) = @_;
+      $right = {
+  	string  => [@{$left->{string}}],
+  	current => $left->{current},
+      };
+      return bless $right, ref($left);
+  }
+  
+  sub currstr {
+      my ($self, $s) = @_;
+      my $curr = $self->{current};
+      my $last = $#{$self->{string}};
+      if (defined($s) && $s->{current} < $last) {
+  	$last = $s->{current};
+      }
+  
+      my $string = join('', @{$self->{string}}[$curr..$last]);
+      return $string;
+  }
+  
+  package ExtUtils::MakeMaker::version::vpp;
+  
+  use 5.006002;
+  use strict;
+  
+  use Config;
+  use vars qw($VERSION $CLASS @ISA $LAX $STRICT);
+  $VERSION = '7.04';
+  $CLASS = 'ExtUtils::MakeMaker::version::vpp';
+  
+  require ExtUtils::MakeMaker::version::regex;
+  *ExtUtils::MakeMaker::version::vpp::is_strict = \&ExtUtils::MakeMaker::version::regex::is_strict;
+  *ExtUtils::MakeMaker::version::vpp::is_lax = \&ExtUtils::MakeMaker::version::regex::is_lax;
+  *LAX = \$ExtUtils::MakeMaker::version::regex::LAX;
+  *STRICT = \$ExtUtils::MakeMaker::version::regex::STRICT;
+  
+  use overload (
+      '""'       => \&stringify,
+      '0+'       => \&numify,
+      'cmp'      => \&vcmp,
+      '<=>'      => \&vcmp,
+      'bool'     => \&vbool,
+      '+'        => \&vnoop,
+      '-'        => \&vnoop,
+      '*'        => \&vnoop,
+      '/'        => \&vnoop,
+      '+='        => \&vnoop,
+      '-='        => \&vnoop,
+      '*='        => \&vnoop,
+      '/='        => \&vnoop,
+      'abs'      => \&vnoop,
+  );
+  
+  eval "use warnings";
+  if ($@) {
+      eval '
+  	package
+  	warnings;
+  	sub enabled {return $^W;}
+  	1;
+      ';
+  }
+  
+  sub import {
+      no strict 'refs';
+      my ($class) = shift;
+  
+      # Set up any derived class
+      unless ($class eq $CLASS) {
+  	local $^W;
+  	*{$class.'::declare'} =  \&{$CLASS.'::declare'};
+  	*{$class.'::qv'} = \&{$CLASS.'::qv'};
+      }
+  
+      my %args;
+      if (@_) { # any remaining terms are arguments
+  	map { $args{$_} = 1 } @_
+      }
+      else { # no parameters at all on use line
+  	%args =
+  	(
+  	    qv => 1,
+  	    'UNIVERSAL::VERSION' => 1,
+  	);
+      }
+  
+      my $callpkg = caller();
+  
+      if (exists($args{declare})) {
+  	*{$callpkg.'::declare'} =
+  	    sub {return $class->declare(shift) }
+  	  unless defined(&{$callpkg.'::declare'});
+      }
+  
+      if (exists($args{qv})) {
+  	*{$callpkg.'::qv'} =
+  	    sub {return $class->qv(shift) }
+  	  unless defined(&{$callpkg.'::qv'});
+      }
+  
+      if (exists($args{'UNIVERSAL::VERSION'})) {
+  	local $^W;
+  	*UNIVERSAL::VERSION
+  		= \&{$CLASS.'::_VERSION'};
+      }
+  
+      if (exists($args{'VERSION'})) {
+  	*{$callpkg.'::VERSION'} = \&{$CLASS.'::_VERSION'};
+      }
+  
+      if (exists($args{'is_strict'})) {
+  	*{$callpkg.'::is_strict'} = \&{$CLASS.'::is_strict'}
+  	  unless defined(&{$callpkg.'::is_strict'});
+      }
+  
+      if (exists($args{'is_lax'})) {
+  	*{$callpkg.'::is_lax'} = \&{$CLASS.'::is_lax'}
+  	  unless defined(&{$callpkg.'::is_lax'});
+      }
+  }
+  
+  my $VERSION_MAX = 0x7FFFFFFF;
+  
+  # implement prescan_version as closely to the C version as possible
+  use constant TRUE  => 1;
+  use constant FALSE => 0;
+  
+  sub isDIGIT {
+      my ($char) = shift->thischar();
+      return ($char =~ /\d/);
+  }
+  
+  sub isALPHA {
+      my ($char) = shift->thischar();
+      return ($char =~ /[a-zA-Z]/);
+  }
+  
+  sub isSPACE {
+      my ($char) = shift->thischar();
+      return ($char =~ /\s/);
+  }
+  
+  sub BADVERSION {
+      my ($s, $errstr, $error) = @_;
+      if ($errstr) {
+  	$$errstr = $error;
+      }
+      return $s;
+  }
+  
+  sub prescan_version {
+      my ($s, $strict, $errstr, $sqv, $ssaw_decimal, $swidth, $salpha) = @_;
+      my $qv          = defined $sqv          ? $$sqv          : FALSE;
+      my $saw_decimal = defined $ssaw_decimal ? $$ssaw_decimal : 0;
+      my $width       = defined $swidth       ? $$swidth       : 3;
+      my $alpha       = defined $salpha       ? $$salpha       : FALSE;
+  
+      my $d = $s;
+  
+      if ($qv && isDIGIT($d)) {
+  	goto dotted_decimal_version;
+      }
+  
+      if ($d eq 'v') { # explicit v-string
+  	$d++;
+  	if (isDIGIT($d)) {
+  	    $qv = TRUE;
+  	}
+  	else { # degenerate v-string
+  	    # requires v1.2.3
+  	    return BADVERSION($s,$errstr,"Invalid version format (dotted-decimal versions require at least three parts)");
+  	}
+  
+  dotted_decimal_version:
+  	if ($strict && $d eq '0' && isDIGIT($d+1)) {
+  	    # no leading zeros allowed
+  	    return BADVERSION($s,$errstr,"Invalid version format (no leading zeros)");
+  	}
+  
+  	while (isDIGIT($d)) { 	# integer part
+  	    $d++;
+  	}
+  
+  	if ($d eq '.')
+  	{
+  	    $saw_decimal++;
+  	    $d++; 		# decimal point
+  	}
+  	else
+  	{
+  	    if ($strict) {
+  		# require v1.2.3
+  		return BADVERSION($s,$errstr,"Invalid version format (dotted-decimal versions require at least three parts)");
+  	    }
+  	    else {
+  		goto version_prescan_finish;
+  	    }
+  	}
+  
+  	{
+  	    my $i = 0;
+  	    my $j = 0;
+  	    while (isDIGIT($d)) {	# just keep reading
+  		$i++;
+  		while (isDIGIT($d)) {
+  		    $d++; $j++;
+  		    # maximum 3 digits between decimal
+  		    if ($strict && $j > 3) {
+  			return BADVERSION($s,$errstr,"Invalid version format (maximum 3 digits between decimals)");
+  		    }
+  		}
+  		if ($d eq '_') {
+  		    if ($strict) {
+  			return BADVERSION($s,$errstr,"Invalid version format (no underscores)");
+  		    }
+  		    if ( $alpha ) {
+  			return BADVERSION($s,$errstr,"Invalid version format (multiple underscores)");
+  		    }
+  		    $d++;
+  		    $alpha = TRUE;
+  		}
+  		elsif ($d eq '.') {
+  		    if ($alpha) {
+  			return BADVERSION($s,$errstr,"Invalid version format (underscores before decimal)");
+  		    }
+  		    $saw_decimal++;
+  		    $d++;
+  		}
+  		elsif (!isDIGIT($d)) {
+  		    last;
+  		}
+  		$j = 0;
+  	    }
+  
+  	    if ($strict && $i < 2) {
+  		# requires v1.2.3
+  		return BADVERSION($s,$errstr,"Invalid version format (dotted-decimal versions require at least three parts)");
+  	    }
+  	}
+      } 					# end if dotted-decimal
+      else
+      {					# decimal versions
+  	my $j = 0;
+  	# special $strict case for leading '.' or '0'
+  	if ($strict) {
+  	    if ($d eq '.') {
+  		return BADVERSION($s,$errstr,"Invalid version format (0 before decimal required)");
+  	    }
+  	    if ($d eq '0' && isDIGIT($d+1)) {
+  		return BADVERSION($s,$errstr,"Invalid version format (no leading zeros)");
+  	    }
+  	}
+  
+  	# and we never support negative version numbers
+  	if ($d eq '-') {
+  	    return BADVERSION($s,$errstr,"Invalid version format (negative version number)");
+  	}
+  
+  	# consume all of the integer part
+  	while (isDIGIT($d)) {
+  	    $d++;
+  	}
+  
+  	# look for a fractional part
+  	if ($d eq '.') {
+  	    # we found it, so consume it
+  	    $saw_decimal++;
+  	    $d++;
+  	}
+  	elsif (!$d || $d eq ';' || isSPACE($d) || $d eq '}') {
+  	    if ( $d == $s ) {
+  		# found nothing
+  		return BADVERSION($s,$errstr,"Invalid version format (version required)");
+  	    }
+  	    # found just an integer
+  	    goto version_prescan_finish;
+  	}
+  	elsif ( $d == $s ) {
+  	    # didn't find either integer or period
+  	    return BADVERSION($s,$errstr,"Invalid version format (non-numeric data)");
+  	}
+  	elsif ($d eq '_') {
+  	    # underscore can't come after integer part
+  	    if ($strict) {
+  		return BADVERSION($s,$errstr,"Invalid version format (no underscores)");
+  	    }
+  	    elsif (isDIGIT($d+1)) {
+  		return BADVERSION($s,$errstr,"Invalid version format (alpha without decimal)");
+  	    }
+  	    else {
+  		return BADVERSION($s,$errstr,"Invalid version format (misplaced underscore)");
+  	    }
+  	}
+  	elsif ($d) {
+  	    # anything else after integer part is just invalid data
+  	    return BADVERSION($s,$errstr,"Invalid version format (non-numeric data)");
+  	}
+  
+  	# scan the fractional part after the decimal point
+  	if ($d && !isDIGIT($d) && ($strict || ! ($d eq ';' || isSPACE($d) || $d eq '}') )) {
+  		# $strict or lax-but-not-the-end
+  		return BADVERSION($s,$errstr,"Invalid version format (fractional part required)");
+  	}
+  
+  	while (isDIGIT($d)) {
+  	    $d++; $j++;
+  	    if ($d eq '.' && isDIGIT($d-1)) {
+  		if ($alpha) {
+  		    return BADVERSION($s,$errstr,"Invalid version format (underscores before decimal)");
+  		}
+  		if ($strict) {
+  		    return BADVERSION($s,$errstr,"Invalid version format (dotted-decimal versions must begin with 'v')");
+  		}
+  		$d = $s; # start all over again
+  		$qv = TRUE;
+  		goto dotted_decimal_version;
+  	    }
+  	    if ($d eq '_') {
+  		if ($strict) {
+  		    return BADVERSION($s,$errstr,"Invalid version format (no underscores)");
+  		}
+  		if ( $alpha ) {
+  		    return BADVERSION($s,$errstr,"Invalid version format (multiple underscores)");
+  		}
+  		if ( ! isDIGIT($d+1) ) {
+  		    return BADVERSION($s,$errstr,"Invalid version format (misplaced underscore)");
+  		}
+  		$width = $j;
+  		$d++;
+  		$alpha = TRUE;
+  	    }
+  	}
+      }
+  
+  version_prescan_finish:
+      while (isSPACE($d)) {
+  	$d++;
+      }
+  
+      if ($d && !isDIGIT($d) && (! ($d eq ';' || $d eq '}') )) {
+  	# trailing non-numeric data
+  	return BADVERSION($s,$errstr,"Invalid version format (non-numeric data)");
+      }
+  
+      if (defined $sqv) {
+  	$$sqv = $qv;
+      }
+      if (defined $swidth) {
+  	$$swidth = $width;
+      }
+      if (defined $ssaw_decimal) {
+  	$$ssaw_decimal = $saw_decimal;
+      }
+      if (defined $salpha) {
+  	$$salpha = $alpha;
+      }
+      return $d;
+  }
+  
+  sub scan_version {
+      my ($s, $rv, $qv) = @_;
+      my $start;
+      my $pos;
+      my $last;
+      my $errstr;
+      my $saw_decimal = 0;
+      my $width = 3;
+      my $alpha = FALSE;
+      my $vinf = FALSE;
+      my @av;
+  
+      $s = new ExtUtils::MakeMaker::charstar $s;
+  
+      while (isSPACE($s)) { # leading whitespace is OK
+  	$s++;
+      }
+  
+      $last = prescan_version($s, FALSE, \$errstr, \$qv, \$saw_decimal,
+  	\$width, \$alpha);
+  
+      if ($errstr) {
+  	# 'undef' is a special case and not an error
+  	if ( $s ne 'undef') {
+  	    require Carp;
+  	    Carp::croak($errstr);
+  	}
+      }
+  
+      $start = $s;
+      if ($s eq 'v') {
+  	$s++;
+      }
+      $pos = $s;
+  
+      if ( $qv ) {
+  	$$rv->{qv} = $qv;
+      }
+      if ( $alpha ) {
+  	$$rv->{alpha} = $alpha;
+      }
+      if ( !$qv && $width < 3 ) {
+  	$$rv->{width} = $width;
+      }
+  
+      while (isDIGIT($pos)) {
+  	$pos++;
+      }
+      if (!isALPHA($pos)) {
+  	my $rev;
+  
+  	for (;;) {
+  	    $rev = 0;
+  	    {
+    		# this is atoi() that delimits on underscores
+    		my $end = $pos;
+    		my $mult = 1;
+  		my $orev;
+  
+  		#  the following if() will only be true after the decimal
+  		#  point of a version originally created with a bare
+  		#  floating point number, i.e. not quoted in any way
+  		#
+   		if ( !$qv && $s > $start && $saw_decimal == 1 ) {
+  		    $mult *= 100;
+   		    while ( $s < $end ) {
+  			$orev = $rev;
+   			$rev += $s * $mult;
+   			$mult /= 10;
+  			if (   (abs($orev) > abs($rev))
+  			    || (abs($rev) > $VERSION_MAX )) {
+  			    warn("Integer overflow in version %d",
+  					   $VERSION_MAX);
+  			    $s = $end - 1;
+  			    $rev = $VERSION_MAX;
+  			    $vinf = 1;
+  			}
+   			$s++;
+  			if ( $s eq '_' ) {
+  			    $s++;
+  			}
+   		    }
+    		}
+   		else {
+   		    while (--$end >= $s) {
+  			$orev = $rev;
+   			$rev += $end * $mult;
+   			$mult *= 10;
+  			if (   (abs($orev) > abs($rev))
+  			    || (abs($rev) > $VERSION_MAX )) {
+  			    warn("Integer overflow in version");
+  			    $end = $s - 1;
+  			    $rev = $VERSION_MAX;
+  			    $vinf = 1;
+  			}
+   		    }
+   		}
+    	    }
+  
+    	    # Append revision
+  	    push @av, $rev;
+  	    if ( $vinf ) {
+  		$s = $last;
+  		last;
+  	    }
+  	    elsif ( $pos eq '.' ) {
+  		$s = ++$pos;
+  	    }
+  	    elsif ( $pos eq '_' && isDIGIT($pos+1) ) {
+  		$s = ++$pos;
+  	    }
+  	    elsif ( $pos eq ',' && isDIGIT($pos+1) ) {
+  		$s = ++$pos;
+  	    }
+  	    elsif ( isDIGIT($pos) ) {
+  		$s = $pos;
+  	    }
+  	    else {
+  		$s = $pos;
+  		last;
+  	    }
+  	    if ( $qv ) {
+  		while ( isDIGIT($pos) ) {
+  		    $pos++;
+  		}
+  	    }
+  	    else {
+  		my $digits = 0;
+  		while ( ( isDIGIT($pos) || $pos eq '_' ) && $digits < 3 ) {
+  		    if ( $pos ne '_' ) {
+  			$digits++;
+  		    }
+  		    $pos++;
+  		}
+  	    }
+  	}
+      }
+      if ( $qv ) { # quoted versions always get at least three terms
+  	my $len = $#av;
+  	#  This for loop appears to trigger a compiler bug on OS X, as it
+  	#  loops infinitely. Yes, len is negative. No, it makes no sense.
+  	#  Compiler in question is:
+  	#  gcc version 3.3 20030304 (Apple Computer, Inc. build 1640)
+  	#  for ( len = 2 - len; len > 0; len-- )
+  	#  av_push(MUTABLE_AV(sv), newSViv(0));
+  	#
+  	$len = 2 - $len;
+  	while ($len-- > 0) {
+  	    push @av, 0;
+  	}
+      }
+  
+      # need to save off the current version string for later
+      if ( $vinf ) {
+  	$$rv->{original} = "v.Inf";
+  	$$rv->{vinf} = 1;
+      }
+      elsif ( $s > $start ) {
+  	$$rv->{original} = $start->currstr($s);
+  	if ( $qv && $saw_decimal == 1 && $start ne 'v' ) {
+  	    # need to insert a v to be consistent
+  	    $$rv->{original} = 'v' . $$rv->{original};
+  	}
+      }
+      else {
+  	$$rv->{original} = '0';
+  	push(@av, 0);
+      }
+  
+      # And finally, store the AV in the hash
+      $$rv->{version} = \@av;
+  
+      # fix RT#19517 - special case 'undef' as string
+      if ($s eq 'undef') {
+  	$s += 5;
+      }
+  
+      return $s;
+  }
+  
+  sub new {
+      my $class = shift;
+      unless (defined $class or $#_ > 1) {
+  	require Carp;
+  	Carp::croak('Usage: version::new(class, version)');
+      }
+  
+      my $self = bless ({}, ref ($class) || $class);
+      my $qv = FALSE;
+  
+      if ( $#_ == 1 ) { # must be CVS-style
+  	$qv = TRUE;
+      }
+      my $value = pop; # always going to be the last element
+  
+      if ( ref($value) && eval('$value->isa("version")') ) {
+  	# Can copy the elements directly
+  	$self->{version} = [ @{$value->{version} } ];
+  	$self->{qv} = 1 if $value->{qv};
+  	$self->{alpha} = 1 if $value->{alpha};
+  	$self->{original} = ''.$value->{original};
+  	return $self;
+      }
+  
+      if ( not defined $value or $value =~ /^undef$/ ) {
+  	# RT #19517 - special case for undef comparison
+  	# or someone forgot to pass a value
+  	push @{$self->{version}}, 0;
+  	$self->{original} = "0";
+  	return ($self);
+      }
+  
+  
+      if (ref($value) =~ m/ARRAY|HASH/) {
+  	require Carp;
+  	Carp::croak("Invalid version format (non-numeric data)");
+      }
+  
+      $value = _un_vstring($value);
+  
+      if ($Config{d_setlocale} && eval { require POSIX } ) {
+        require locale;
+  	my $currlocale = POSIX::setlocale(&POSIX::LC_ALL);
+  
+  	# if the current locale uses commas for decimal points, we
+  	# just replace commas with decimal places, rather than changing
+  	# locales
+  	if ( POSIX::localeconv()->{decimal_point} eq ',' ) {
+  	    $value =~ tr/,/./;
+  	}
+      }
+  
+      # exponential notation
+      if ( $value =~ /\d+.?\d*e[-+]?\d+/ ) {
+  	$value = sprintf("%.9f",$value);
+  	$value =~ s/(0+)$//; # trim trailing zeros
+      }
+  
+      my $s = scan_version($value, \$self, $qv);
+  
+      if ($s) { # must be something left over
+  	warn("Version string '%s' contains invalid data; "
+  		   ."ignoring: '%s'", $value, $s);
+      }
+  
+      return ($self);
+  }
+  
+  *parse = \&new;
+  
+  sub numify {
+      my ($self) = @_;
+      unless (_verify($self)) {
+  	require Carp;
+  	Carp::croak("Invalid version object");
+      }
+      my $width = $self->{width} || 3;
+      my $alpha = $self->{alpha} || "";
+      my $len = $#{$self->{version}};
+      my $digit = $self->{version}[0];
+      my $string = sprintf("%d.", $digit );
+  
+      for ( my $i = 1 ; $i < $len ; $i++ ) {
+  	$digit = $self->{version}[$i];
+  	if ( $width < 3 ) {
+  	    my $denom = 10**(3-$width);
+  	    my $quot = int($digit/$denom);
+  	    my $rem = $digit - ($quot * $denom);
+  	    $string .= sprintf("%0".$width."d_%d", $quot, $rem);
+  	}
+  	else {
+  	    $string .= sprintf("%03d", $digit);
+  	}
+      }
+  
+      if ( $len > 0 ) {
+  	$digit = $self->{version}[$len];
+  	if ( $alpha && $width == 3 ) {
+  	    $string .= "_";
+  	}
+  	$string .= sprintf("%0".$width."d", $digit);
+      }
+      else # $len = 0
+      {
+  	$string .= sprintf("000");
+      }
+  
+      return $string;
+  }
+  
+  sub normal {
+      my ($self) = @_;
+      unless (_verify($self)) {
+  	require Carp;
+  	Carp::croak("Invalid version object");
+      }
+      my $alpha = $self->{alpha} || "";
+      my $len = $#{$self->{version}};
+      my $digit = $self->{version}[0];
+      my $string = sprintf("v%d", $digit );
+  
+      for ( my $i = 1 ; $i < $len ; $i++ ) {
+  	$digit = $self->{version}[$i];
+  	$string .= sprintf(".%d", $digit);
+      }
+  
+      if ( $len > 0 ) {
+  	$digit = $self->{version}[$len];
+  	if ( $alpha ) {
+  	    $string .= sprintf("_%0d", $digit);
+  	}
+  	else {
+  	    $string .= sprintf(".%0d", $digit);
+  	}
+      }
+  
+      if ( $len <= 2 ) {
+  	for ( $len = 2 - $len; $len != 0; $len-- ) {
+  	    $string .= sprintf(".%0d", 0);
+  	}
+      }
+  
+      return $string;
+  }
+  
+  sub stringify {
+      my ($self) = @_;
+      unless (_verify($self)) {
+  	require Carp;
+  	Carp::croak("Invalid version object");
+      }
+      return exists $self->{original}
+      	? $self->{original}
+  	: exists $self->{qv}
+  	    ? $self->normal
+  	    : $self->numify;
+  }
+  
+  sub vcmp {
+      require UNIVERSAL;
+      my ($left,$right,$swap) = @_;
+      my $class = ref($left);
+      unless ( UNIVERSAL::isa($right, $class) ) {
+  	$right = $class->new($right);
+      }
+  
+      if ( $swap ) {
+  	($left, $right) = ($right, $left);
+      }
+      unless (_verify($left)) {
+  	require Carp;
+  	Carp::croak("Invalid version object");
+      }
+      unless (_verify($right)) {
+  	require Carp;
+  	Carp::croak("Invalid version format");
+      }
+      my $l = $#{$left->{version}};
+      my $r = $#{$right->{version}};
+      my $m = $l < $r ? $l : $r;
+      my $lalpha = $left->is_alpha;
+      my $ralpha = $right->is_alpha;
+      my $retval = 0;
+      my $i = 0;
+      while ( $i <= $m && $retval == 0 ) {
+  	$retval = $left->{version}[$i] <=> $right->{version}[$i];
+  	$i++;
+      }
+  
+      # tiebreaker for alpha with identical terms
+      if ( $retval == 0
+  	&& $l == $r
+  	&& $left->{version}[$m] == $right->{version}[$m]
+  	&& ( $lalpha || $ralpha ) ) {
+  
+  	if ( $lalpha && !$ralpha ) {
+  	    $retval = -1;
+  	}
+  	elsif ( $ralpha && !$lalpha) {
+  	    $retval = +1;
+  	}
+      }
+  
+      # possible match except for trailing 0's
+      if ( $retval == 0 && $l != $r ) {
+  	if ( $l < $r ) {
+  	    while ( $i <= $r && $retval == 0 ) {
+  		if ( $right->{version}[$i] != 0 ) {
+  		    $retval = -1; # not a match after all
+  		}
+  		$i++;
+  	    }
+  	}
+  	else {
+  	    while ( $i <= $l && $retval == 0 ) {
+  		if ( $left->{version}[$i] != 0 ) {
+  		    $retval = +1; # not a match after all
+  		}
+  		$i++;
+  	    }
+  	}
+      }
+  
+      return $retval;
+  }
+  
+  sub vbool {
+      my ($self) = @_;
+      return vcmp($self,$self->new("0"),1);
+  }
+  
+  sub vnoop {
+      require Carp;
+      Carp::croak("operation not supported with version object");
+  }
+  
+  sub is_alpha {
+      my ($self) = @_;
+      return (exists $self->{alpha});
+  }
+  
+  sub qv {
+      my $value = shift;
+      my $class = $CLASS;
+      if (@_) {
+  	$class = ref($value) || $value;
+  	$value = shift;
+      }
+  
+      $value = _un_vstring($value);
+      $value = 'v'.$value unless $value =~ /(^v|\d+\.\d+\.\d)/;
+      my $obj = $CLASS->new($value);
+      return bless $obj, $class;
+  }
+  
+  *declare = \&qv;
+  
+  sub is_qv {
+      my ($self) = @_;
+      return (exists $self->{qv});
+  }
+  
+  
+  sub _verify {
+      my ($self) = @_;
+      if ( ref($self)
+  	&& eval { exists $self->{version} }
+  	&& ref($self->{version}) eq 'ARRAY'
+  	) {
+  	return 1;
+      }
+      else {
+  	return 0;
+      }
+  }
+  
+  sub _is_non_alphanumeric {
+      my $s = shift;
+      $s = new ExtUtils::MakeMaker::charstar $s;
+      while ($s) {
+  	return 0 if isSPACE($s); # early out
+  	return 1 unless (isALPHA($s) || isDIGIT($s) || $s =~ /[.-]/);
+  	$s++;
+      }
+      return 0;
+  }
+  
+  sub _un_vstring {
+      my $value = shift;
+      # may be a v-string
+      if ( length($value) >= 3 && $value !~ /[._]/
+  	&& _is_non_alphanumeric($value)) {
+  	my $tvalue;
+  	if ( $] ge 5.008_001 ) {
+  	    $tvalue = _find_magic_vstring($value);
+  	    $value = $tvalue if length $tvalue;
+  	}
+  	elsif ( $] ge 5.006_000 ) {
+  	    $tvalue = sprintf("v%vd",$value);
+  	    if ( $tvalue =~ /^v\d+(\.\d+){2,}$/ ) {
+  		# must be a v-string
+  		$value = $tvalue;
+  	    }
+  	}
+      }
+      return $value;
+  }
+  
+  sub _find_magic_vstring {
+      my $value = shift;
+      my $tvalue = '';
+      require B;
+      my $sv = B::svref_2object(\$value);
+      my $magic = ref($sv) eq 'B::PVMG' ? $sv->MAGIC : undef;
+      while ( $magic ) {
+  	if ( $magic->TYPE eq 'V' ) {
+  	    $tvalue = $magic->PTR;
+  	    $tvalue =~ s/^v?(.+)$/v$1/;
+  	    last;
+  	}
+  	else {
+  	    $magic = $magic->MOREMAGIC;
+  	}
+      }
+      return $tvalue;
+  }
+  
+  sub _VERSION {
+      my ($obj, $req) = @_;
+      my $class = ref($obj) || $obj;
+  
+      no strict 'refs';
+      if ( exists $INC{"$class.pm"} and not %{"$class\::"} and $] >= 5.008) {
+  	 # file but no package
+  	require Carp;
+  	Carp::croak( "$class defines neither package nor VERSION"
+  	    ."--version check failed");
+      }
+  
+      my $version = eval "\$$class\::VERSION";
+      if ( defined $version ) {
+  	local $^W if $] <= 5.008;
+  	$version = ExtUtils::MakeMaker::version::vpp->new($version);
+      }
+  
+      if ( defined $req ) {
+  	unless ( defined $version ) {
+  	    require Carp;
+  	    my $msg =  $] < 5.006
+  	    ? "$class version $req required--this is only version "
+  	    : "$class does not define \$$class\::VERSION"
+  	      ."--version check failed";
+  
+  	    if ( $ENV{VERSION_DEBUG} ) {
+  		Carp::confess($msg);
+  	    }
+  	    else {
+  		Carp::croak($msg);
+  	    }
+  	}
+  
+  	$req = ExtUtils::MakeMaker::version::vpp->new($req);
+  
+  	if ( $req > $version ) {
+  	    require Carp;
+  	    if ( $req->is_qv ) {
+  		Carp::croak(
+  		    sprintf ("%s version %s required--".
+  			"this is only version %s", $class,
+  			$req->normal, $version->normal)
+  		);
+  	    }
+  	    else {
+  		Carp::croak(
+  		    sprintf ("%s version %s required--".
+  			"this is only version %s", $class,
+  			$req->stringify, $version->stringify)
+  		);
+  	    }
+  	}
+      }
+  
+      return defined $version ? $version->stringify : undef;
+  }
+  
+  1; #this line is important and will help the module return a true value
+EXTUTILS_MAKEMAKER_VERSION_VPP
+
+$fatpacked{"ExtUtils/Manifest.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_MANIFEST';
+  package ExtUtils::Manifest;
+  
+  require Exporter;
+  use Config;
+  use File::Basename;
+  use File::Copy 'copy';
+  use File::Find;
+  use File::Spec 0.8;
+  use Carp;
+  use strict;
+  use warnings;
+  
+  our $VERSION = '1.70';
+  our @ISA = ('Exporter');
+  our @EXPORT_OK = qw(mkmanifest
+                  manicheck  filecheck  fullcheck  skipcheck
+                  manifind   maniread   manicopy   maniadd
+                  maniskip
+                 );
+  
+  our $Is_MacOS = $^O eq 'MacOS';
+  our $Is_VMS   = $^O eq 'VMS';
+  our $Is_VMS_mode = 0;
+  our $Is_VMS_lc = 0;
+  our $Is_VMS_nodot = 0;  # No dots in dir names or double dots in files
+  
+  if ($Is_VMS) {
+      require VMS::Filespec if $Is_VMS;
+      my $vms_unix_rpt;
+      my $vms_efs;
+      my $vms_case;
+  
+      $Is_VMS_mode = 1;
+      $Is_VMS_lc = 1;
+      $Is_VMS_nodot = 1;
+      if (eval { local $SIG{__DIE__}; require VMS::Feature; }) {
+          $vms_unix_rpt = VMS::Feature::current("filename_unix_report");
+          $vms_efs = VMS::Feature::current("efs_charset");
+          $vms_case = VMS::Feature::current("efs_case_preserve");
+      } else {
+          my $unix_rpt = $ENV{'DECC$FILENAME_UNIX_REPORT'} || '';
+          my $efs_charset = $ENV{'DECC$EFS_CHARSET'} || '';
+          my $efs_case = $ENV{'DECC$EFS_CASE_PRESERVE'} || '';
+          $vms_unix_rpt = $unix_rpt =~ /^[ET1]/i;
+          $vms_efs = $efs_charset =~ /^[ET1]/i;
+          $vms_case = $efs_case =~ /^[ET1]/i;
+      }
+      $Is_VMS_lc = 0 if ($vms_case);
+      $Is_VMS_mode = 0 if ($vms_unix_rpt);
+      $Is_VMS_nodot = 0 if ($vms_efs);
+  }
+  
+  our $Debug   = $ENV{PERL_MM_MANIFEST_DEBUG} || 0;
+  our $Verbose = defined $ENV{PERL_MM_MANIFEST_VERBOSE} ?
+                     $ENV{PERL_MM_MANIFEST_VERBOSE} : 1;
+  our $Quiet = 0;
+  our $MANIFEST = 'MANIFEST';
+  
+  our $DEFAULT_MSKIP = File::Spec->catfile( dirname(__FILE__), "$MANIFEST.SKIP" );
+  
+  
+  =head1 NAME
+  
+  ExtUtils::Manifest - utilities to write and check a MANIFEST file
+  
+  =head1 VERSION
+  
+  version 1.70
+  
+  =head1 SYNOPSIS
+  
+      use ExtUtils::Manifest qw(...funcs to import...);
+  
+      mkmanifest();
+  
+      my @missing_files    = manicheck;
+      my @skipped          = skipcheck;
+      my @extra_files      = filecheck;
+      my($missing, $extra) = fullcheck;
+  
+      my $found    = manifind();
+  
+      my $manifest = maniread();
+  
+      manicopy($read,$target);
+  
+      maniadd({$file => $comment, ...});
+  
+  
+  =head1 DESCRIPTION
+  
+  =head2 Functions
+  
+  ExtUtils::Manifest exports no functions by default.  The following are
+  exported on request
+  
+  =over 4
+  
+  =item mkmanifest
+  
+      mkmanifest();
+  
+  Writes all files in and below the current directory to your F<MANIFEST>.
+  It works similar to the result of the Unix command
+  
+      find . > MANIFEST
+  
+  All files that match any regular expression in a file F<MANIFEST.SKIP>
+  (if it exists) are ignored.
+  
+  Any existing F<MANIFEST> file will be saved as F<MANIFEST.bak>.
+  
+  =cut
+  
+  sub _sort {
+      return sort { lc $a cmp lc $b } @_;
+  }
+  
+  sub mkmanifest {
+      my $manimiss = 0;
+      my $read = (-r 'MANIFEST' && maniread()) or $manimiss++;
+      $read = {} if $manimiss;
+      local *M;
+      my $bakbase = $MANIFEST;
+      $bakbase =~ s/\./_/g if $Is_VMS_nodot; # avoid double dots
+      rename $MANIFEST, "$bakbase.bak" unless $manimiss;
+      open M, "> $MANIFEST" or die "Could not open $MANIFEST: $!";
+      binmode M, ':raw';
+      my $skip = maniskip();
+      my $found = manifind();
+      my($key,$val,$file,%all);
+      %all = (%$found, %$read);
+      $all{$MANIFEST} = ($Is_VMS_mode ? "$MANIFEST\t\t" : '') .
+                       'This list of files'
+          if $manimiss; # add new MANIFEST to known file list
+      foreach $file (_sort keys %all) {
+  	if ($skip->($file)) {
+  	    # Policy: only remove files if they're listed in MANIFEST.SKIP.
+  	    # Don't remove files just because they don't exist.
+  	    warn "Removed from $MANIFEST: $file\n" if $Verbose and exists $read->{$file};
+  	    next;
+  	}
+  	if ($Verbose){
+  	    warn "Added to $MANIFEST: $file\n" unless exists $read->{$file};
+  	}
+  	my $text = $all{$file};
+  	$file = _unmacify($file);
+  	my $tabs = (5 - (length($file)+1)/8);
+  	$tabs = 1 if $tabs < 1;
+  	$tabs = 0 unless $text;
+          if ($file =~ /\s/) {
+              $file =~ s/([\\'])/\\$1/g;
+              $file = "'$file'";
+          }
+  	print M $file, "\t" x $tabs, $text, "\n";
+      }
+      close M;
+  }
+  
+  # Geez, shouldn't this use File::Spec or File::Basename or something?
+  # Why so careful about dependencies?
+  sub clean_up_filename {
+    my $filename = shift;
+    $filename =~ s|^\./||;
+    $filename =~ s/^:([^:]+)$/$1/ if $Is_MacOS;
+    if ( $Is_VMS ) {
+        $filename =~ s/\.$//;                           # trim trailing dot
+        $filename = VMS::Filespec::unixify($filename);  # unescape spaces, etc.
+        if( $Is_VMS_lc ) {
+            $filename = lc($filename);
+            $filename = uc($filename) if $filename =~ /^MANIFEST(\.SKIP)?$/i;
+        }
+    }
+    return $filename;
+  }
+  
+  
+  =item manifind
+  
+      my $found = manifind();
+  
+  returns a hash reference. The keys of the hash are the files found
+  below the current directory.
+  
+  =cut
+  
+  sub manifind {
+      my $p = shift || {};
+      my $found = {};
+  
+      my $wanted = sub {
+  	my $name = clean_up_filename($File::Find::name);
+  	warn "Debug: diskfile $name\n" if $Debug;
+  	return if -d $_;
+  	$found->{$name} = "";
+      };
+  
+      # We have to use "$File::Find::dir/$_" in preprocess, because
+      # $File::Find::name is unavailable.
+      # Also, it's okay to use / here, because MANIFEST files use Unix-style
+      # paths.
+      find({wanted => $wanted, follow_fast => 1},
+  	 $Is_MacOS ? ":" : ".");
+  
+      return $found;
+  }
+  
+  
+  =item manicheck
+  
+      my @missing_files = manicheck();
+  
+  checks if all the files within a C<MANIFEST> in the current directory
+  really do exist. If C<MANIFEST> and the tree below the current
+  directory are in sync it silently returns an empty list.
+  Otherwise it returns a list of files which are listed in the
+  C<MANIFEST> but missing from the directory, and by default also
+  outputs these names to STDERR.
+  
+  =cut
+  
+  sub manicheck {
+      return _check_files();
+  }
+  
+  
+  =item filecheck
+  
+      my @extra_files = filecheck();
+  
+  finds files below the current directory that are not mentioned in the
+  C<MANIFEST> file. An optional file C<MANIFEST.SKIP> will be
+  consulted. Any file matching a regular expression in such a file will
+  not be reported as missing in the C<MANIFEST> file. The list of any
+  extraneous files found is returned, and by default also reported to
+  STDERR.
+  
+  =cut
+  
+  sub filecheck {
+      return _check_manifest();
+  }
+  
+  
+  =item fullcheck
+  
+      my($missing, $extra) = fullcheck();
+  
+  does both a manicheck() and a filecheck(), returning then as two array
+  refs.
+  
+  =cut
+  
+  sub fullcheck {
+      return [_check_files()], [_check_manifest()];
+  }
+  
+  
+  =item skipcheck
+  
+      my @skipped = skipcheck();
+  
+  lists all the files that are skipped due to your C<MANIFEST.SKIP>
+  file.
+  
+  =cut
+  
+  sub skipcheck {
+      my($p) = @_;
+      my $found = manifind();
+      my $matches = maniskip();
+  
+      my @skipped = ();
+      foreach my $file (_sort keys %$found){
+          if (&$matches($file)){
+              warn "Skipping $file\n" unless $Quiet;
+              push @skipped, $file;
+              next;
+          }
+      }
+  
+      return @skipped;
+  }
+  
+  
+  sub _check_files {
+      my $p = shift;
+      my $dosnames=(defined(&Dos::UseLFN) && Dos::UseLFN()==0);
+      my $read = maniread() || {};
+      my $found = manifind($p);
+  
+      my(@missfile) = ();
+      foreach my $file (_sort keys %$read){
+          warn "Debug: manicheck checking from $MANIFEST $file\n" if $Debug;
+          if ($dosnames){
+              $file = lc $file;
+              $file =~ s=(\.(\w|-)+)=substr ($1,0,4)=ge;
+              $file =~ s=((\w|-)+)=substr ($1,0,8)=ge;
+          }
+          unless ( exists $found->{$file} ) {
+              warn "No such file: $file\n" unless $Quiet;
+              push @missfile, $file;
+          }
+      }
+  
+      return @missfile;
+  }
+  
+  
+  sub _check_manifest {
+      my($p) = @_;
+      my $read = maniread() || {};
+      my $found = manifind($p);
+      my $skip  = maniskip();
+  
+      my @missentry = ();
+      foreach my $file (_sort keys %$found){
+          next if $skip->($file);
+          warn "Debug: manicheck checking from disk $file\n" if $Debug;
+          unless ( exists $read->{$file} ) {
+              my $canon = $Is_MacOS ? "\t" . _unmacify($file) : '';
+              warn "Not in $MANIFEST: $file$canon\n" unless $Quiet;
+              push @missentry, $file;
+          }
+      }
+  
+      return @missentry;
+  }
+  
+  
+  =item maniread
+  
+      my $manifest = maniread();
+      my $manifest = maniread($manifest_file);
+  
+  reads a named C<MANIFEST> file (defaults to C<MANIFEST> in the current
+  directory) and returns a HASH reference with files being the keys and
+  comments being the values of the HASH.  Blank lines and lines which
+  start with C<#> in the C<MANIFEST> file are discarded.
+  
+  =cut
+  
+  sub maniread {
+      my ($mfile) = @_;
+      $mfile ||= $MANIFEST;
+      my $read = {};
+      local *M;
+      unless (open M, "< $mfile"){
+          warn "Problem opening $mfile: $!";
+          return $read;
+      }
+      local $_;
+      while (<M>){
+          chomp;
+          next if /^\s*#/;
+  
+          my($file, $comment);
+  
+          # filename may contain spaces if enclosed in ''
+          # (in which case, \\ and \' are escapes)
+          if (($file, $comment) = /^'((?:\\[\\']|.+)+)'\s*(.*)/) {
+              $file =~ s/\\([\\'])/$1/g;
+          }
+          else {
+              ($file, $comment) = /^(\S+)\s*(.*)/;
+          }
+          next unless $file;
+  
+          if ($Is_MacOS) {
+              $file = _macify($file);
+              $file =~ s/\\([0-3][0-7][0-7])/sprintf("%c", oct($1))/ge;
+          }
+          elsif ($Is_VMS_mode) {
+              require File::Basename;
+              my($base,$dir) = File::Basename::fileparse($file);
+              # Resolve illegal file specifications in the same way as tar
+              if ($Is_VMS_nodot) {
+                  $dir =~ tr/./_/;
+                  my(@pieces) = split(/\./,$base);
+                  if (@pieces > 2)
+                      { $base = shift(@pieces) . '.' . join('_',@pieces); }
+                  my $okfile = "$dir$base";
+                  warn "Debug: Illegal name $file changed to $okfile\n" if $Debug;
+                  $file = $okfile;
+              }
+              if( $Is_VMS_lc ) {
+                  $file = lc($file);
+                  $file = uc($file) if $file =~ /^MANIFEST(\.SKIP)?$/i;
+              }
+          }
+  
+          $read->{$file} = $comment;
+      }
+      close M;
+      $read;
+  }
+  
+  =item maniskip
+  
+      my $skipchk = maniskip();
+      my $skipchk = maniskip($manifest_skip_file);
+  
+      if ($skipchk->($file)) { .. }
+  
+  reads a named C<MANIFEST.SKIP> file (defaults to C<MANIFEST.SKIP> in
+  the current directory) and returns a CODE reference that tests whether
+  a given filename should be skipped.
+  
+  =cut
+  
+  # returns an anonymous sub that decides if an argument matches
+  sub maniskip {
+      my @skip ;
+      my $mfile = shift || "$MANIFEST.SKIP";
+      _check_mskip_directives($mfile) if -f $mfile;
+      local(*M, $_);
+      open M, "< $mfile" or open M, "< $DEFAULT_MSKIP" or return sub {0};
+      while (<M>){
+        chomp;
+        s/\r//;
+        $_ =~ qr{^\s*(?:(?:'([^\\']*(?:\\.[^\\']*)*)')|([^#\s]\S*))?(?:(?:\s*)|(?:\s+(.*?)\s*))$};
+        #my $comment = $3;
+        my $filename = $2;
+        if ( defined($1) ) {
+          $filename = $1;
+          $filename =~ s/\\(['\\])/$1/g;
+        }
+        next if (not defined($filename) or not $filename);
+        push @skip, _macify($filename);
+      }
+      close M;
+      return sub {0} unless (scalar @skip > 0);
+  
+      my $opts = $Is_VMS_mode ? '(?i)' : '';
+  
+      # Make sure each entry is isolated in its own parentheses, in case
+      # any of them contain alternations
+      my $regex = join '|', map "(?:$_)", @skip;
+  
+      return sub { $_[0] =~ qr{$opts$regex} };
+  }
+  
+  # checks for the special directives
+  #   #!include_default
+  #   #!include /path/to/some/manifest.skip
+  # in a custom MANIFEST.SKIP for, for including
+  # the content of, respectively, the default MANIFEST.SKIP
+  # and an external manifest.skip file
+  sub _check_mskip_directives {
+      my $mfile = shift;
+      local (*M, $_);
+      my @lines = ();
+      my $flag = 0;
+      unless (open M, "< $mfile") {
+          warn "Problem opening $mfile: $!";
+          return;
+      }
+      while (<M>) {
+          if (/^#!include_default\s*$/) {
+  	    if (my @default = _include_mskip_file()) {
+  	        push @lines, @default;
+  		warn "Debug: Including default MANIFEST.SKIP\n" if $Debug;
+  		$flag++;
+  	    }
+  	    next;
+          }
+  	if (/^#!include\s+(.*)\s*$/) {
+  	    my $external_file = $1;
+  	    if (my @external = _include_mskip_file($external_file)) {
+  	        push @lines, @external;
+  		warn "Debug: Including external $external_file\n" if $Debug;
+  		$flag++;
+  	    }
+              next;
+          }
+          push @lines, $_;
+      }
+      close M;
+      return unless $flag;
+      my $bakbase = $mfile;
+      $bakbase =~ s/\./_/g if $Is_VMS_nodot;  # avoid double dots
+      rename $mfile, "$bakbase.bak";
+      warn "Debug: Saving original $mfile as $bakbase.bak\n" if $Debug;
+      unless (open M, "> $mfile") {
+          warn "Problem opening $mfile: $!";
+          return;
+      }
+      binmode M, ':raw';
+      print M $_ for (@lines);
+      close M;
+      return;
+  }
+  
+  # returns an array containing the lines of an external
+  # manifest.skip file, if given, or $DEFAULT_MSKIP
+  sub _include_mskip_file {
+      my $mskip = shift || $DEFAULT_MSKIP;
+      unless (-f $mskip) {
+          warn qq{Included file "$mskip" not found - skipping};
+          return;
+      }
+      local (*M, $_);
+      unless (open M, "< $mskip") {
+          warn "Problem opening $mskip: $!";
+          return;
+      }
+      my @lines = ();
+      push @lines, "\n#!start included $mskip\n";
+      push @lines, $_ while <M>;
+      close M;
+      push @lines, "#!end included $mskip\n\n";
+      return @lines;
+  }
+  
+  =item manicopy
+  
+      manicopy(\%src, $dest_dir);
+      manicopy(\%src, $dest_dir, $how);
+  
+  Copies the files that are the keys in %src to the $dest_dir.  %src is
+  typically returned by the maniread() function.
+  
+      manicopy( maniread(), $dest_dir );
+  
+  This function is useful for producing a directory tree identical to the
+  intended distribution tree.
+  
+  $how can be used to specify a different methods of "copying".  Valid
+  values are C<cp>, which actually copies the files, C<ln> which creates
+  hard links, and C<best> which mostly links the files but copies any
+  symbolic link to make a tree without any symbolic link.  C<cp> is the
+  default.
+  
+  =cut
+  
+  sub manicopy {
+      my($read,$target,$how)=@_;
+      croak "manicopy() called without target argument" unless defined $target;
+      $how ||= 'cp';
+      require File::Path;
+      require File::Basename;
+  
+      $target = VMS::Filespec::unixify($target) if $Is_VMS_mode;
+      File::Path::mkpath([ $target ],! $Quiet,$Is_VMS ? undef : 0755);
+      foreach my $file (keys %$read){
+  	if ($Is_MacOS) {
+  	    if ($file =~ m!:!) {
+  		my $dir = _maccat($target, $file);
+  		$dir =~ s/[^:]+$//;
+  		File::Path::mkpath($dir,1,0755);
+  	    }
+  	    cp_if_diff($file, _maccat($target, $file), $how);
+  	} else {
+  	    $file = VMS::Filespec::unixify($file) if $Is_VMS_mode;
+  	    if ($file =~ m!/!) { # Ilya, that hurts, I fear, or maybe not?
+  		my $dir = File::Basename::dirname($file);
+  		$dir = VMS::Filespec::unixify($dir) if $Is_VMS_mode;
+  		File::Path::mkpath(["$target/$dir"],! $Quiet,$Is_VMS ? undef : 0755);
+  	    }
+  	    cp_if_diff($file, "$target/$file", $how);
+  	}
+      }
+  }
+  
+  sub cp_if_diff {
+      my($from, $to, $how)=@_;
+      if (! -f $from) {
+          carp "$from not found";
+          return;
+      }
+      my($diff) = 0;
+      local(*F,*T);
+      open(F,"< $from\0") or die "Can't read $from: $!\n";
+      if (open(T,"< $to\0")) {
+          local $_;
+  	while (<F>) { $diff++,last if $_ ne <T>; }
+  	$diff++ unless eof(T);
+  	close T;
+      }
+      else { $diff++; }
+      close F;
+      if ($diff) {
+  	if (-e $to) {
+  	    unlink($to) or confess "unlink $to: $!";
+  	}
+          STRICT_SWITCH: {
+  	    best($from,$to), last STRICT_SWITCH if $how eq 'best';
+  	    cp($from,$to), last STRICT_SWITCH if $how eq 'cp';
+  	    ln($from,$to), last STRICT_SWITCH if $how eq 'ln';
+  	    croak("ExtUtils::Manifest::cp_if_diff " .
+  		  "called with illegal how argument [$how]. " .
+  		  "Legal values are 'best', 'cp', and 'ln'.");
+  	}
+      }
+  }
+  
+  sub cp {
+      my ($srcFile, $dstFile) = @_;
+      my ($access,$mod) = (stat $srcFile)[8,9];
+  
+      copy($srcFile,$dstFile);
+      utime $access, $mod + ($Is_VMS ? 1 : 0), $dstFile;
+      _manicopy_chmod($srcFile, $dstFile);
+  }
+  
+  
+  sub ln {
+      my ($srcFile, $dstFile) = @_;
+      # Fix-me - VMS can support links.
+      return &cp if $Is_VMS or ($^O eq 'MSWin32' and Win32::IsWin95());
+      link($srcFile, $dstFile);
+  
+      unless( _manicopy_chmod($srcFile, $dstFile) ) {
+          unlink $dstFile;
+          return;
+      }
+      1;
+  }
+  
+  # 1) Strip off all group and world permissions.
+  # 2) Let everyone read it.
+  # 3) If the owner can execute it, everyone can.
+  sub _manicopy_chmod {
+      my($srcFile, $dstFile) = @_;
+  
+      my $perm = 0444 | (stat $srcFile)[2] & 0700;
+      chmod( $perm | ( $perm & 0100 ? 0111 : 0 ), $dstFile );
+  }
+  
+  # Files that are often modified in the distdir.  Don't hard link them.
+  my @Exceptions = qw(MANIFEST META.yml SIGNATURE);
+  sub best {
+      my ($srcFile, $dstFile) = @_;
+  
+      my $is_exception = grep $srcFile =~ /$_/, @Exceptions;
+      if ($is_exception or !$Config{d_link} or -l $srcFile) {
+  	cp($srcFile, $dstFile);
+      } else {
+  	ln($srcFile, $dstFile) or cp($srcFile, $dstFile);
+      }
+  }
+  
+  sub _macify {
+      my($file) = @_;
+  
+      return $file unless $Is_MacOS;
+  
+      $file =~ s|^\./||;
+      if ($file =~ m|/|) {
+  	$file =~ s|/+|:|g;
+  	$file = ":$file";
+      }
+  
+      $file;
+  }
+  
+  sub _maccat {
+      my($f1, $f2) = @_;
+  
+      return "$f1/$f2" unless $Is_MacOS;
+  
+      $f1 .= ":$f2";
+      $f1 =~ s/([^:]:):/$1/g;
+      return $f1;
+  }
+  
+  sub _unmacify {
+      my($file) = @_;
+  
+      return $file unless $Is_MacOS;
+  
+      $file =~ s|^:||;
+      $file =~ s|([/ \n])|sprintf("\\%03o", unpack("c", $1))|ge;
+      $file =~ y|:|/|;
+  
+      $file;
+  }
+  
+  
+  =item maniadd
+  
+    maniadd({ $file => $comment, ...});
+  
+  Adds an entry to an existing F<MANIFEST> unless its already there.
+  
+  $file will be normalized (ie. Unixified).  B<UNIMPLEMENTED>
+  
+  =cut
+  
+  sub maniadd {
+      my($additions) = shift;
+  
+      _normalize($additions);
+      _fix_manifest($MANIFEST);
+  
+      my $manifest = maniread();
+      my @needed = grep { !exists $manifest->{$_} } keys %$additions;
+      return 1 unless @needed;
+  
+      open(MANIFEST, ">>$MANIFEST") or
+        die "maniadd() could not open $MANIFEST: $!";
+      binmode MANIFEST, ':raw';
+  
+      foreach my $file (_sort @needed) {
+          my $comment = $additions->{$file} || '';
+          if ($file =~ /\s/) {
+              $file =~ s/([\\'])/\\$1/g;
+              $file = "'$file'";
+          }
+          printf MANIFEST "%-40s %s\n", $file, $comment;
+      }
+      close MANIFEST or die "Error closing $MANIFEST: $!";
+  
+      return 1;
+  }
+  
+  
+  # Make sure this MANIFEST is consistently written with native
+  # newlines and has a terminal newline.
+  sub _fix_manifest {
+      my $manifest_file = shift;
+  
+      open MANIFEST, $MANIFEST or die "Could not open $MANIFEST: $!";
+      local $/;
+      my @manifest = split /(\015\012|\012|\015)/, <MANIFEST>, -1;
+      close MANIFEST;
+      my $must_rewrite = "";
+      if ($manifest[-1] eq ""){
+          # sane case: last line had a terminal newline
+          pop @manifest;
+          for (my $i=1; $i<=$#manifest; $i+=2) {
+              unless ($manifest[$i] eq "\n") {
+                  $must_rewrite = "not a newline at pos $i";
+                  last;
+              }
+          }
+      } else {
+          $must_rewrite = "last line without newline";
+      }
+  
+      if ( $must_rewrite ) {
+          1 while unlink $MANIFEST; # avoid multiple versions on VMS
+          open MANIFEST, ">", $MANIFEST or die "(must_rewrite=$must_rewrite) Could not open >$MANIFEST: $!";
+  	binmode MANIFEST, ':raw';
+          for (my $i=0; $i<=$#manifest; $i+=2) {
+              print MANIFEST "$manifest[$i]\n";
+          }
+          close MANIFEST or die "could not write $MANIFEST: $!";
+      }
+  }
+  
+  
+  # UNIMPLEMENTED
+  sub _normalize {
+      return;
+  }
+  
+  
+  =back
+  
+  =head2 MANIFEST
+  
+  A list of files in the distribution, one file per line.  The MANIFEST
+  always uses Unix filepath conventions even if you're not on Unix.  This
+  means F<foo/bar> style not F<foo\bar>.
+  
+  Anything between white space and an end of line within a C<MANIFEST>
+  file is considered to be a comment.  Any line beginning with # is also
+  a comment. Beginning with ExtUtils::Manifest 1.52, a filename may
+  contain whitespace characters if it is enclosed in single quotes; single
+  quotes or backslashes in that filename must be backslash-escaped.
+  
+      # this a comment
+      some/file
+      some/other/file            comment about some/file
+      'some/third file'          comment
+  
+  
+  =head2 MANIFEST.SKIP
+  
+  The file MANIFEST.SKIP may contain regular expressions of files that
+  should be ignored by mkmanifest() and filecheck(). The regular
+  expressions should appear one on each line. Blank lines and lines
+  which start with C<#> are skipped.  Use C<\#> if you need a regular
+  expression to start with a C<#>.
+  
+  For example:
+  
+      # Version control files and dirs.
+      \bRCS\b
+      \bCVS\b
+      ,v$
+      \B\.svn\b
+  
+      # Makemaker generated files and dirs.
+      ^MANIFEST\.
+      ^Makefile$
+      ^blib/
+      ^MakeMaker-\d
+  
+      # Temp, old and emacs backup files.
+      ~$
+      \.old$
+      ^#.*#$
+      ^\.#
+  
+  If no MANIFEST.SKIP file is found, a default set of skips will be
+  used, similar to the example above.  If you want nothing skipped,
+  simply make an empty MANIFEST.SKIP file.
+  
+  In one's own MANIFEST.SKIP file, certain directives
+  can be used to include the contents of other MANIFEST.SKIP
+  files. At present two such directives are recognized.
+  
+  =over 4
+  
+  =item #!include_default
+  
+  This inserts the contents of the default MANIFEST.SKIP file
+  
+  =item #!include /Path/to/another/manifest.skip
+  
+  This inserts the contents of the specified external file
+  
+  =back
+  
+  The included contents will be inserted into the MANIFEST.SKIP
+  file in between I<#!start included /path/to/manifest.skip>
+  and I<#!end included /path/to/manifest.skip> markers.
+  The original MANIFEST.SKIP is saved as MANIFEST.SKIP.bak.
+  
+  =head2 EXPORT_OK
+  
+  C<&mkmanifest>, C<&manicheck>, C<&filecheck>, C<&fullcheck>,
+  C<&maniread>, and C<&manicopy> are exportable.
+  
+  =head2 GLOBAL VARIABLES
+  
+  C<$ExtUtils::Manifest::MANIFEST> defaults to C<MANIFEST>. Changing it
+  results in both a different C<MANIFEST> and a different
+  C<MANIFEST.SKIP> file. This is useful if you want to maintain
+  different distributions for different audiences (say a user version
+  and a developer version including RCS).
+  
+  C<$ExtUtils::Manifest::Quiet> defaults to 0. If set to a true value,
+  all functions act silently.
+  
+  C<$ExtUtils::Manifest::Debug> defaults to 0.  If set to a true value,
+  or if PERL_MM_MANIFEST_DEBUG is true, debugging output will be
+  produced.
+  
+  =head1 DIAGNOSTICS
+  
+  All diagnostic output is sent to C<STDERR>.
+  
+  =over 4
+  
+  =item C<Not in MANIFEST:> I<file>
+  
+  is reported if a file is found which is not in C<MANIFEST>.
+  
+  =item C<Skipping> I<file>
+  
+  is reported if a file is skipped due to an entry in C<MANIFEST.SKIP>.
+  
+  =item C<No such file:> I<file>
+  
+  is reported if a file mentioned in a C<MANIFEST> file does not
+  exist.
+  
+  =item C<MANIFEST:> I<$!>
+  
+  is reported if C<MANIFEST> could not be opened.
+  
+  =item C<Added to MANIFEST:> I<file>
+  
+  is reported by mkmanifest() if $Verbose is set and a file is added
+  to MANIFEST. $Verbose is set to 1 by default.
+  
+  =back
+  
+  =head1 ENVIRONMENT
+  
+  =over 4
+  
+  =item B<PERL_MM_MANIFEST_DEBUG>
+  
+  Turns on debugging
+  
+  =back
+  
+  =head1 SEE ALSO
+  
+  L<ExtUtils::MakeMaker> which has handy targets for most of the functionality.
+  
+  =head1 AUTHOR
+  
+  Andreas Koenig C<andreas.koenig@anima.de>
+  
+  Currently maintained by the Perl Toolchain Gang.
+  
+  =head1 COPYRIGHT AND LICENSE
+  
+  This software is copyright (c) 1996- by Andreas Koenig.
+  
+  This is free software; you can redistribute it and/or modify it under
+  the same terms as the Perl 5 programming language system itself.
+  
+  =cut
+  
+  1;
+EXTUTILS_MANIFEST
+
+$fatpacked{"ExtUtils/Mkbootstrap.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_MKBOOTSTRAP';
+  package ExtUtils::Mkbootstrap;
+  
+  # There's just too much Dynaloader incest here to turn on strict vars.
+  use strict 'refs';
+  
+  our $VERSION = '7.04';
+  
+  require Exporter;
+  our @ISA = ('Exporter');
+  our @EXPORT = ('&Mkbootstrap');
+  
+  use Config;
+  
+  our $Verbose = 0;
+  
+  
+  sub Mkbootstrap {
+      my($baseext, @bsloadlibs)=@_;
+      @bsloadlibs = grep($_, @bsloadlibs); # strip empty libs
+  
+      print "	bsloadlibs=@bsloadlibs\n" if $Verbose;
+  
+      # We need DynaLoader here because we and/or the *_BS file may
+      # call dl_findfile(). We don't say `use' here because when
+      # first building perl extensions the DynaLoader will not have
+      # been built when MakeMaker gets first used.
+      require DynaLoader;
+  
+      rename "$baseext.bs", "$baseext.bso"
+        if -s "$baseext.bs";
+  
+      if (-f "${baseext}_BS"){
+  	$_ = "${baseext}_BS";
+  	package DynaLoader; # execute code as if in DynaLoader
+  	local($osname, $dlsrc) = (); # avoid warnings
+  	($osname, $dlsrc) = @Config::Config{qw(osname dlsrc)};
+  	$bscode = "";
+  	unshift @INC, ".";
+  	require $_;
+  	shift @INC;
+      }
+  
+      if ($Config{'dlsrc'} =~ /^dl_dld/){
+  	package DynaLoader;
+  	push(@dl_resolve_using, dl_findfile('-lc'));
+      }
+  
+      my(@all) = (@bsloadlibs, @DynaLoader::dl_resolve_using);
+      my($method) = '';
+      if (@all){
+  	open my $bs, ">", "$baseext.bs"
+  		or die "Unable to open $baseext.bs: $!";
+  	print "Writing $baseext.bs\n";
+  	print "	containing: @all" if $Verbose;
+  	print $bs "# $baseext DynaLoader bootstrap file for $^O architecture.\n";
+  	print $bs "# Do not edit this file, changes will be lost.\n";
+  	print $bs "# This file was automatically generated by the\n";
+  	print $bs "# Mkbootstrap routine in ExtUtils::Mkbootstrap (v$VERSION).\n";
+  	print $bs "\@DynaLoader::dl_resolve_using = ";
+  	# If @all contains names in the form -lxxx or -Lxxx then it's asking for
+  	# runtime library location so we automatically add a call to dl_findfile()
+  	if (" @all" =~ m/ -[lLR]/){
+  	    print $bs "  dl_findfile(qw(\n  @all\n  ));\n";
+  	}else{
+  	    print $bs "  qw(@all);\n";
+  	}
+  	# write extra code if *_BS says so
+  	print $bs $DynaLoader::bscode if $DynaLoader::bscode;
+  	print $bs "\n1;\n";
+  	close $bs;
+      }
+  }
+  
+  1;
+  
+  __END__
+  
+  =head1 NAME
+  
+  ExtUtils::Mkbootstrap - make a bootstrap file for use by DynaLoader
+  
+  =head1 SYNOPSIS
+  
+  C<Mkbootstrap>
+  
+  =head1 DESCRIPTION
+  
+  Mkbootstrap typically gets called from an extension Makefile.
+  
+  There is no C<*.bs> file supplied with the extension. Instead, there may
+  be a C<*_BS> file which has code for the special cases, like posix for
+  berkeley db on the NeXT.
+  
+  This file will get parsed, and produce a maybe empty
+  C<@DynaLoader::dl_resolve_using> array for the current architecture.
+  That will be extended by $BSLOADLIBS, which was computed by
+  ExtUtils::Liblist::ext(). If this array still is empty, we do nothing,
+  else we write a .bs file with an C<@DynaLoader::dl_resolve_using>
+  array.
+  
+  The C<*_BS> file can put some code into the generated C<*.bs> file by
+  placing it in C<$bscode>. This is a handy 'escape' mechanism that may
+  prove useful in complex situations.
+  
+  If @DynaLoader::dl_resolve_using contains C<-L*> or C<-l*> entries then
+  Mkbootstrap will automatically add a dl_findfile() call to the
+  generated C<*.bs> file.
+  
+  =cut
+EXTUTILS_MKBOOTSTRAP
+
+$fatpacked{"ExtUtils/Mksymlists.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_MKSYMLISTS';
+  package ExtUtils::Mksymlists;
+  
+  use 5.006;
+  use strict qw[ subs refs ];
+  # no strict 'vars';  # until filehandles are exempted
+  
+  use Carp;
+  use Exporter;
+  use Config;
+  
+  our @ISA = qw(Exporter);
+  our @EXPORT = qw(&Mksymlists);
+  our $VERSION = '7.04';
+  
+  sub Mksymlists {
+      my(%spec) = @_;
+      my($osname) = $^O;
+  
+      croak("Insufficient information specified to Mksymlists")
+          unless ( $spec{NAME} or
+                   ($spec{FILE} and ($spec{DL_FUNCS} or $spec{FUNCLIST})) );
+  
+      $spec{DL_VARS} = [] unless $spec{DL_VARS};
+      ($spec{FILE} = $spec{NAME}) =~ s/.*::// unless $spec{FILE};
+      $spec{FUNCLIST} = [] unless $spec{FUNCLIST};
+      $spec{DL_FUNCS} = { $spec{NAME} => [] }
+          unless ( ($spec{DL_FUNCS} and keys %{$spec{DL_FUNCS}}) or
+                   @{$spec{FUNCLIST}});
+      if (defined $spec{DL_FUNCS}) {
+          foreach my $package (sort keys %{$spec{DL_FUNCS}}) {
+              my($packprefix,$bootseen);
+              ($packprefix = $package) =~ s/\W/_/g;
+              foreach my $sym (@{$spec{DL_FUNCS}->{$package}}) {
+                  if ($sym =~ /^boot_/) {
+                      push(@{$spec{FUNCLIST}},$sym);
+                      $bootseen++;
+                  }
+                  else {
+                      push(@{$spec{FUNCLIST}},"XS_${packprefix}_$sym");
+                  }
+              }
+              push(@{$spec{FUNCLIST}},"boot_$packprefix") unless $bootseen;
+          }
+      }
+  
+  #    We'll need this if we ever add any OS which uses mod2fname
+  #    not as pseudo-builtin.
+  #    require DynaLoader;
+      if (defined &DynaLoader::mod2fname and not $spec{DLBASE}) {
+          $spec{DLBASE} = DynaLoader::mod2fname([ split(/::/,$spec{NAME}) ]);
+      }
+  
+      if    ($osname eq 'aix') { _write_aix(\%spec); }
+      elsif ($osname eq 'MacOS'){ _write_aix(\%spec) }
+      elsif ($osname eq 'VMS') { _write_vms(\%spec) }
+      elsif ($osname eq 'os2') { _write_os2(\%spec) }
+      elsif ($osname eq 'MSWin32') { _write_win32(\%spec) }
+      else {
+          croak("Don't know how to create linker option file for $osname\n");
+      }
+  }
+  
+  
+  sub _write_aix {
+      my($data) = @_;
+  
+      rename "$data->{FILE}.exp", "$data->{FILE}.exp_old";
+  
+      open( my $exp, ">", "$data->{FILE}.exp")
+          or croak("Can't create $data->{FILE}.exp: $!\n");
+      print $exp join("\n",@{$data->{DL_VARS}}, "\n") if @{$data->{DL_VARS}};
+      print $exp join("\n",@{$data->{FUNCLIST}}, "\n") if @{$data->{FUNCLIST}};
+      close $exp;
+  }
+  
+  
+  sub _write_os2 {
+      my($data) = @_;
+      require Config;
+      my $threaded = ($Config::Config{archname} =~ /-thread/ ? " threaded" : "");
+  
+      if (not $data->{DLBASE}) {
+          ($data->{DLBASE} = $data->{NAME}) =~ s/.*:://;
+          $data->{DLBASE} = substr($data->{DLBASE},0,7) . '_';
+      }
+      my $distname = $data->{DISTNAME} || $data->{NAME};
+      $distname = "Distribution $distname";
+      my $patchlevel = " pl$Config{perl_patchlevel}" || '';
+      my $comment = sprintf "Perl (v%s%s%s) module %s",
+        $Config::Config{version}, $threaded, $patchlevel, $data->{NAME};
+      chomp $comment;
+      if ($data->{INSTALLDIRS} and $data->{INSTALLDIRS} eq 'perl') {
+          $distname = 'perl5-porters@perl.org';
+          $comment = "Core $comment";
+      }
+      $comment = "$comment (Perl-config: $Config{config_args})";
+      $comment = substr($comment, 0, 200) . "...)" if length $comment > 203;
+      rename "$data->{FILE}.def", "$data->{FILE}_def.old";
+  
+      open(my $def, ">", "$data->{FILE}.def")
+          or croak("Can't create $data->{FILE}.def: $!\n");
+      print $def "LIBRARY '$data->{DLBASE}' INITINSTANCE TERMINSTANCE\n";
+      print $def "DESCRIPTION '\@#$distname:$data->{VERSION}#\@ $comment'\n";
+      print $def "CODE LOADONCALL\n";
+      print $def "DATA LOADONCALL NONSHARED MULTIPLE\n";
+      print $def "EXPORTS\n  ";
+      print $def join("\n  ",@{$data->{DL_VARS}}, "\n") if @{$data->{DL_VARS}};
+      print $def join("\n  ",@{$data->{FUNCLIST}}, "\n") if @{$data->{FUNCLIST}};
+      _print_imports($def, $data);
+      close $def;
+  }
+  
+  sub _print_imports {
+      my ($def, $data)= @_;
+      my $imports= $data->{IMPORTS}
+          or return;
+      if ( keys %$imports ) {
+          print $def "IMPORTS\n";
+          foreach my $name (sort keys %$imports) {
+              print $def "  $name=$imports->{$name}\n";
+          }
+      }
+  }
+  
+  sub _write_win32 {
+      my($data) = @_;
+  
+      require Config;
+      if (not $data->{DLBASE}) {
+          ($data->{DLBASE} = $data->{NAME}) =~ s/.*:://;
+          $data->{DLBASE} = substr($data->{DLBASE},0,7) . '_';
+      }
+      rename "$data->{FILE}.def", "$data->{FILE}_def.old";
+  
+      open( my $def, ">", "$data->{FILE}.def" )
+          or croak("Can't create $data->{FILE}.def: $!\n");
+      # put library name in quotes (it could be a keyword, like 'Alias')
+      if ($Config::Config{'cc'} !~ /^gcc/i) {
+          print $def "LIBRARY \"$data->{DLBASE}\"\n";
+      }
+      print $def "EXPORTS\n  ";
+      my @syms;
+      # Export public symbols both with and without underscores to
+      # ensure compatibility between DLLs from Borland C and Visual C
+      # NOTE: DynaLoader itself only uses the names without underscores,
+      # so this is only to cover the case when the extension DLL may be
+      # linked to directly from C. GSAR 97-07-10
+  
+      #bcc dropped in 5.16, so dont create useless extra symbols for export table
+      unless($] >= 5.016) {
+          if ($Config::Config{'cc'} =~ /^bcc/i) {
+              push @syms, "_$_", "$_ = _$_"
+                  for (@{$data->{DL_VARS}}, @{$data->{FUNCLIST}});
+          }
+          else {
+              push @syms, "$_", "_$_ = $_"
+                  for (@{$data->{DL_VARS}}, @{$data->{FUNCLIST}});
+          }
+      } else {
+          push @syms, "$_"
+              for (@{$data->{DL_VARS}}, @{$data->{FUNCLIST}});
+      }
+      print $def join("\n  ",@syms, "\n") if @syms;
+      _print_imports($def, $data);
+      close $def;
+  }
+  
+  
+  sub _write_vms {
+      my($data) = @_;
+  
+      require Config; # a reminder for once we do $^O
+      require ExtUtils::XSSymSet;
+  
+      my($isvax) = $Config::Config{'archname'} =~ /VAX/i;
+      my($set) = new ExtUtils::XSSymSet;
+  
+      rename "$data->{FILE}.opt", "$data->{FILE}.opt_old";
+  
+      open(my $opt,">", "$data->{FILE}.opt")
+          or croak("Can't create $data->{FILE}.opt: $!\n");
+  
+      # Options file declaring universal symbols
+      # Used when linking shareable image for dynamic extension,
+      # or when linking PerlShr into which we've added this package
+      # as a static extension
+      # We don't do anything to preserve order, so we won't relax
+      # the GSMATCH criteria for a dynamic extension
+  
+      print $opt "case_sensitive=yes\n"
+          if $Config::Config{d_vms_case_sensitive_symbols};
+  
+      foreach my $sym (@{$data->{FUNCLIST}}) {
+          my $safe = $set->addsym($sym);
+          if ($isvax) { print $opt "UNIVERSAL=$safe\n" }
+          else        { print $opt "SYMBOL_VECTOR=($safe=PROCEDURE)\n"; }
+      }
+  
+      foreach my $sym (@{$data->{DL_VARS}}) {
+          my $safe = $set->addsym($sym);
+          print $opt "PSECT_ATTR=${sym},PIC,OVR,RD,NOEXE,WRT,NOSHR\n";
+          if ($isvax) { print $opt "UNIVERSAL=$safe\n" }
+          else        { print $opt "SYMBOL_VECTOR=($safe=DATA)\n"; }
+      }
+  
+      close $opt;
+  }
+  
+  1;
+  
+  __END__
+  
+  =head1 NAME
+  
+  ExtUtils::Mksymlists - write linker options files for dynamic extension
+  
+  =head1 SYNOPSIS
+  
+      use ExtUtils::Mksymlists;
+      Mksymlists(  NAME     => $name ,
+                   DL_VARS  => [ $var1, $var2, $var3 ],
+                   DL_FUNCS => { $pkg1 => [ $func1, $func2 ],
+                                 $pkg2 => [ $func3 ] );
+  
+  =head1 DESCRIPTION
+  
+  C<ExtUtils::Mksymlists> produces files used by the linker under some OSs
+  during the creation of shared libraries for dynamic extensions.  It is
+  normally called from a MakeMaker-generated Makefile when the extension
+  is built.  The linker option file is generated by calling the function
+  C<Mksymlists>, which is exported by default from C<ExtUtils::Mksymlists>.
+  It takes one argument, a list of key-value pairs, in which the following
+  keys are recognized:
+  
+  =over 4
+  
+  =item DLBASE
+  
+  This item specifies the name by which the linker knows the
+  extension, which may be different from the name of the
+  extension itself (for instance, some linkers add an '_' to the
+  name of the extension).  If it is not specified, it is derived
+  from the NAME attribute.  It is presently used only by OS2 and Win32.
+  
+  =item DL_FUNCS
+  
+  This is identical to the DL_FUNCS attribute available via MakeMaker,
+  from which it is usually taken.  Its value is a reference to an
+  associative array, in which each key is the name of a package, and
+  each value is an a reference to an array of function names which
+  should be exported by the extension.  For instance, one might say
+  C<DL_FUNCS =E<gt> { Homer::Iliad =E<gt> [ qw(trojans greeks) ],
+  Homer::Odyssey =E<gt> [ qw(travellers family suitors) ] }>.  The
+  function names should be identical to those in the XSUB code;
+  C<Mksymlists> will alter the names written to the linker option
+  file to match the changes made by F<xsubpp>.  In addition, if
+  none of the functions in a list begin with the string B<boot_>,
+  C<Mksymlists> will add a bootstrap function for that package,
+  just as xsubpp does.  (If a B<boot_E<lt>pkgE<gt>> function is
+  present in the list, it is passed through unchanged.)  If
+  DL_FUNCS is not specified, it defaults to the bootstrap
+  function for the extension specified in NAME.
+  
+  =item DL_VARS
+  
+  This is identical to the DL_VARS attribute available via MakeMaker,
+  and, like DL_FUNCS, it is usually specified via MakeMaker.  Its
+  value is a reference to an array of variable names which should
+  be exported by the extension.
+  
+  =item FILE
+  
+  This key can be used to specify the name of the linker option file
+  (minus the OS-specific extension), if for some reason you do not
+  want to use the default value, which is the last word of the NAME
+  attribute (I<e.g.> for C<Tk::Canvas>, FILE defaults to C<Canvas>).
+  
+  =item FUNCLIST
+  
+  This provides an alternate means to specify function names to be
+  exported from the extension.  Its value is a reference to an
+  array of function names to be exported by the extension.  These
+  names are passed through unaltered to the linker options file.
+  Specifying a value for the FUNCLIST attribute suppresses automatic
+  generation of the bootstrap function for the package. To still create
+  the bootstrap name you have to specify the package name in the
+  DL_FUNCS hash:
+  
+      Mksymlists(  NAME     => $name ,
+  		 FUNCLIST => [ $func1, $func2 ],
+                   DL_FUNCS => { $pkg => [] } );
+  
+  
+  =item IMPORTS
+  
+  This attribute is used to specify names to be imported into the
+  extension. It is currently only used by OS/2 and Win32.
+  
+  =item NAME
+  
+  This gives the name of the extension (I<e.g.> C<Tk::Canvas>) for which
+  the linker option file will be produced.
+  
+  =back
+  
+  When calling C<Mksymlists>, one should always specify the NAME
+  attribute.  In most cases, this is all that's necessary.  In
+  the case of unusual extensions, however, the other attributes
+  can be used to provide additional information to the linker.
+  
+  =head1 AUTHOR
+  
+  Charles Bailey I<E<lt>bailey@newman.upenn.eduE<gt>>
+  
+  =head1 REVISION
+  
+  Last revised 14-Feb-1996, for Perl 5.002.
+EXTUTILS_MKSYMLISTS
+
+$fatpacked{"ExtUtils/testlib.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'EXTUTILS_TESTLIB';
+  package ExtUtils::testlib;
+  
+  use strict;
+  use warnings;
+  
+  our $VERSION = '7.04';
+  
+  use Cwd;
+  use File::Spec;
+  
+  # So the tests can chdir around and not break @INC.
+  # We use getcwd() because otherwise rel2abs will blow up under taint
+  # mode pre-5.8.  We detaint is so @INC won't be tainted.  This is
+  # no worse, and probably better, than just shoving an untainted,
+  # relative "blib/lib" onto @INC.
+  my $cwd;
+  BEGIN {
+      ($cwd) = getcwd() =~ /(.*)/;
+  }
+  use lib map { File::Spec->rel2abs($_, $cwd) } qw(blib/arch blib/lib);
+  1;
+  __END__
+  
+  =head1 NAME
+  
+  ExtUtils::testlib - add blib/* directories to @INC
+  
+  =head1 SYNOPSIS
+  
+    use ExtUtils::testlib;
+  
+  =head1 DESCRIPTION
+  
+  After an extension has been built and before it is installed it may be
+  desirable to test it bypassing C<make test>. By adding
+  
+      use ExtUtils::testlib;
+  
+  to a test program the intermediate directories used by C<make> are
+  added to @INC.
+  
+EXTUTILS_TESTLIB
+
 $fatpacked{"File/pushd.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'FILE_PUSHD';
   use strict;
   use warnings;
   
   package File::pushd;
   # ABSTRACT: change directory temporarily for a limited scope
-  our $VERSION = '1.007'; # VERSION
+  our $VERSION = '1.009'; # VERSION
   
   our @EXPORT = qw( pushd tempd );
   our @ISA    = qw( Exporter );
@@ -4878,7 +24378,7 @@ $fatpacked{"File/pushd.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'FILE
   
   =head1 VERSION
   
-  version 1.007
+  version 1.009
   
   =head1 SYNOPSIS
   
@@ -5944,6 +25444,1301 @@ $fatpacked{"Module/Pluggable/Object.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."
   =cut 
   
 MODULE_PLUGGABLE_OBJECT
+
+$fatpacked{"darwin-thread-multi-2level/version.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'DARWIN-THREAD-MULTI-2LEVEL_VERSION';
+  #!perl -w
+  package version;
+  
+  use 5.006002;
+  use strict;
+  
+  use vars qw(@ISA $VERSION $CLASS $STRICT $LAX *declare *qv);
+  
+  $VERSION = 0.9909;
+  $CLASS = 'version';
+  
+  # !!!!Delete this next block completely when adding to Perl core!!!!
+  {
+      local $SIG{'__DIE__'};
+      eval "use version::vxs $VERSION";
+      if ( $@ ) { # don't have the XS version installed
+  	eval "use version::vpp $VERSION"; # don't tempt fate
+  	die "$@" if ( $@ );
+  	push @ISA, "version::vpp";
+  	local $^W;
+  	*version::qv = \&version::vpp::qv;
+  	*version::declare = \&version::vpp::declare;
+  	*version::_VERSION = \&version::vpp::_VERSION;
+  	*version::vcmp = \&version::vpp::vcmp;
+  	*version::new = \&version::vpp::new;
+  	if ($] >= 5.009000) {
+  	    no strict 'refs';
+  	    *version::stringify = \&version::vpp::stringify;
+  	    *{'version::(""'} = \&version::vpp::stringify;
+  	    *{'version::(<=>'} = \&version::vpp::vcmp;
+  	    *version::parse = \&version::vpp::parse;
+  	}
+      }
+      else { # use XS module
+  	push @ISA, "version::vxs";
+  	local $^W;
+  	*version::declare = \&version::vxs::declare;
+  	*version::qv = \&version::vxs::qv;
+  	*version::_VERSION = \&version::vxs::_VERSION;
+  	*version::vcmp = \&version::vxs::VCMP;
+  	*version::new = \&version::vxs::new;
+  	if ($] >= 5.009000) {
+  	    no strict 'refs';
+  	    *version::stringify = \&version::vxs::stringify;
+  	    *{'version::(""'} = \&version::vxs::stringify;
+  	    *{'version::(<=>'} = \&version::vxs::VCMP;
+  	    *version::parse = \&version::vxs::parse;
+  	}
+      }
+  }
+  
+  # avoid using Exporter
+  require version::regex;
+  *version::is_lax = \&version::regex::is_lax;
+  *version::is_strict = \&version::regex::is_strict;
+  *LAX = \$version::regex::LAX;
+  *STRICT = \$version::regex::STRICT;
+  
+  sub import {
+      no strict 'refs';
+      my ($class) = shift;
+  
+      # Set up any derived class
+      unless ($class eq $CLASS) {
+  	local $^W;
+  	*{$class.'::declare'} =  \&{$CLASS.'::declare'};
+  	*{$class.'::qv'} = \&{$CLASS.'::qv'};
+      }
+  
+      my %args;
+      if (@_) { # any remaining terms are arguments
+  	map { $args{$_} = 1 } @_
+      }
+      else { # no parameters at all on use line
+  	%args =
+  	(
+  	    qv => 1,
+  	    'UNIVERSAL::VERSION' => 1,
+  	);
+      }
+  
+      my $callpkg = caller();
+  
+      if (exists($args{declare})) {
+  	*{$callpkg.'::declare'} =
+  	    sub {return $class->declare(shift) }
+  	  unless defined(&{$callpkg.'::declare'});
+      }
+  
+      if (exists($args{qv})) {
+  	*{$callpkg.'::qv'} =
+  	    sub {return $class->qv(shift) }
+  	  unless defined(&{$callpkg.'::qv'});
+      }
+  
+      if (exists($args{'UNIVERSAL::VERSION'})) {
+  	local $^W;
+  	*UNIVERSAL::VERSION
+  		= \&{$CLASS.'::_VERSION'};
+      }
+  
+      if (exists($args{'VERSION'})) {
+  	*{$callpkg.'::VERSION'} = \&{$CLASS.'::_VERSION'};
+      }
+  
+      if (exists($args{'is_strict'})) {
+  	*{$callpkg.'::is_strict'} = \&{$CLASS.'::is_strict'}
+  	  unless defined(&{$callpkg.'::is_strict'});
+      }
+  
+      if (exists($args{'is_lax'})) {
+  	*{$callpkg.'::is_lax'} = \&{$CLASS.'::is_lax'}
+  	  unless defined(&{$callpkg.'::is_lax'});
+      }
+  }
+  
+  
+  1;
+DARWIN-THREAD-MULTI-2LEVEL_VERSION
+
+$fatpacked{"darwin-thread-multi-2level/version/regex.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'DARWIN-THREAD-MULTI-2LEVEL_VERSION_REGEX';
+  package version::regex;
+  
+  use strict;
+  
+  use vars qw($VERSION $CLASS $STRICT $LAX);
+  
+  $VERSION = 0.9909;
+  
+  #--------------------------------------------------------------------------#
+  # Version regexp components
+  #--------------------------------------------------------------------------#
+  
+  # Fraction part of a decimal version number.  This is a common part of
+  # both strict and lax decimal versions
+  
+  my $FRACTION_PART = qr/\.[0-9]+/;
+  
+  # First part of either decimal or dotted-decimal strict version number.
+  # Unsigned integer with no leading zeroes (except for zero itself) to
+  # avoid confusion with octal.
+  
+  my $STRICT_INTEGER_PART = qr/0|[1-9][0-9]*/;
+  
+  # First part of either decimal or dotted-decimal lax version number.
+  # Unsigned integer, but allowing leading zeros.  Always interpreted
+  # as decimal.  However, some forms of the resulting syntax give odd
+  # results if used as ordinary Perl expressions, due to how perl treats
+  # octals.  E.g.
+  #   version->new("010" ) == 10
+  #   version->new( 010  ) == 8
+  #   version->new( 010.2) == 82  # "8" . "2"
+  
+  my $LAX_INTEGER_PART = qr/[0-9]+/;
+  
+  # Second and subsequent part of a strict dotted-decimal version number.
+  # Leading zeroes are permitted, and the number is always decimal.
+  # Limited to three digits to avoid overflow when converting to decimal
+  # form and also avoid problematic style with excessive leading zeroes.
+  
+  my $STRICT_DOTTED_DECIMAL_PART = qr/\.[0-9]{1,3}/;
+  
+  # Second and subsequent part of a lax dotted-decimal version number.
+  # Leading zeroes are permitted, and the number is always decimal.  No
+  # limit on the numerical value or number of digits, so there is the
+  # possibility of overflow when converting to decimal form.
+  
+  my $LAX_DOTTED_DECIMAL_PART = qr/\.[0-9]+/;
+  
+  # Alpha suffix part of lax version number syntax.  Acts like a
+  # dotted-decimal part.
+  
+  my $LAX_ALPHA_PART = qr/_[0-9]+/;
+  
+  #--------------------------------------------------------------------------#
+  # Strict version regexp definitions
+  #--------------------------------------------------------------------------#
+  
+  # Strict decimal version number.
+  
+  my $STRICT_DECIMAL_VERSION =
+      qr/ $STRICT_INTEGER_PART $FRACTION_PART? /x;
+  
+  # Strict dotted-decimal version number.  Must have both leading "v" and
+  # at least three parts, to avoid confusion with decimal syntax.
+  
+  my $STRICT_DOTTED_DECIMAL_VERSION =
+      qr/ v $STRICT_INTEGER_PART $STRICT_DOTTED_DECIMAL_PART{2,} /x;
+  
+  # Complete strict version number syntax -- should generally be used
+  # anchored: qr/ \A $STRICT \z /x
+  
+  $STRICT =
+      qr/ $STRICT_DECIMAL_VERSION | $STRICT_DOTTED_DECIMAL_VERSION /x;
+  
+  #--------------------------------------------------------------------------#
+  # Lax version regexp definitions
+  #--------------------------------------------------------------------------#
+  
+  # Lax decimal version number.  Just like the strict one except for
+  # allowing an alpha suffix or allowing a leading or trailing
+  # decimal-point
+  
+  my $LAX_DECIMAL_VERSION =
+      qr/ $LAX_INTEGER_PART (?: \. | $FRACTION_PART $LAX_ALPHA_PART? )?
+  	|
+  	$FRACTION_PART $LAX_ALPHA_PART?
+      /x;
+  
+  # Lax dotted-decimal version number.  Distinguished by having either
+  # leading "v" or at least three non-alpha parts.  Alpha part is only
+  # permitted if there are at least two non-alpha parts. Strangely
+  # enough, without the leading "v", Perl takes .1.2 to mean v0.1.2,
+  # so when there is no "v", the leading part is optional
+  
+  my $LAX_DOTTED_DECIMAL_VERSION =
+      qr/
+  	v $LAX_INTEGER_PART (?: $LAX_DOTTED_DECIMAL_PART+ $LAX_ALPHA_PART? )?
+  	|
+  	$LAX_INTEGER_PART? $LAX_DOTTED_DECIMAL_PART{2,} $LAX_ALPHA_PART?
+      /x;
+  
+  # Complete lax version number syntax -- should generally be used
+  # anchored: qr/ \A $LAX \z /x
+  #
+  # The string 'undef' is a special case to make for easier handling
+  # of return values from ExtUtils::MM->parse_version
+  
+  $LAX =
+      qr/ undef | $LAX_DECIMAL_VERSION | $LAX_DOTTED_DECIMAL_VERSION /x;
+  
+  #--------------------------------------------------------------------------#
+  
+  # Preloaded methods go here.
+  sub is_strict	{ defined $_[0] && $_[0] =~ qr/ \A $STRICT \z /x }
+  sub is_lax	{ defined $_[0] && $_[0] =~ qr/ \A $LAX \z /x }
+  
+  1;
+DARWIN-THREAD-MULTI-2LEVEL_VERSION_REGEX
+
+$fatpacked{"darwin-thread-multi-2level/version/vpp.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'DARWIN-THREAD-MULTI-2LEVEL_VERSION_VPP';
+  package charstar;
+  # a little helper class to emulate C char* semantics in Perl
+  # so that prescan_version can use the same code as in C
+  
+  use overload (
+      '""'	=> \&thischar,
+      '0+'	=> \&thischar,
+      '++'	=> \&increment,
+      '--'	=> \&decrement,
+      '+'		=> \&plus,
+      '-'		=> \&minus,
+      '*'		=> \&multiply,
+      'cmp'	=> \&cmp,
+      '<=>'	=> \&spaceship,
+      'bool'	=> \&thischar,
+      '='		=> \&clone,
+  );
+  
+  sub new {
+      my ($self, $string) = @_;
+      my $class = ref($self) || $self;
+  
+      my $obj = {
+  	string  => [split(//,$string)],
+  	current => 0,
+      };
+      return bless $obj, $class;
+  }
+  
+  sub thischar {
+      my ($self) = @_;
+      my $last = $#{$self->{string}};
+      my $curr = $self->{current};
+      if ($curr >= 0 && $curr <= $last) {
+  	return $self->{string}->[$curr];
+      }
+      else {
+  	return '';
+      }
+  }
+  
+  sub increment {
+      my ($self) = @_;
+      $self->{current}++;
+  }
+  
+  sub decrement {
+      my ($self) = @_;
+      $self->{current}--;
+  }
+  
+  sub plus {
+      my ($self, $offset) = @_;
+      my $rself = $self->clone;
+      $rself->{current} += $offset;
+      return $rself;
+  }
+  
+  sub minus {
+      my ($self, $offset) = @_;
+      my $rself = $self->clone;
+      $rself->{current} -= $offset;
+      return $rself;
+  }
+  
+  sub multiply {
+      my ($left, $right, $swapped) = @_;
+      my $char = $left->thischar();
+      return $char * $right;
+  }
+  
+  sub spaceship {
+      my ($left, $right, $swapped) = @_;
+      unless (ref($right)) { # not an object already
+  	$right = $left->new($right);
+      }
+      return $left->{current} <=> $right->{current};
+  }
+  
+  sub cmp {
+      my ($left, $right, $swapped) = @_;
+      unless (ref($right)) { # not an object already
+  	if (length($right) == 1) { # comparing single character only
+  	    return $left->thischar cmp $right;
+  	}
+  	$right = $left->new($right);
+      }
+      return $left->currstr cmp $right->currstr;
+  }
+  
+  sub bool {
+      my ($self) = @_;
+      my $char = $self->thischar;
+      return ($char ne '');
+  }
+  
+  sub clone {
+      my ($left, $right, $swapped) = @_;
+      $right = {
+  	string  => [@{$left->{string}}],
+  	current => $left->{current},
+      };
+      return bless $right, ref($left);
+  }
+  
+  sub currstr {
+      my ($self, $s) = @_;
+      my $curr = $self->{current};
+      my $last = $#{$self->{string}};
+      if (defined($s) && $s->{current} < $last) {
+  	$last = $s->{current};
+      }
+  
+      my $string = join('', @{$self->{string}}[$curr..$last]);
+      return $string;
+  }
+  
+  package version::vpp;
+  
+  use 5.006002;
+  use strict;
+  
+  use Config;
+  use vars qw($VERSION $CLASS @ISA $LAX $STRICT);
+  $VERSION = 0.9909;
+  $CLASS = 'version::vpp';
+  
+  require version::regex;
+  *version::vpp::is_strict = \&version::regex::is_strict;
+  *version::vpp::is_lax = \&version::regex::is_lax;
+  *LAX = \$version::regex::LAX;
+  *STRICT = \$version::regex::STRICT;
+  
+  use overload (
+      '""'       => \&stringify,
+      '0+'       => \&numify,
+      'cmp'      => \&vcmp,
+      '<=>'      => \&vcmp,
+      'bool'     => \&vbool,
+      '+'        => \&vnoop,
+      '-'        => \&vnoop,
+      '*'        => \&vnoop,
+      '/'        => \&vnoop,
+      '+='        => \&vnoop,
+      '-='        => \&vnoop,
+      '*='        => \&vnoop,
+      '/='        => \&vnoop,
+      'abs'      => \&vnoop,
+  );
+  
+  eval "use warnings";
+  if ($@) {
+      eval '
+  	package
+  	warnings;
+  	sub enabled {return $^W;}
+  	1;
+      ';
+  }
+  
+  sub import {
+      no strict 'refs';
+      my ($class) = shift;
+  
+      # Set up any derived class
+      unless ($class eq $CLASS) {
+  	local $^W;
+  	*{$class.'::declare'} =  \&{$CLASS.'::declare'};
+  	*{$class.'::qv'} = \&{$CLASS.'::qv'};
+      }
+  
+      my %args;
+      if (@_) { # any remaining terms are arguments
+  	map { $args{$_} = 1 } @_
+      }
+      else { # no parameters at all on use line
+  	%args =
+  	(
+  	    qv => 1,
+  	    'UNIVERSAL::VERSION' => 1,
+  	);
+      }
+  
+      my $callpkg = caller();
+  
+      if (exists($args{declare})) {
+  	*{$callpkg.'::declare'} =
+  	    sub {return $class->declare(shift) }
+  	  unless defined(&{$callpkg.'::declare'});
+      }
+  
+      if (exists($args{qv})) {
+  	*{$callpkg.'::qv'} =
+  	    sub {return $class->qv(shift) }
+  	  unless defined(&{$callpkg.'::qv'});
+      }
+  
+      if (exists($args{'UNIVERSAL::VERSION'})) {
+  	local $^W;
+  	*UNIVERSAL::VERSION
+  		= \&{$CLASS.'::_VERSION'};
+      }
+  
+      if (exists($args{'VERSION'})) {
+  	*{$callpkg.'::VERSION'} = \&{$CLASS.'::_VERSION'};
+      }
+  
+      if (exists($args{'is_strict'})) {
+  	*{$callpkg.'::is_strict'} = \&{$CLASS.'::is_strict'}
+  	  unless defined(&{$callpkg.'::is_strict'});
+      }
+  
+      if (exists($args{'is_lax'})) {
+  	*{$callpkg.'::is_lax'} = \&{$CLASS.'::is_lax'}
+  	  unless defined(&{$callpkg.'::is_lax'});
+      }
+  }
+  
+  my $VERSION_MAX = 0x7FFFFFFF;
+  
+  # implement prescan_version as closely to the C version as possible
+  use constant TRUE  => 1;
+  use constant FALSE => 0;
+  
+  sub isDIGIT {
+      my ($char) = shift->thischar();
+      return ($char =~ /\d/);
+  }
+  
+  sub isALPHA {
+      my ($char) = shift->thischar();
+      return ($char =~ /[a-zA-Z]/);
+  }
+  
+  sub isSPACE {
+      my ($char) = shift->thischar();
+      return ($char =~ /\s/);
+  }
+  
+  sub BADVERSION {
+      my ($s, $errstr, $error) = @_;
+      if ($errstr) {
+  	$$errstr = $error;
+      }
+      return $s;
+  }
+  
+  sub prescan_version {
+      my ($s, $strict, $errstr, $sqv, $ssaw_decimal, $swidth, $salpha) = @_;
+      my $qv          = defined $sqv          ? $$sqv          : FALSE;
+      my $saw_decimal = defined $ssaw_decimal ? $$ssaw_decimal : 0;
+      my $width       = defined $swidth       ? $$swidth       : 3;
+      my $alpha       = defined $salpha       ? $$salpha       : FALSE;
+  
+      my $d = $s;
+  
+      if ($qv && isDIGIT($d)) {
+  	goto dotted_decimal_version;
+      }
+  
+      if ($d eq 'v') { # explicit v-string
+  	$d++;
+  	if (isDIGIT($d)) {
+  	    $qv = TRUE;
+  	}
+  	else { # degenerate v-string
+  	    # requires v1.2.3
+  	    return BADVERSION($s,$errstr,"Invalid version format (dotted-decimal versions require at least three parts)");
+  	}
+  
+  dotted_decimal_version:
+  	if ($strict && $d eq '0' && isDIGIT($d+1)) {
+  	    # no leading zeros allowed
+  	    return BADVERSION($s,$errstr,"Invalid version format (no leading zeros)");
+  	}
+  
+  	while (isDIGIT($d)) { 	# integer part
+  	    $d++;
+  	}
+  
+  	if ($d eq '.')
+  	{
+  	    $saw_decimal++;
+  	    $d++; 		# decimal point
+  	}
+  	else
+  	{
+  	    if ($strict) {
+  		# require v1.2.3
+  		return BADVERSION($s,$errstr,"Invalid version format (dotted-decimal versions require at least three parts)");
+  	    }
+  	    else {
+  		goto version_prescan_finish;
+  	    }
+  	}
+  
+  	{
+  	    my $i = 0;
+  	    my $j = 0;
+  	    while (isDIGIT($d)) {	# just keep reading
+  		$i++;
+  		while (isDIGIT($d)) {
+  		    $d++; $j++;
+  		    # maximum 3 digits between decimal
+  		    if ($strict && $j > 3) {
+  			return BADVERSION($s,$errstr,"Invalid version format (maximum 3 digits between decimals)");
+  		    }
+  		}
+  		if ($d eq '_') {
+  		    if ($strict) {
+  			return BADVERSION($s,$errstr,"Invalid version format (no underscores)");
+  		    }
+  		    if ( $alpha ) {
+  			return BADVERSION($s,$errstr,"Invalid version format (multiple underscores)");
+  		    }
+  		    $d++;
+  		    $alpha = TRUE;
+  		}
+  		elsif ($d eq '.') {
+  		    if ($alpha) {
+  			return BADVERSION($s,$errstr,"Invalid version format (underscores before decimal)");
+  		    }
+  		    $saw_decimal++;
+  		    $d++;
+  		}
+  		elsif (!isDIGIT($d)) {
+  		    last;
+  		}
+  		$j = 0;
+  	    }
+  
+  	    if ($strict && $i < 2) {
+  		# requires v1.2.3
+  		return BADVERSION($s,$errstr,"Invalid version format (dotted-decimal versions require at least three parts)");
+  	    }
+  	}
+      } 					# end if dotted-decimal
+      else
+      {					# decimal versions
+  	my $j = 0;
+  	# special $strict case for leading '.' or '0'
+  	if ($strict) {
+  	    if ($d eq '.') {
+  		return BADVERSION($s,$errstr,"Invalid version format (0 before decimal required)");
+  	    }
+  	    if ($d eq '0' && isDIGIT($d+1)) {
+  		return BADVERSION($s,$errstr,"Invalid version format (no leading zeros)");
+  	    }
+  	}
+  
+  	# and we never support negative version numbers
+  	if ($d eq '-') {
+  	    return BADVERSION($s,$errstr,"Invalid version format (negative version number)");
+  	}
+  
+  	# consume all of the integer part
+  	while (isDIGIT($d)) {
+  	    $d++;
+  	}
+  
+  	# look for a fractional part
+  	if ($d eq '.') {
+  	    # we found it, so consume it
+  	    $saw_decimal++;
+  	    $d++;
+  	}
+  	elsif (!$d || $d eq ';' || isSPACE($d) || $d eq '}') {
+  	    if ( $d == $s ) {
+  		# found nothing
+  		return BADVERSION($s,$errstr,"Invalid version format (version required)");
+  	    }
+  	    # found just an integer
+  	    goto version_prescan_finish;
+  	}
+  	elsif ( $d == $s ) {
+  	    # didn't find either integer or period
+  	    return BADVERSION($s,$errstr,"Invalid version format (non-numeric data)");
+  	}
+  	elsif ($d eq '_') {
+  	    # underscore can't come after integer part
+  	    if ($strict) {
+  		return BADVERSION($s,$errstr,"Invalid version format (no underscores)");
+  	    }
+  	    elsif (isDIGIT($d+1)) {
+  		return BADVERSION($s,$errstr,"Invalid version format (alpha without decimal)");
+  	    }
+  	    else {
+  		return BADVERSION($s,$errstr,"Invalid version format (misplaced underscore)");
+  	    }
+  	}
+  	elsif ($d) {
+  	    # anything else after integer part is just invalid data
+  	    return BADVERSION($s,$errstr,"Invalid version format (non-numeric data)");
+  	}
+  
+  	# scan the fractional part after the decimal point
+  	if ($d && !isDIGIT($d) && ($strict || ! ($d eq ';' || isSPACE($d) || $d eq '}') )) {
+  		# $strict or lax-but-not-the-end
+  		return BADVERSION($s,$errstr,"Invalid version format (fractional part required)");
+  	}
+  
+  	while (isDIGIT($d)) {
+  	    $d++; $j++;
+  	    if ($d eq '.' && isDIGIT($d-1)) {
+  		if ($alpha) {
+  		    return BADVERSION($s,$errstr,"Invalid version format (underscores before decimal)");
+  		}
+  		if ($strict) {
+  		    return BADVERSION($s,$errstr,"Invalid version format (dotted-decimal versions must begin with 'v')");
+  		}
+  		$d = $s; # start all over again
+  		$qv = TRUE;
+  		goto dotted_decimal_version;
+  	    }
+  	    if ($d eq '_') {
+  		if ($strict) {
+  		    return BADVERSION($s,$errstr,"Invalid version format (no underscores)");
+  		}
+  		if ( $alpha ) {
+  		    return BADVERSION($s,$errstr,"Invalid version format (multiple underscores)");
+  		}
+  		if ( ! isDIGIT($d+1) ) {
+  		    return BADVERSION($s,$errstr,"Invalid version format (misplaced underscore)");
+  		}
+  		$width = $j;
+  		$d++;
+  		$alpha = TRUE;
+  	    }
+  	}
+      }
+  
+  version_prescan_finish:
+      while (isSPACE($d)) {
+  	$d++;
+      }
+  
+      if ($d && !isDIGIT($d) && (! ($d eq ';' || $d eq '}') )) {
+  	# trailing non-numeric data
+  	return BADVERSION($s,$errstr,"Invalid version format (non-numeric data)");
+      }
+  
+      if (defined $sqv) {
+  	$$sqv = $qv;
+      }
+      if (defined $swidth) {
+  	$$swidth = $width;
+      }
+      if (defined $ssaw_decimal) {
+  	$$ssaw_decimal = $saw_decimal;
+      }
+      if (defined $salpha) {
+  	$$salpha = $alpha;
+      }
+      return $d;
+  }
+  
+  sub scan_version {
+      my ($s, $rv, $qv) = @_;
+      my $start;
+      my $pos;
+      my $last;
+      my $errstr;
+      my $saw_decimal = 0;
+      my $width = 3;
+      my $alpha = FALSE;
+      my $vinf = FALSE;
+      my @av;
+  
+      $s = new charstar $s;
+  
+      while (isSPACE($s)) { # leading whitespace is OK
+  	$s++;
+      }
+  
+      $last = prescan_version($s, FALSE, \$errstr, \$qv, \$saw_decimal,
+  	\$width, \$alpha);
+  
+      if ($errstr) {
+  	# 'undef' is a special case and not an error
+  	if ( $s ne 'undef') {
+  	    require Carp;
+  	    Carp::croak($errstr);
+  	}
+      }
+  
+      $start = $s;
+      if ($s eq 'v') {
+  	$s++;
+      }
+      $pos = $s;
+  
+      if ( $qv ) {
+  	$$rv->{qv} = $qv;
+      }
+      if ( $alpha ) {
+  	$$rv->{alpha} = $alpha;
+      }
+      if ( !$qv && $width < 3 ) {
+  	$$rv->{width} = $width;
+      }
+  
+      while (isDIGIT($pos)) {
+  	$pos++;
+      }
+      if (!isALPHA($pos)) {
+  	my $rev;
+  
+  	for (;;) {
+  	    $rev = 0;
+  	    {
+    		# this is atoi() that delimits on underscores
+    		my $end = $pos;
+    		my $mult = 1;
+  		my $orev;
+  
+  		#  the following if() will only be true after the decimal
+  		#  point of a version originally created with a bare
+  		#  floating point number, i.e. not quoted in any way
+  		#
+   		if ( !$qv && $s > $start && $saw_decimal == 1 ) {
+  		    $mult *= 100;
+   		    while ( $s < $end ) {
+  			$orev = $rev;
+   			$rev += $s * $mult;
+   			$mult /= 10;
+  			if (   (abs($orev) > abs($rev))
+  			    || (abs($rev) > $VERSION_MAX )) {
+  			    warn("Integer overflow in version %d",
+  					   $VERSION_MAX);
+  			    $s = $end - 1;
+  			    $rev = $VERSION_MAX;
+  			    $vinf = 1;
+  			}
+   			$s++;
+  			if ( $s eq '_' ) {
+  			    $s++;
+  			}
+   		    }
+    		}
+   		else {
+   		    while (--$end >= $s) {
+  			$orev = $rev;
+   			$rev += $end * $mult;
+   			$mult *= 10;
+  			if (   (abs($orev) > abs($rev))
+  			    || (abs($rev) > $VERSION_MAX )) {
+  			    warn("Integer overflow in version");
+  			    $end = $s - 1;
+  			    $rev = $VERSION_MAX;
+  			    $vinf = 1;
+  			}
+   		    }
+   		}
+    	    }
+  
+    	    # Append revision
+  	    push @av, $rev;
+  	    if ( $vinf ) {
+  		$s = $last;
+  		last;
+  	    }
+  	    elsif ( $pos eq '.' ) {
+  		$s = ++$pos;
+  	    }
+  	    elsif ( $pos eq '_' && isDIGIT($pos+1) ) {
+  		$s = ++$pos;
+  	    }
+  	    elsif ( $pos eq ',' && isDIGIT($pos+1) ) {
+  		$s = ++$pos;
+  	    }
+  	    elsif ( isDIGIT($pos) ) {
+  		$s = $pos;
+  	    }
+  	    else {
+  		$s = $pos;
+  		last;
+  	    }
+  	    if ( $qv ) {
+  		while ( isDIGIT($pos) ) {
+  		    $pos++;
+  		}
+  	    }
+  	    else {
+  		my $digits = 0;
+  		while ( ( isDIGIT($pos) || $pos eq '_' ) && $digits < 3 ) {
+  		    if ( $pos ne '_' ) {
+  			$digits++;
+  		    }
+  		    $pos++;
+  		}
+  	    }
+  	}
+      }
+      if ( $qv ) { # quoted versions always get at least three terms
+  	my $len = $#av;
+  	#  This for loop appears to trigger a compiler bug on OS X, as it
+  	#  loops infinitely. Yes, len is negative. No, it makes no sense.
+  	#  Compiler in question is:
+  	#  gcc version 3.3 20030304 (Apple Computer, Inc. build 1640)
+  	#  for ( len = 2 - len; len > 0; len-- )
+  	#  av_push(MUTABLE_AV(sv), newSViv(0));
+  	#
+  	$len = 2 - $len;
+  	while ($len-- > 0) {
+  	    push @av, 0;
+  	}
+      }
+  
+      # need to save off the current version string for later
+      if ( $vinf ) {
+  	$$rv->{original} = "v.Inf";
+  	$$rv->{vinf} = 1;
+      }
+      elsif ( $s > $start ) {
+  	$$rv->{original} = $start->currstr($s);
+  	if ( $qv && $saw_decimal == 1 && $start ne 'v' ) {
+  	    # need to insert a v to be consistent
+  	    $$rv->{original} = 'v' . $$rv->{original};
+  	}
+      }
+      else {
+  	$$rv->{original} = '0';
+  	push(@av, 0);
+      }
+  
+      # And finally, store the AV in the hash
+      $$rv->{version} = \@av;
+  
+      # fix RT#19517 - special case 'undef' as string
+      if ($s eq 'undef') {
+  	$s += 5;
+      }
+  
+      return $s;
+  }
+  
+  sub new {
+      my $class = shift;
+      unless (defined $class or $#_ > 1) {
+  	require Carp;
+  	Carp::croak('Usage: version::new(class, version)');
+      }
+  
+      my $self = bless ({}, ref ($class) || $class);
+      my $qv = FALSE;
+  
+      if ( $#_ == 1 ) { # must be CVS-style
+  	$qv = TRUE;
+      }
+      my $value = pop; # always going to be the last element
+  
+      if ( ref($value) && eval('$value->isa("version")') ) {
+  	# Can copy the elements directly
+  	$self->{version} = [ @{$value->{version} } ];
+  	$self->{qv} = 1 if $value->{qv};
+  	$self->{alpha} = 1 if $value->{alpha};
+  	$self->{original} = ''.$value->{original};
+  	return $self;
+      }
+  
+      if ( not defined $value or $value =~ /^undef$/ ) {
+  	# RT #19517 - special case for undef comparison
+  	# or someone forgot to pass a value
+  	push @{$self->{version}}, 0;
+  	$self->{original} = "0";
+  	return ($self);
+      }
+  
+  
+      if (ref($value) =~ m/ARRAY|HASH/) {
+  	require Carp;
+  	Carp::croak("Invalid version format (non-numeric data)");
+      }
+  
+      $value = _un_vstring($value);
+  
+      if ($Config{d_setlocale}) {
+  	use POSIX qw/locale_h/;
+  	use if $Config{d_setlocale}, 'locale';
+  	my $currlocale = setlocale(LC_ALL);
+  
+  	# if the current locale uses commas for decimal points, we
+  	# just replace commas with decimal places, rather than changing
+  	# locales
+  	if ( localeconv()->{decimal_point} eq ',' ) {
+  	    $value =~ tr/,/./;
+  	}
+      }
+  
+      # exponential notation
+      if ( $value =~ /\d+.?\d*e[-+]?\d+/ ) {
+  	$value = sprintf("%.9f",$value);
+  	$value =~ s/(0+)$//; # trim trailing zeros
+      }
+  
+      my $s = scan_version($value, \$self, $qv);
+  
+      if ($s) { # must be something left over
+  	warn("Version string '%s' contains invalid data; "
+  		   ."ignoring: '%s'", $value, $s);
+      }
+  
+      return ($self);
+  }
+  
+  *parse = \&new;
+  
+  sub numify {
+      my ($self) = @_;
+      unless (_verify($self)) {
+  	require Carp;
+  	Carp::croak("Invalid version object");
+      }
+      my $width = $self->{width} || 3;
+      my $alpha = $self->{alpha} || "";
+      my $len = $#{$self->{version}};
+      my $digit = $self->{version}[0];
+      my $string = sprintf("%d.", $digit );
+  
+      for ( my $i = 1 ; $i < $len ; $i++ ) {
+  	$digit = $self->{version}[$i];
+  	if ( $width < 3 ) {
+  	    my $denom = 10**(3-$width);
+  	    my $quot = int($digit/$denom);
+  	    my $rem = $digit - ($quot * $denom);
+  	    $string .= sprintf("%0".$width."d_%d", $quot, $rem);
+  	}
+  	else {
+  	    $string .= sprintf("%03d", $digit);
+  	}
+      }
+  
+      if ( $len > 0 ) {
+  	$digit = $self->{version}[$len];
+  	if ( $alpha && $width == 3 ) {
+  	    $string .= "_";
+  	}
+  	$string .= sprintf("%0".$width."d", $digit);
+      }
+      else # $len = 0
+      {
+  	$string .= sprintf("000");
+      }
+  
+      return $string;
+  }
+  
+  sub normal {
+      my ($self) = @_;
+      unless (_verify($self)) {
+  	require Carp;
+  	Carp::croak("Invalid version object");
+      }
+      my $alpha = $self->{alpha} || "";
+      my $len = $#{$self->{version}};
+      my $digit = $self->{version}[0];
+      my $string = sprintf("v%d", $digit );
+  
+      for ( my $i = 1 ; $i < $len ; $i++ ) {
+  	$digit = $self->{version}[$i];
+  	$string .= sprintf(".%d", $digit);
+      }
+  
+      if ( $len > 0 ) {
+  	$digit = $self->{version}[$len];
+  	if ( $alpha ) {
+  	    $string .= sprintf("_%0d", $digit);
+  	}
+  	else {
+  	    $string .= sprintf(".%0d", $digit);
+  	}
+      }
+  
+      if ( $len <= 2 ) {
+  	for ( $len = 2 - $len; $len != 0; $len-- ) {
+  	    $string .= sprintf(".%0d", 0);
+  	}
+      }
+  
+      return $string;
+  }
+  
+  sub stringify {
+      my ($self) = @_;
+      unless (_verify($self)) {
+  	require Carp;
+  	Carp::croak("Invalid version object");
+      }
+      return exists $self->{original}
+      	? $self->{original}
+  	: exists $self->{qv}
+  	    ? $self->normal
+  	    : $self->numify;
+  }
+  
+  sub vcmp {
+      require UNIVERSAL;
+      my ($left,$right,$swap) = @_;
+      my $class = ref($left);
+      unless ( UNIVERSAL::isa($right, $class) ) {
+  	$right = $class->new($right);
+      }
+  
+      if ( $swap ) {
+  	($left, $right) = ($right, $left);
+      }
+      unless (_verify($left)) {
+  	require Carp;
+  	Carp::croak("Invalid version object");
+      }
+      unless (_verify($right)) {
+  	require Carp;
+  	Carp::croak("Invalid version format");
+      }
+      my $l = $#{$left->{version}};
+      my $r = $#{$right->{version}};
+      my $m = $l < $r ? $l : $r;
+      my $lalpha = $left->is_alpha;
+      my $ralpha = $right->is_alpha;
+      my $retval = 0;
+      my $i = 0;
+      while ( $i <= $m && $retval == 0 ) {
+  	$retval = $left->{version}[$i] <=> $right->{version}[$i];
+  	$i++;
+      }
+  
+      # tiebreaker for alpha with identical terms
+      if ( $retval == 0
+  	&& $l == $r
+  	&& $left->{version}[$m] == $right->{version}[$m]
+  	&& ( $lalpha || $ralpha ) ) {
+  
+  	if ( $lalpha && !$ralpha ) {
+  	    $retval = -1;
+  	}
+  	elsif ( $ralpha && !$lalpha) {
+  	    $retval = +1;
+  	}
+      }
+  
+      # possible match except for trailing 0's
+      if ( $retval == 0 && $l != $r ) {
+  	if ( $l < $r ) {
+  	    while ( $i <= $r && $retval == 0 ) {
+  		if ( $right->{version}[$i] != 0 ) {
+  		    $retval = -1; # not a match after all
+  		}
+  		$i++;
+  	    }
+  	}
+  	else {
+  	    while ( $i <= $l && $retval == 0 ) {
+  		if ( $left->{version}[$i] != 0 ) {
+  		    $retval = +1; # not a match after all
+  		}
+  		$i++;
+  	    }
+  	}
+      }
+  
+      return $retval;
+  }
+  
+  sub vbool {
+      my ($self) = @_;
+      return vcmp($self,$self->new("0"),1);
+  }
+  
+  sub vnoop {
+      require Carp;
+      Carp::croak("operation not supported with version object");
+  }
+  
+  sub is_alpha {
+      my ($self) = @_;
+      return (exists $self->{alpha});
+  }
+  
+  sub qv {
+      my $value = shift;
+      my $class = $CLASS;
+      if (@_) {
+  	$class = ref($value) || $value;
+  	$value = shift;
+      }
+  
+      $value = _un_vstring($value);
+      $value = 'v'.$value unless $value =~ /(^v|\d+\.\d+\.\d)/;
+      my $obj = $CLASS->new($value);
+      return bless $obj, $class;
+  }
+  
+  *declare = \&qv;
+  
+  sub is_qv {
+      my ($self) = @_;
+      return (exists $self->{qv});
+  }
+  
+  
+  sub _verify {
+      my ($self) = @_;
+      if ( ref($self)
+  	&& eval { exists $self->{version} }
+  	&& ref($self->{version}) eq 'ARRAY'
+  	) {
+  	return 1;
+      }
+      else {
+  	return 0;
+      }
+  }
+  
+  sub _is_non_alphanumeric {
+      my $s = shift;
+      $s = new charstar $s;
+      while ($s) {
+  	return 0 if isSPACE($s); # early out
+  	return 1 unless (isALPHA($s) || isDIGIT($s) || $s =~ /[.-]/);
+  	$s++;
+      }
+      return 0;
+  }
+  
+  sub _un_vstring {
+      my $value = shift;
+      # may be a v-string
+      if ( length($value) >= 3 && $value !~ /[._]/
+  	&& _is_non_alphanumeric($value)) {
+  	my $tvalue;
+  	if ( $] ge 5.008_001 ) {
+  	    $tvalue = _find_magic_vstring($value);
+  	    $value = $tvalue if length $tvalue;
+  	}
+  	elsif ( $] ge 5.006_000 ) {
+  	    $tvalue = sprintf("v%vd",$value);
+  	    if ( $tvalue =~ /^v\d+(\.\d+){2,}$/ ) {
+  		# must be a v-string
+  		$value = $tvalue;
+  	    }
+  	}
+      }
+      return $value;
+  }
+  
+  sub _find_magic_vstring {
+      my $value = shift;
+      my $tvalue = '';
+      require B;
+      my $sv = B::svref_2object(\$value);
+      my $magic = ref($sv) eq 'B::PVMG' ? $sv->MAGIC : undef;
+      while ( $magic ) {
+  	if ( $magic->TYPE eq 'V' ) {
+  	    $tvalue = $magic->PTR;
+  	    $tvalue =~ s/^v?(.+)$/v$1/;
+  	    last;
+  	}
+  	else {
+  	    $magic = $magic->MOREMAGIC;
+  	}
+      }
+      return $tvalue;
+  }
+  
+  sub _VERSION {
+      my ($obj, $req) = @_;
+      my $class = ref($obj) || $obj;
+  
+      no strict 'refs';
+      if ( exists $INC{"$class.pm"} and not %{"$class\::"} and $] >= 5.008) {
+  	 # file but no package
+  	require Carp;
+  	Carp::croak( "$class defines neither package nor VERSION"
+  	    ."--version check failed");
+      }
+  
+      my $version = eval "\$$class\::VERSION";
+      if ( defined $version ) {
+  	local $^W if $] <= 5.008;
+  	$version = version::vpp->new($version);
+      }
+  
+      if ( defined $req ) {
+  	unless ( defined $version ) {
+  	    require Carp;
+  	    my $msg =  $] < 5.006
+  	    ? "$class version $req required--this is only version "
+  	    : "$class does not define \$$class\::VERSION"
+  	      ."--version check failed";
+  
+  	    if ( $ENV{VERSION_DEBUG} ) {
+  		Carp::confess($msg);
+  	    }
+  	    else {
+  		Carp::croak($msg);
+  	    }
+  	}
+  
+  	$req = version::vpp->new($req);
+  
+  	if ( $req > $version ) {
+  	    require Carp;
+  	    if ( $req->is_qv ) {
+  		Carp::croak(
+  		    sprintf ("%s version %s required--".
+  			"this is only version %s", $class,
+  			$req->normal, $version->normal)
+  		);
+  	    }
+  	    else {
+  		Carp::croak(
+  		    sprintf ("%s version %s required--".
+  			"this is only version %s", $class,
+  			$req->stringify, $version->stringify)
+  		);
+  	    }
+  	}
+      }
+  
+      return defined $version ? $version->stringify : undef;
+  }
+  
+  1; #this line is important and will help the module return a true value
+DARWIN-THREAD-MULTI-2LEVEL_VERSION_VPP
+
+$fatpacked{"darwin-thread-multi-2level/version/vxs.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'DARWIN-THREAD-MULTI-2LEVEL_VERSION_VXS';
+  #!perl -w
+  package version::vxs;
+  
+  use v5.10;
+  use strict;
+  
+  use vars qw(@ISA $VERSION $CLASS );
+  $VERSION = 0.9909;
+  $CLASS = 'version::vxs';
+  
+  eval {
+      require XSLoader;
+      local $^W; # shut up the 'redefined' warning for UNIVERSAL::VERSION
+      XSLoader::load('version::vxs', $VERSION);
+      1;
+  } or do {
+      require DynaLoader;
+      push @ISA, 'DynaLoader'; 
+      local $^W; # shut up the 'redefined' warning for UNIVERSAL::VERSION
+      bootstrap version::vxs $VERSION;
+  };
+  
+  # Preloaded methods go here.
+  
+  1;
+DARWIN-THREAD-MULTI-2LEVEL_VERSION_VXS
 
 s/^  //mg for values %fatpacked;
 
